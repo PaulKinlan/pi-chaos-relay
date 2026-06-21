@@ -5,6 +5,14 @@
   "type": "module",
   "license": "MIT",
   "author": "Paul Kinlan",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/paulkinlan/pi-chaos-relay.git"
+  },
+  "homepage": "https://github.com/paulkinlan/pi-chaos-relay#readme",
+  "bugs": {
+    "url": "https://github.com/paulkinlan/pi-chaos-relay/issues"
+  },
   "keywords": [
     "pi-package",
     "pi",
@@ -23,6 +31,7 @@
     "relay-client.ts",
     "config.ts",
     "poller.ts",
+    "crypto.ts",
     "skills/",
     "README.md",
     "LICENSE"
@@ -39,8 +48,8 @@
     "typebox": "^1.1.24"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-ai": "*"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {
@@ -52,6 +61,7 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.79.0",
+    "@types/node": "^26.0.0",
     "typescript": "^5.0.0"
   }
 }

@@ -11,6 +11,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "n
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import type { KeyPairJwk } from "./crypto.ts";
+
 export const DEFAULT_RELAY_URL = "https://chaos-relay.deno.dev";
 export const DEFAULT_POLL_INTERVAL_MS = 15_000;
 export const MIN_POLL_INTERVAL_MS = 3_000;
@@ -31,6 +33,14 @@ export interface PersistedConfig {
   pollIntervalMs?: number;
   /** Channels registered through this extension (for reference / reply routing). */
   channels?: RegisteredChannelRecord[];
+  /**
+   * ECDSA P-256 keypair (JWK) bound to this session at registration. The
+   * private key is SECRET — it is the client's identity and is never sent to
+   * the relay or committed. Stored only in this 0600 file under ~/.pi.
+   */
+  keyPair?: KeyPairJwk;
+  /** Server's ECDSA public key (JWK) returned at registration — TOFU pin. */
+  serverPublicKey?: JsonWebKey;
 }
 
 export interface RegisteredChannelRecord {
@@ -47,6 +57,10 @@ export interface ResolvedConfig {
   agentId: string;
   pollIntervalMs: number;
   channels: RegisteredChannelRecord[];
+  /** ECDSA keypair for request signing. File-only (never from env). */
+  keyPair?: KeyPairJwk;
+  /** Pinned server public key (TOFU). File-only. */
+  serverPublicKey?: JsonWebKey;
 }
 
 export function loadPersisted(): PersistedConfig {
@@ -112,6 +126,10 @@ export function resolveConfig(persisted = loadPersisted()): ResolvedConfig {
     agentId,
     pollIntervalMs,
     channels: persisted.channels ?? [],
+    // The keypair is the client's identity and is intentionally NOT
+    // overridable via env — it lives only in the 0600 config file.
+    keyPair: persisted.keyPair,
+    serverPublicKey: persisted.serverPublicKey,
   };
 }
 

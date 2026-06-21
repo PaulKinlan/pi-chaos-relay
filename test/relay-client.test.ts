@@ -5,7 +5,9 @@ import {
   RelayError,
   normalizeRelayUrl,
   registerSession,
+  registerSessionWithKey,
 } from "../relay-client.ts";
+import { generateKeyPair, verifyRequest } from "../crypto.ts";
 
 /** Build a fake fetch that records calls and returns scripted responses. */
 function mockFetch(
@@ -96,6 +98,90 @@ test("registerEmail hits the right endpoint", async () => {
   const res = await client.registerEmail({ userEmail: "a@b.com", agentId: "pi" });
   assert.equal(res.inboundAddress, "ch_e@relay");
   assert.equal(calls[0].url, "http://relay/channels/email/register");
+});
+
+test("registerSessionWithKey sends the public key and returns the keypair", async () => {
+  const { fn, calls } = mockFetch(() => ({
+    body: { userId: "u1", apiKey: "k1", serverPublicKey: { kty: "EC" } },
+  }));
+  const res = await registerSessionWithKey("http://relay", { fetchImpl: fn });
+  assert.equal(res.apiKey, "k1");
+  assert.ok(res.keyPair.privateKey.d, "keypair has a private scalar");
+  const sent = JSON.parse(calls[0].init?.body as string);
+  // The PUBLIC key is sent — never the private one.
+  assert.equal(sent.publicKey.kty, "EC");
+  assert.equal(sent.publicKey.d, undefined);
+});
+
+test("signed client attaches verifiable signature headers (POST with body)", async () => {
+  const keyPair = await generateKeyPair();
+  const { fn, calls } = mockFetch(() => ({
+    body: { ok: true, channelType: "telegram", channelId: "ch1" },
+  }));
+  const client = new RelayClient({
+    relayUrl: "http://relay",
+    apiKey: "k",
+    keyPair,
+    fetchImpl: fn,
+  });
+  assert.equal(client.isSigned, true);
+  await client.reply({ channelType: "telegram", channelId: "ch1", content: "hi" });
+
+  const headers = calls[0].init?.headers as Record<string, string>;
+  assert.equal(headers.Authorization, "Bearer k");
+  assert.match(headers["X-Nonce"], /^[0-9a-f]{32}$/);
+  assert.ok(headers["X-Timestamp"]);
+  assert.ok(headers["X-Signature"]);
+
+  const sentBody = calls[0].init?.body as string;
+  const ok = await verifyRequest(
+    keyPair.publicKey,
+    headers["X-Signature"],
+    headers["X-Timestamp"],
+    headers["X-Nonce"],
+    "/reply",
+    sentBody,
+  );
+  assert.equal(ok, true);
+});
+
+test("signed GET signs the pathname only (query excluded) over an empty body", async () => {
+  const keyPair = await generateKeyPair();
+  const { fn, calls } = mockFetch(() => ({
+    body: { messages: [], since: "2026-01-01T00:00:00Z" },
+  }));
+  const client = new RelayClient({
+    relayUrl: "http://relay",
+    apiKey: "k",
+    keyPair,
+    fetchImpl: fn,
+  });
+  await client.getMessages("2025-12-31T00:00:00Z");
+
+  // URL keeps the query string...
+  assert.match(calls[0].url, /\/messages\?since=2025-12-31/);
+  const headers = calls[0].init?.headers as Record<string, string>;
+  // ...but the signature is over "/messages" with an empty body.
+  const ok = await verifyRequest(
+    keyPair.publicKey,
+    headers["X-Signature"],
+    headers["X-Timestamp"],
+    headers["X-Nonce"],
+    "/messages",
+    "",
+  );
+  assert.equal(ok, true);
+});
+
+test("unsigned (Bearer-only) client omits signature headers", async () => {
+  const { fn, calls } = mockFetch(() => ({ body: { messages: [], since: "x" } }));
+  const client = new RelayClient({ relayUrl: "http://relay", apiKey: "k", fetchImpl: fn });
+  assert.equal(client.isSigned, false);
+  await client.getMessages();
+  const headers = calls[0].init?.headers as Record<string, string>;
+  assert.equal(headers.Authorization, "Bearer k");
+  assert.equal(headers["X-Signature"], undefined);
+  assert.equal(headers["X-Nonce"], undefined);
 });
 
 test("error responses throw RelayError with the server message", async () => {

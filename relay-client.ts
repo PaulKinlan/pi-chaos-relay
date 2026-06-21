@@ -1,20 +1,33 @@
 /**
  * Thin HTTP client for the CHAOS relay server.
  *
- * Implements the Bearer-token subset of the relay API that a polling client
- * needs: register a session, register Telegram/email channels, poll inbound
- * messages, and post replies. ECDSA request signing (the relay's optional
- * enhanced-security mode) is intentionally not used here — we register without
- * a public key, so plain Bearer auth applies to every request.
+ * Identity is ECDSA P-256 request signing — the relay's real identity model.
+ * At registration we send the client's public key; the relay binds the session
+ * to it and from then on REQUIRES every authenticated request to carry a valid
+ * `X-Signature` (plus `X-Timestamp` and `X-Nonce`) made by the matching private
+ * key. The Bearer API key still travels on every request, but on its own it is
+ * not enough once a public key is registered.
  *
- * Spec: ~/chaos/docs/relay-api-spec.md and relay-openapi.yaml.
+ * Bearer-only is supported as a fallback for legacy sessions that registered
+ * without a public key (the relay still accepts unsigned requests for those).
+ * When this client has a keypair it always signs.
+ *
+ * Spec: ~/chaos/docs/relay-api-spec.md, relay-openapi.yaml, security.md, and
+ * the canonical impl in ~/chaos/packages/{server,extension}/src.
  */
+
+import { buildSignatureHeaders, generateKeyPair, type KeyPairJwk } from "./crypto.ts";
 
 export interface RelayClientOptions {
   /** Base URL of the relay, e.g. https://chaos-relay.deno.dev or http://localhost:8787 */
   relayUrl: string;
   /** Bearer API key obtained from POST /auth/register. */
   apiKey: string;
+  /**
+   * ECDSA P-256 keypair (JWK) bound to this session. When present, every
+   * authenticated request is signed. Omit only for legacy Bearer-only sessions.
+   */
+  keyPair?: KeyPairJwk;
   /** Optional fetch override (used by tests). Defaults to global fetch. */
   fetchImpl?: typeof fetch;
 }
@@ -38,7 +51,13 @@ export interface GetMessagesResult {
 export interface RegisterSessionResult {
   userId: string;
   apiKey: string;
-  serverPublicKey?: unknown;
+  serverPublicKey?: JsonWebKey;
+}
+
+/** Result of registering a session including the locally-generated keypair. */
+export interface RegisterWithKeyResult extends RegisterSessionResult {
+  /** The keypair that was generated and bound to this session. Persist it. */
+  keyPair: KeyPairJwk;
 }
 
 export interface TelegramRegisterResult {
@@ -79,10 +98,10 @@ export function normalizeRelayUrl(url: string): string {
 }
 
 /**
- * Register a new relay session and obtain a Bearer API key.
+ * Register a new relay session WITHOUT a public key (legacy Bearer-only).
  *
- * This is a static helper (no key required yet). We deliberately omit
- * `publicKey` so that subsequent requests only need the Bearer token.
+ * Prefer {@link registerSessionWithKey} — the relay's real identity model is
+ * ECDSA signing. This helper exists for compatibility / explicit opt-out.
  */
 export async function registerSession(
   relayUrl: string,
@@ -105,31 +124,100 @@ export async function registerSession(
   return body as RegisterSessionResult;
 }
 
+/**
+ * Register a new relay session WITH an ECDSA public key — the default identity
+ * path. Generates a P-256 keypair (unless one is supplied for reuse), sends the
+ * public JWK to `POST /auth/register`, and returns the credentials plus the
+ * keypair so the caller can persist it (mode 0600, never committed).
+ *
+ * After this, the relay binds the session to the public key and rejects any
+ * authenticated request that is missing or has an invalid signature.
+ */
+export async function registerSessionWithKey(
+  relayUrl: string,
+  opts: { keyPair?: KeyPairJwk; fetchImpl?: typeof fetch } = {},
+): Promise<RegisterWithKeyResult> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const base = normalizeRelayUrl(relayUrl);
+  const keyPair = opts.keyPair ?? (await generateKeyPair());
+
+  const res = await fetchImpl(`${base}/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ publicKey: keyPair.publicKey }),
+  });
+  const body = await readBody(res);
+  if (!res.ok) {
+    throw new RelayError(
+      `Failed to register relay session: ${describeError(body, res.status)}`,
+      res.status,
+      body,
+    );
+  }
+  const result = body as RegisterSessionResult;
+  return { ...result, keyPair };
+}
+
 export class RelayClient {
   private readonly base: string;
   private readonly apiKey: string;
+  private readonly keyPair?: KeyPairJwk;
   private readonly fetchImpl: typeof fetch;
 
   constructor(opts: RelayClientOptions) {
     this.base = normalizeRelayUrl(opts.relayUrl);
     this.apiKey = opts.apiKey;
+    this.keyPair = opts.keyPair;
     this.fetchImpl = opts.fetchImpl ?? fetch;
   }
 
-  private get authHeaders(): Record<string, string> {
-    return {
+  /** True when this client signs requests (i.e. a keypair is configured). */
+  get isSigned(): boolean {
+    return Boolean(this.keyPair);
+  }
+
+  /**
+   * Build the headers for an authenticated request. Always carries the Bearer
+   * token; when a keypair is present it ALSO signs over the pathname + body and
+   * adds X-Timestamp / X-Nonce / X-Signature.
+   *
+   * @param path     the request pathname WITHOUT query string — the server
+   *                 signs over `new URL(req.url).pathname` only.
+   * @param bodyText the exact serialized body string that will be sent
+   *                 (must match byte-for-byte what fetch sends), or "" for none.
+   */
+  private async buildHeaders(
+    path: string,
+    bodyText: string,
+  ): Promise<Record<string, string>> {
+    const headers: Record<string, string> = {
       "Authorization": `Bearer ${this.apiKey}`,
       "Content-Type": "application/json",
     };
+    if (this.keyPair) {
+      Object.assign(
+        headers,
+        await buildSignatureHeaders(this.keyPair.privateKey, path, bodyText),
+      );
+    }
+    return headers;
   }
 
+  /**
+   * @param path  full request path, possibly including a query string. The
+   *              query is included in the fetch URL but stripped before signing
+   *              (the server signs over the pathname only).
+   */
   private async request<T>(
     method: string,
     path: string,
     body?: unknown,
   ): Promise<T> {
-    const init: RequestInit = { method, headers: this.authHeaders };
-    if (body !== undefined) init.body = JSON.stringify(body);
+    const bodyText = body !== undefined ? JSON.stringify(body) : "";
+    const pathname = path.split("?")[0];
+    const headers = await this.buildHeaders(pathname, bodyText);
+    const init: RequestInit = { method, headers };
+    if (body !== undefined) init.body = bodyText;
     const res = await this.fetchImpl(`${this.base}${path}`, init);
     const parsed = await readBody(res);
     if (!res.ok) {

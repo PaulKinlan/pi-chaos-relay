@@ -18,7 +18,10 @@ Telegram / Email ──> CHAOS relay ──poll GET /messages──> pi agent
 
 ## What it does
 
-- Registers a relay **session** (Bearer API key) and stores it locally.
+- Registers a relay **session** with an **ECDSA P-256 keypair** (the relay's
+  real identity model) and stores the credentials + key locally.
+- **Signs every authenticated request** (`X-Timestamp` / `X-Nonce` /
+  `X-Signature`) so the relay can verify it really came from this client.
 - Registers a **Telegram bot** channel and an **email** channel via the relay.
 - **Polls** `GET /messages` in the background and injects new messages into the
   pi agent (also exposed as an on-demand tool).
@@ -46,6 +49,11 @@ file > default**. The saved config file is `~/.pi/chaos-relay.json` (written wit
 | `CHAOS_RELAY_API_KEY` | — | Bearer API key from `POST /auth/register` (secret) |
 | `CHAOS_RELAY_AGENT_ID` | `pi` | Agent id channels route to |
 | `CHAOS_RELAY_POLL_MS` | `15000` | Background poll interval in ms (min `3000`) |
+
+The **ECDSA private key** is part of your identity and is deliberately *not*
+configurable via an env var — it lives only in the `0600` config file. Running
+`/chaos-relay setup` → "Register a new session (ECDSA)" generates the keypair,
+sends only the **public** key to the relay, and persists the pair locally.
 
 The quickest start is the interactive setup, which registers a session for you:
 
@@ -115,14 +123,23 @@ or `/chaos-relay poll`.
 
 ## Security
 
-- The API key is read from the environment or `~/.pi/chaos-relay.json` (0600) and
-  is never written to the repo. `.gitignore` also blocks stray `chaos-relay.json`
-  / `.env` files.
+- **ECDSA P-256 request signing is the default identity path.** At registration
+  the client generates a P-256 keypair, sends only the public key to the relay
+  (`POST /auth/register` with `publicKey`), and the relay binds the session to
+  it. Every authenticated request after that is signed: a base64 ECDSA-SHA256
+  `X-Signature` over `{timestamp}|{nonce}|{path}|{bodyHash}` (path = pathname
+  only, `bodyHash` = SHA-256 hex of the body, empty body for GET), plus
+  `X-Timestamp` (ISO 8601, ±5 min) and `X-Nonce` (16 random bytes hex, replay
+  protected). This matches the canonical CHAOS extension/server implementation.
+- The **private key never leaves the machine** — it is stored only in
+  `~/.pi/chaos-relay.json` (0600) and never sent to the relay or committed. The
+  API key lives in the same file (or the `CHAOS_RELAY_API_KEY` env var).
+  `.gitignore` blocks stray `chaos-relay.json` / `.env` files.
+- **Bearer-only** mode is kept as a fallback for legacy sessions registered
+  without a public key (e.g. a pasted API key). The relay still accepts unsigned
+  requests for those; signed is preferred and automatic when a keypair exists.
 - Bot tokens are sent only to the relay's register endpoint over HTTPS; the relay
   encrypts them at rest. They are not persisted by this extension.
-- The relay supports optional ECDSA request signing. This extension uses the
-  simpler Bearer-token mode (it registers sessions without a public key). If you
-  need signed requests, that is a future enhancement (see below).
 
 ## Development
 
@@ -137,8 +154,10 @@ Integration testing against a local relay: run the CHAOS relay server
 
 ## Known gaps / future work
 
-- **ECDSA signing** is not implemented (Bearer-only). Fine for the default and
-  most self-hosted setups; add signing if your relay enforces it.
+- **Server response signing / TOFU pinning.** The relay returns its public key
+  at registration and we persist it (`serverPublicKey`), but the client does not
+  yet verify server signatures on poll responses. Outbound request signing (the
+  key threat: someone spending your API key) is fully implemented.
 - **WebSocket** real-time delivery (`GET /ws`) is not used; the extension polls.
   Polling is simpler and robust; a WS transport could lower latency later.
 - Email registration depends on relay-side `CHAOS_EMAIL_DOMAIN` + provider config.

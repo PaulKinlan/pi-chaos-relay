@@ -21,6 +21,7 @@ import {
   RelayClient,
   RelayError,
   registerSession,
+  registerSessionWithKey,
   type ChannelMessage,
 } from "./relay-client.ts";
 import {
@@ -59,8 +60,15 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       return undefined;
     }
     if (!client) {
-      log(`connecting to relay ${cfg.relayUrl} as agentId="${cfg.agentId}"`);
-      client = new RelayClient({ relayUrl: cfg.relayUrl, apiKey: cfg.apiKey! });
+      const identity = cfg.keyPair ? "ECDSA-signed" : "Bearer-only (legacy)";
+      log(
+        `connecting to relay ${cfg.relayUrl} as agentId="${cfg.agentId}" (${identity})`,
+      );
+      client = new RelayClient({
+        relayUrl: cfg.relayUrl,
+        apiKey: cfg.apiKey!,
+        keyPair: cfg.keyPair,
+      });
       poller = new MessagePoller(client);
     }
     return client;
@@ -343,23 +351,29 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // Either reuse an existing API key or register a fresh session.
     let apiKey = persisted.apiKey;
     let userId = persisted.userId;
+    let keyPair = persisted.keyPair;
+    let serverPublicKey = persisted.serverPublicKey;
     const haveKey = Boolean(apiKey);
     const action = await ctx.ui.select(
       haveKey ? "Relay credentials" : "No API key found",
       haveKey
-        ? ["Keep existing API key", "Register a new session", "Paste an existing API key"]
-        : ["Register a new session", "Paste an existing API key"],
+        ? ["Keep existing API key", "Register a new session (ECDSA)", "Paste an existing API key"]
+        : ["Register a new session (ECDSA)", "Paste an existing API key"],
     );
 
-    if (action === "Register a new session") {
-      ctx.ui.notify("Registering a new relay session...", "info");
-      const reg = await registerSession(relayUrl);
+    if (action === "Register a new session (ECDSA)") {
+      ctx.ui.notify("Generating ECDSA keypair and registering session...", "info");
+      // Reuse the existing keypair if present so the identity stays stable.
+      const reg = await registerSessionWithKey(relayUrl, { keyPair });
       apiKey = reg.apiKey;
       userId = reg.userId;
-      ctx.ui.notify(`Registered. userId=${userId}`, "info");
+      keyPair = reg.keyPair;
+      serverPublicKey = reg.serverPublicKey ?? serverPublicKey;
+      ctx.ui.notify(`Registered with ECDSA identity. userId=${userId}`, "info");
     } else if (action === "Paste an existing API key") {
       const pasted = await ctx.ui.input("Paste relay API key", "");
       if (pasted) apiKey = pasted.trim();
+      // A pasted key with no local keypair falls back to Bearer-only auth.
     }
 
     if (!apiKey) {
@@ -367,11 +381,13 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       return;
     }
 
-    savePersisted({ relayUrl, agentId, apiKey, userId });
+    // Persist credentials AND the keypair (the keypair is the secret identity;
+    // it lives only in this 0600 file under ~/.pi and is never committed).
+    savePersisted({ relayUrl, agentId, apiKey, userId, keyPair, serverPublicKey });
 
     // Verify reachability before declaring success.
     try {
-      const verify = new RelayClient({ relayUrl, apiKey });
+      const verify = new RelayClient({ relayUrl, apiKey, keyPair });
       const h = await verify.health();
       ctx.ui.notify(`Relay reachable (status=${h.status}). Credentials saved.`, "info");
     } catch (err) {
@@ -393,6 +409,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       `relayUrl:      ${current.relayUrl}`,
       `agentId:       ${current.agentId}`,
       `apiKey:        ${current.apiKey ? "set" : "MISSING (run /chaos-relay setup)"}`,
+      `identity:      ${current.keyPair ? "ECDSA P-256 (signed requests)" : "Bearer-only (legacy)"}`,
       `userId:        ${current.userId ?? "(unknown)"}`,
       `pollInterval:  ${current.pollIntervalMs}ms`,
       `poller:        ${pollTimer ? "running" : "stopped"}`,
@@ -404,7 +421,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // Live reachability + channel list from the relay, if configured.
     if (current.apiKey) {
       try {
-        const c = new RelayClient({ relayUrl: current.relayUrl, apiKey: current.apiKey });
+        const c = new RelayClient({
+          relayUrl: current.relayUrl,
+          apiKey: current.apiKey,
+          keyPair: current.keyPair,
+        });
         const h = await c.health();
         lines.push(`relay health:  ${h.status}${h.version ? ` (v${h.version})` : ""}`);
       } catch (err) {
