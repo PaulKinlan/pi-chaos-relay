@@ -1,0 +1,10 @@
+node_modules/
+*.log
+.DS_Store
+
+# Local secrets / credentials — never commit. The extension writes the relay
+# API key to ~/.pi/chaos-relay.json, but guard against any stray local copies.
+chaos-relay.json
+.env
+.env.*
+*.local

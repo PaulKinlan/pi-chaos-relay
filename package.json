@@ -1,0 +1,57 @@
+{
+  "name": "pi-chaos-relay",
+  "version": "0.1.0",
+  "description": "Bridge the pi coding agent to a CHAOS relay server — drive and answer your pi agent over Telegram and email.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Paul Kinlan",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "chaos",
+    "relay",
+    "telegram",
+    "email"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "files": [
+    "index.ts",
+    "relay-client.ts",
+    "config.ts",
+    "poller.ts",
+    "skills/",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "dependencies": {
+    "typebox": "^1.1.24"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.79.0",
+    "typescript": "^5.0.0"
+  }
+}
