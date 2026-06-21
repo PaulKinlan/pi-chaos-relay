@@ -13,7 +13,7 @@ import { join } from "node:path";
 
 import type { KeyPairJwk } from "./crypto.ts";
 
-export const DEFAULT_RELAY_URL = "https://chaos-relay.deno.dev";
+export const DEFAULT_RELAY_URL = "https://chaos-relay.com";
 export const DEFAULT_POLL_INTERVAL_MS = 15_000;
 export const MIN_POLL_INTERVAL_MS = 3_000;
 

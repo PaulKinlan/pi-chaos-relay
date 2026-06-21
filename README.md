@@ -45,7 +45,7 @@ file > default**. The saved config file is `~/.pi/chaos-relay.json` (written wit
 
 | Env var | Default | Meaning |
 |---------|---------|---------|
-| `CHAOS_RELAY_URL` | `https://chaos-relay.deno.dev` | Relay base URL |
+| `CHAOS_RELAY_URL` | `https://chaos-relay.com` | Relay base URL |
 | `CHAOS_RELAY_API_KEY` | — | Bearer API key from `POST /auth/register` (secret) |
 | `CHAOS_RELAY_AGENT_ID` | `pi` | Agent id channels route to |
 | `CHAOS_RELAY_POLL_MS` | `15000` | Background poll interval in ms (min `3000`) |

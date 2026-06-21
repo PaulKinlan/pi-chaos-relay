@@ -19,7 +19,7 @@
 import { buildSignatureHeaders, generateKeyPair, type KeyPairJwk } from "./crypto.ts";
 
 export interface RelayClientOptions {
-  /** Base URL of the relay, e.g. https://chaos-relay.deno.dev or http://localhost:8787 */
+  /** Base URL of the relay, e.g. https://chaos-relay.com or http://localhost:8787 */
   relayUrl: string;
   /** Bearer API key obtained from POST /auth/register. */
   apiKey: string;

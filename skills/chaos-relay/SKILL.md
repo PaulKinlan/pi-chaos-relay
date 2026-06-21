@@ -19,7 +19,7 @@ on demand with `relay_check_messages`.
 ## First-time setup
 
 1. Run `/chaos-relay setup` in pi (interactive). It will:
-   - ask for the relay URL (default `https://chaos-relay.deno.dev`),
+   - ask for the relay URL (default `https://chaos-relay.com`),
    - ask for an agent id (default `pi`),
    - register a new relay session (or reuse/paste an existing API key),
    - verify the relay is reachable and save credentials to `~/.pi/chaos-relay.json`.
