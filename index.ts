@@ -61,6 +61,14 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   let cfg: ResolvedConfig = resolveConfig();
 
+  // Typing indicator state: the channel of the most recent inbound message, and
+  // whether the current/next agent run was triggered by a relay message (so we
+  // only show "typing" in the channel when the agent is actually working on a
+  // message from it, not on terminal-driven turns).
+  let typingTimer: ReturnType<typeof setInterval> | undefined;
+  let lastChannel: { channelType: string; channelId: string } | undefined;
+  let relayInputSinceIdle = false;
+
   /**
    * Re-register with the persisted keypair to recover a working apiKey after a
    * relay data loss (the relay reclaims the SAME session for the same key, so
@@ -208,8 +216,35 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
    * streaming and delivers immediately when idle. Matches pi's own extension
    * examples (reload-runtime, git-merge-and-resolve).
    */
-  function deliverToAgent(text: string): void {
-    pi.sendUserMessage(text, { deliverAs: "followUp" });
+  function deliverToAgent(messages: ChannelMessage[]): void {
+    // Remember where the latest message came from so we can show a typing
+    // indicator there while the agent works on it.
+    const last = messages[messages.length - 1];
+    if (last) {
+      lastChannel = { channelType: last.channelType, channelId: last.channelId };
+      relayInputSinceIdle = true;
+    }
+    pi.sendUserMessage(formatMessagesForAgent(messages), { deliverAs: "followUp" });
+  }
+
+  /** Repeatedly send a "typing" indicator to the active channel until stopped. */
+  function startTyping(): void {
+    stopTyping();
+    if (!relayInputSinceIdle || !lastChannel) return;
+    const c = ensureClient();
+    if (!c) return;
+    const ch = lastChannel;
+    const ping = () => void c.sendTyping(ch.channelType, ch.channelId);
+    ping(); // immediate, then refresh before Telegram's ~5s expiry
+    typingTimer = setInterval(ping, 4000);
+    if (typeof typingTimer.unref === "function") typingTimer.unref();
+  }
+
+  function stopTyping(): void {
+    if (typingTimer) {
+      clearInterval(typingTimer);
+      typingTimer = undefined;
+    }
   }
 
   /** Poll once and, if there are new messages, inject them into the agent. */
@@ -219,7 +254,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       const messages = await poller.poll();
       if (messages.length === 0) return;
       log(`delivering ${messages.length} new message(s) to the agent`);
-      deliverToAgent(formatMessagesForAgent(messages));
+      deliverToAgent(messages);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log(`poll failed: ${msg}`);
@@ -244,7 +279,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         const fresh = poller.accept(messages);
         if (fresh.length === 0) return;
         log(`delivering ${fresh.length} message(s) to the agent`);
-        deliverToAgent(formatMessagesForAgent(fresh));
+        deliverToAgent(fresh);
       },
       // Return RAW messages (cursor advanced, NOT deduped) so the single dedup
       // happens in onMessage below. Using poller.poll() here would dedup first,
@@ -267,6 +302,15 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", () => {
     stopPolling();
+    stopTyping();
+  });
+
+  // Show a "typing" indicator in the active channel while the agent works on a
+  // relay-delivered message, and clear it when the run finishes.
+  pi.on("agent_start", () => startTyping());
+  pi.on("agent_end", () => {
+    stopTyping();
+    relayInputSinceIdle = false;
   });
 
   // --- Tools the LLM can call ------------------------------------------------

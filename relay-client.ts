@@ -346,6 +346,19 @@ export class RelayClient {
     });
   }
 
+  /**
+   * Send a transient activity indicator (e.g. Telegram "typing") to a channel.
+   * Best-effort — never throws; typing is non-critical and the relay treats
+   * channels without an indicator (email/webhook) as a no-op.
+   */
+  async sendTyping(channelType: string, channelId: string): Promise<void> {
+    try {
+      await this.request("POST", "/typing", { channelType, channelId });
+    } catch {
+      // ignore — typing is best-effort
+    }
+  }
+
   /** Register a Telegram bot as a bidirectional channel. */
   async registerTelegram(params: {
     botToken: string;
