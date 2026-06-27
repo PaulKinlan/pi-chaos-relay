@@ -18,6 +18,37 @@
 
 import { buildSignatureHeaders, generateKeyPair, type KeyPairJwk } from "./crypto.ts";
 
+/**
+ * Default per-request timeout. A bare `fetch` has NO timeout, so an unreachable
+ * or stalled relay (cold start, dead host, hung proxy) makes the awaiting tool
+ * hang forever and never return control to the agent. Every request is given an
+ * AbortSignal so it always resolves — with a clear error — within this window.
+ */
+export const DEFAULT_TIMEOUT_MS = 15000;
+
+/** True for an AbortError raised by our timeout signal. */
+function isTimeoutError(err: unknown): boolean {
+  return err instanceof DOMException && err.name === "TimeoutError" ||
+    err instanceof Error && err.name === "AbortError";
+}
+
+/**
+ * A timeout signal backed by a clearable timer. Unlike `AbortSignal.timeout`,
+ * the timer is cleared via `clear()` in a finally block as soon as the request
+ * settles, so it never lingers (which would trip Deno's test timer sanitizer
+ * and needlessly keep the event loop alive).
+ */
+function timeoutSignal(ms: number): { signal: AbortSignal; clear: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new DOMException(`Timed out after ${ms}ms`, "TimeoutError")),
+    ms,
+  );
+  // Don't let a pending timeout keep the process alive (Deno/Node).
+  (timer as { unref?: () => void }).unref?.();
+  return { signal: controller.signal, clear: () => clearTimeout(timer) };
+}
+
 export interface RelayClientOptions {
   /** Base URL of the relay, e.g. https://chaos-relay.com or http://localhost:8787 */
   relayUrl: string;
@@ -30,6 +61,8 @@ export interface RelayClientOptions {
   keyPair?: KeyPairJwk;
   /** Optional fetch override (used by tests). Defaults to global fetch. */
   fetchImpl?: typeof fetch;
+  /** Per-request timeout in ms. Defaults to {@link DEFAULT_TIMEOUT_MS}. */
+  timeoutMs?: number;
 }
 
 export interface ChannelMessage {
@@ -84,7 +117,7 @@ export interface ReplyResult {
 export class RelayError extends Error {
   readonly status: number;
   readonly body: unknown;
-  constructor(message: string, status: number, body: unknown) {
+  constructor(message: string, status: number, body: unknown = undefined) {
     super(message);
     this.name = "RelayError";
     this.status = status;
@@ -135,17 +168,34 @@ export async function registerSession(
  */
 export async function registerSessionWithKey(
   relayUrl: string,
-  opts: { keyPair?: KeyPairJwk; fetchImpl?: typeof fetch } = {},
+  opts: { keyPair?: KeyPairJwk; fetchImpl?: typeof fetch; timeoutMs?: number } = {},
 ): Promise<RegisterWithKeyResult> {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const base = normalizeRelayUrl(relayUrl);
   const keyPair = opts.keyPair ?? (await generateKeyPair());
 
-  const res = await fetchImpl(`${base}/auth/register`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ publicKey: keyPair.publicKey }),
-  });
+  const ms = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const t = timeoutSignal(ms);
+  let res: Response;
+  try {
+    res = await fetchImpl(`${base}/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ publicKey: keyPair.publicKey }),
+      signal: t.signal,
+    });
+  } catch (err) {
+    if (isTimeoutError(err)) {
+      throw new RelayError(
+        `Relay did not respond within ${ms}ms (POST ${base}/auth/register) — ` +
+          `check the relay URL is correct and reachable.`,
+        0,
+      );
+    }
+    throw err;
+  } finally {
+    t.clear();
+  }
   const body = await readBody(res);
   if (!res.ok) {
     throw new RelayError(
@@ -163,12 +213,14 @@ export class RelayClient {
   private readonly apiKey: string;
   private readonly keyPair?: KeyPairJwk;
   private readonly fetchImpl: typeof fetch;
+  private readonly timeoutMs: number;
 
   constructor(opts: RelayClientOptions) {
     this.base = normalizeRelayUrl(opts.relayUrl);
     this.apiKey = opts.apiKey;
     this.keyPair = opts.keyPair;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
 
   /** True when this client signs requests (i.e. a keypair is configured). */
@@ -216,9 +268,24 @@ export class RelayClient {
     const bodyText = body !== undefined ? JSON.stringify(body) : "";
     const pathname = path.split("?")[0];
     const headers = await this.buildHeaders(pathname, bodyText);
-    const init: RequestInit = { method, headers };
+    const t = timeoutSignal(this.timeoutMs);
+    const init: RequestInit = { method, headers, signal: t.signal };
     if (body !== undefined) init.body = bodyText;
-    const res = await this.fetchImpl(`${this.base}${path}`, init);
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.base}${path}`, init);
+    } catch (err) {
+      if (isTimeoutError(err)) {
+        throw new RelayError(
+          `Relay did not respond within ${this.timeoutMs}ms (${method} ${path}) — ` +
+            `check the relay URL is correct and reachable.`,
+          0,
+        );
+      }
+      throw err;
+    } finally {
+      t.clear();
+    }
     const parsed = await readBody(res);
     if (!res.ok) {
       throw new RelayError(
@@ -232,7 +299,22 @@ export class RelayClient {
 
   /** Health check — useful for `setup` to confirm the relay is reachable. */
   async health(): Promise<{ status: string; version?: string }> {
-    const res = await this.fetchImpl(`${this.base}/health`);
+    const t = timeoutSignal(this.timeoutMs);
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.base}/health`, { signal: t.signal });
+    } catch (err) {
+      if (isTimeoutError(err)) {
+        throw new RelayError(
+          `Relay health check timed out after ${this.timeoutMs}ms — ` +
+            `the relay at ${this.base} is not responding.`,
+          0,
+        );
+      }
+      throw err;
+    } finally {
+      t.clear();
+    }
     const body = await readBody(res);
     if (!res.ok) {
       throw new RelayError(`Relay health check failed`, res.status, body);

@@ -184,6 +184,33 @@ test("unsigned (Bearer-only) client omits signature headers", async () => {
   assert.equal(headers["X-Nonce"], undefined);
 });
 
+test("a hung relay aborts via the timeout and throws RelayError (returns control)", async () => {
+  // A fetch that never resolves on its own — it only settles when the request's
+  // AbortSignal fires. Without a timeout this would hang the agent forever.
+  const hangingFetch = ((_url: string | URL | Request, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () =>
+        reject((init.signal as AbortSignal).reason ??
+          new DOMException("Aborted", "AbortError")),
+      );
+    })) as unknown as typeof fetch;
+
+  const client = new RelayClient({
+    relayUrl: "http://relay",
+    apiKey: "k",
+    fetchImpl: hangingFetch,
+    timeoutMs: 20,
+  });
+  await assert.rejects(
+    () => client.getMessages(),
+    (err: unknown) => {
+      assert.ok(err instanceof RelayError);
+      assert.match(err.message, /did not respond within 20ms/);
+      return true;
+    },
+  );
+});
+
 test("error responses throw RelayError with the server message", async () => {
   const { fn } = mockFetch(() => ({ status: 401, body: { error: "Unauthorized" } }));
   const client = new RelayClient({ relayUrl: "http://relay", apiKey: "bad", fetchImpl: fn });
