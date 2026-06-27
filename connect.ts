@@ -23,8 +23,11 @@ export function parseConnectInput(raw: string): ConnectPlan {
   const input = (raw ?? "").trim();
   if (!input) return { kind: "unknown", reason: "nothing was provided" };
 
-  // Explicit "telegram <token>" / "discord <token>" / "email <addr>" / "webhook [name]".
-  const prefixed = input.match(/^(telegram|discord|email|webhook)\b[:\s]*(.*)$/is);
+  // Explicit "telegram <token>" / "discord <token>" / "email <addr>" / "webhook <name>".
+  // Require a separator after the keyword so a value that merely *starts* with a
+  // type word (e.g. a token "discord-like…") isn't mis-parsed — that falls
+  // through to shape detection below. ("webhook" with no value is handled there.)
+  const prefixed = input.match(/^(telegram|discord|email|webhook)[:\s]+(.*)$/is);
   if (prefixed) {
     const type = prefixed[1].toLowerCase();
     const rest = prefixed[2].trim();

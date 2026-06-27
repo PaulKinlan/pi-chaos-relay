@@ -13,7 +13,7 @@ test("auto-detects a Telegram bot token", () => {
 test("auto-detects a Discord bot token (three dotted segments)", () => {
   // Obviously-fake placeholder shaped like a Discord token (three base64url-ish
   // dot-separated segments) — kept low-entropy so secret scanners don't flag it.
-  const token = "discord-token-placeholder.test.this-is-not-a-secret-value";
+  const token = "fake-bot-token-aaaaaaaaaa.test.this-is-not-a-secret-value";
   const r = parseConnectInput(token);
   assert.deepEqual(r, { kind: "discord", token });
 });
@@ -40,6 +40,11 @@ test("explicit type prefix wins and disambiguates", () => {
     kind: "email",
     email: "me@you.dev",
   });
+});
+
+test("a type keyword glued to a value is NOT treated as a prefix", () => {
+  // Needs a separator after the keyword; "webhookfoo" is not a webhook request.
+  assert.equal(parseConnectInput("webhookfoo").kind, "unknown");
 });
 
 test("trims surrounding whitespace", () => {
