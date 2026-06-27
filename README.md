@@ -122,6 +122,7 @@ Since v0.6.2 the setup prompt rejects invalid URLs (must be absolute
 | Command | Description |
 |---------|-------------|
 | `/chaos-relay setup` | Zero-config connect (auto-registers your session) + start polling, then offers to link a channel. `--advanced` for a custom relay URL / agent id / pasted key |
+| `/chaos-relay connect <token\|email\|webhook>` | One-shot: paste a Telegram/Discord bot token, an email, or `webhook` and it sets up the relay + registers the channel in a single step |
 | `/chaos-relay add` | Interactive wizard to add a channel (Telegram / Discord / email / webhook) |
 | `/chaos-relay status` | Show config, poller state, and live relay health |
 | `/chaos-relay poll` | Poll once now and deliver any new messages |
@@ -134,6 +135,7 @@ Since v0.6.2 the setup prompt rejects invalid URLs (must be absolute
 
 | Tool | Description |
 |------|-------------|
+| `relay_connect` | **One-shot**: give it a bot token / email / `webhook` and it sets up the relay (auto-registering your session) and the channel in one step. Lets you just paste a token and say "connect this" |
 | `relay_check_messages` | Pull pending inbound Telegram/email messages |
 | `relay_reply` | Reply to a channel message (`channelType`, `channelId`, `content`, optional `replyTo`) |
 | `relay_register_telegram` | Register a Telegram bot channel |

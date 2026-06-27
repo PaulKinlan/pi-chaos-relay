@@ -45,6 +45,7 @@ import {
 } from "./config.ts";
 import { MessagePoller, formatMessagesForAgent } from "./poller.ts";
 import { RelayWebSocket } from "./ws-client.ts";
+import { parseConnectInput } from "./connect.ts";
 
 /**
  * Slow safety poll. The WebSocket is the primary transport (instant push);
@@ -908,10 +909,54 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     },
   });
 
+  // relay_connect — one-shot: paste a token / email / "webhook" and it does it all.
+  /** Provision the relay (if needed) and register whatever the input describes. */
+  async function runConnect(input: string): Promise<string> {
+    const plan = parseConnectInput(input);
+    if (plan.kind === "unknown") return plan.reason;
+    const c = await ensureConfigured();
+    if (!c) {
+      return "Couldn't reach the chaos relay to set up your connection. Check your network and try again.";
+    }
+    if (plan.kind === "telegram") return (await addTelegram(c, plan.token)).summary;
+    if (plan.kind === "discord") return (await addDiscord(c, plan.token)).summary;
+    if (plan.kind === "email") return (await addEmail(c, plan.email)).summary;
+    return (await addWebhook(c, plan.name)).summary;
+  }
+
+  const connectParams = Type.Object({
+    input: Type.String({
+      description:
+        'One thing identifying the channel: a Telegram bot token (123456:ABC…), a ' +
+        'Discord bot token, an email address, or the word "webhook" (optionally ' +
+        '"webhook <name>"). Prefix with the type to disambiguate, e.g. "discord <token>".',
+    }),
+  });
+  pi.registerTool({
+    name: "relay_connect",
+    label: "CHAOS Relay: connect (one-shot)",
+    description:
+      "One-shot connect: hand it a Telegram/Discord bot token, an email address, " +
+      'or "webhook" and it sets up the relay (auto-registering your session if ' +
+      "needed) AND registers the channel, returning the next step (pairing code / " +
+      "verification link / webhook URL). Use this whenever the user pastes a token " +
+      "or address and wants to connect — no prior /chaos-relay setup required.",
+    promptSnippet:
+      "relay_connect: paste a bot token / email / 'webhook' and it sets up the relay + channel in one step",
+    parameters: connectParams,
+    async execute(_id: string, params: Static<typeof connectParams>) {
+      try {
+        return textResult(await runConnect(params.input));
+      } catch (err) {
+        throw toFriendly(err);
+      }
+    },
+  });
+
   // --- /chaos-relay command --------------------------------------------------
 
   pi.registerCommand("chaos-relay", {
-    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup [--advanced], add, status, poll, stop, approvals, reset, doctor)",
+    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup [--advanced], connect, add, status, poll, stop, approvals, reset, doctor)",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parts = args.trim().split(/\s+/);
       const sub = parts[0] || "status";
@@ -924,6 +969,19 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
               ),
             });
             break;
+          case "connect": {
+            const rest = parts.slice(1).join(" ").trim();
+            if (!rest) {
+              ctx.ui.notify(
+                "Usage: /chaos-relay connect <telegram-token | discord-token | email | webhook [name]>\n" +
+                  "Or just run /chaos-relay add for a guided wizard.",
+                "info",
+              );
+              break;
+            }
+            ctx.ui.notify(await runConnect(rest), "info");
+            break;
+          }
           case "add":
           case "channel":
             await runAddChannel(ctx);
@@ -977,7 +1035,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           }
           default:
             ctx.ui.notify(
-              `Unknown subcommand "${sub}". Use: setup | add | status | poll | stop | approvals | reset | doctor`,
+              `Unknown subcommand "${sub}". Use: setup | connect | add | status | poll | stop | approvals | reset | doctor`,
               "warning",
             );
         }
