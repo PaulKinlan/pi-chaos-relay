@@ -4,6 +4,7 @@ import {
   DEFAULT_RELAY_URL,
   MIN_POLL_INTERVAL_MS,
   isConfigured,
+  isValidRelayUrl,
   normalizeApprovalMode,
   resolveConfig,
 } from "../config.ts";
@@ -102,5 +103,62 @@ test("persisted poll interval is used when no env override", () => {
   withEnv({ CHAOS_RELAY_POLL_MS: undefined }, () => {
     const cfg = resolveConfig({ pollIntervalMs: 30000 });
     assert.equal(cfg.pollIntervalMs, 30000);
+  });
+});
+
+test("isValidRelayUrl accepts absolute http(s) URLs", () => {
+  assert.equal(isValidRelayUrl("https://chaos-relay.com"), true);
+  assert.equal(isValidRelayUrl("https://chaos-relay.com/"), true);
+  assert.equal(isValidRelayUrl("http://localhost:8787"), true);
+  assert.equal(isValidRelayUrl("https://relay.example.com/path"), true);
+});
+
+test("isValidRelayUrl rejects non-absolute / non-http values", () => {
+  // The exact malformed values that caused the onboarding crash.
+  assert.equal(isValidRelayUrl("/chaos-relay approvals writes"), false);
+  assert.equal(isValidRelayUrl("chaos-relay approvals writes/auth/register"), false);
+  assert.equal(isValidRelayUrl(""), false);
+  // Bare hostnames (no scheme), relative paths, wrong schemes.
+  assert.equal(isValidRelayUrl("chaos-relay.com"), false);
+  assert.equal(isValidRelayUrl("localhost:8787"), false);
+  assert.equal(isValidRelayUrl("ftp://chaos-relay.com"), false);
+  assert.equal(isValidRelayUrl("file:///etc/passwd"), false);
+  // Non-strings.
+  assert.equal(isValidRelayUrl(undefined), false);
+  assert.equal(isValidRelayUrl(42 as never), false);
+  assert.equal(isValidRelayUrl(null as never), false);
+});
+
+test("resolveConfig falls back to default when persisted relayUrl is invalid", () => {
+  withEnv(
+    { CHAOS_RELAY_URL: undefined, CHAOS_RELAY_API_KEY: undefined },
+    () => {
+      // A command accidentally pasted into the URL field should not poison
+      // every subsequent request — fall back to the default instead.
+      const cfg = resolveConfig({
+        relayUrl: "/chaos-relay approvals writes",
+        apiKey: "k",
+      });
+      assert.equal(cfg.relayUrl, DEFAULT_RELAY_URL);
+      assert.equal(isConfigured(cfg), true);
+    },
+  );
+});
+
+test("resolveConfig falls back to default when env CHAOS_RELAY_URL is invalid", () => {
+  withEnv(
+    { CHAOS_RELAY_URL: "not a url", CHAOS_RELAY_API_KEY: undefined },
+    () => {
+      const cfg = resolveConfig({ relayUrl: "https://persisted.example.com" });
+      // Env wins when valid, but an INVALID env must not win — fall back.
+      assert.equal(cfg.relayUrl, DEFAULT_RELAY_URL);
+    },
+  );
+});
+
+test("resolveConfig keeps a valid persisted relayUrl when env is unset", () => {
+  withEnv({ CHAOS_RELAY_URL: undefined }, () => {
+    const cfg = resolveConfig({ relayUrl: "https://my-relay.example.com" });
+    assert.equal(cfg.relayUrl, "https://my-relay.example.com");
   });
 });

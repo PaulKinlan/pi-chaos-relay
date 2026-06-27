@@ -28,6 +28,27 @@ export function normalizeApprovalMode(v: unknown): ApprovalMode {
   return APPROVAL_MODES.includes(v as ApprovalMode) ? (v as ApprovalMode) : "off";
 }
 
+/**
+ * True if `url` is an absolute http(s) URL we can safely build request URLs
+ * from. Rejects empty strings, relative paths, and non-http schemes — all of
+ * which would otherwise produce "Failed to parse URL" errors at fetch time.
+ *
+ * Accepted: "https://chaos-relay.com", "http://localhost:8787",
+ *          "https://relay.example.com/" (trailing slash ok).
+ * Rejected: "", "/chaos-relay approvals writes", "chaos-relay.com",
+ *          "ftp://x", "file:///x", "relay foo".
+ */
+export function isValidRelayUrl(url: unknown): url is string {
+  if (typeof url !== "string" || url.trim() === "") return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(url.trim());
+  } catch {
+    return false;
+  }
+  return parsed.protocol === "http:" || parsed.protocol === "https:";
+}
+
 export interface PersistedConfig {
   /** Relay base URL. */
   relayUrl?: string;
@@ -167,7 +188,25 @@ function envInt(name: string): number | undefined {
  *   CHAOS_RELAY_POLL_MS   — poll interval (ms)
  */
 export function resolveConfig(persisted = loadPersisted()): ResolvedConfig {
-  const relayUrl = process.env.CHAOS_RELAY_URL ?? persisted.relayUrl ?? DEFAULT_RELAY_URL;
+  // Validate at the chokepoint: env > file > default, but fall back to the
+  // default if the chosen value isn't an absolute http(s) URL. This prevents a
+  // malformed value (e.g. a command accidentally pasted into the URL field)
+  // from ever reaching fetch() and throwing "Failed to parse URL".
+  const candidateUrl = process.env.CHAOS_RELAY_URL ?? persisted.relayUrl ?? DEFAULT_RELAY_URL;
+  let relayUrl = candidateUrl;
+  if (!isValidRelayUrl(candidateUrl)) {
+    // Helpful stderr warning — visible in logs without blocking startup.
+    const where = process.env.CHAOS_RELAY_URL === candidateUrl
+      ? "CHAOS_RELAY_URL env var"
+      : persisted.relayUrl === candidateUrl
+        ? "relayUrl in ~/.pi/chaos-relay.json"
+        : "default";
+    console.warn(
+      `pi-chaos-relay: ignoring invalid relay URL "${candidateUrl}" (from ${where}); ` +
+        `falling back to ${DEFAULT_RELAY_URL}. Run /chaos-relay setup to fix.`,
+    );
+    relayUrl = DEFAULT_RELAY_URL;
+  }
   const apiKey = process.env.CHAOS_RELAY_API_KEY ?? persisted.apiKey;
   const agentId = process.env.CHAOS_RELAY_AGENT_ID ?? persisted.agentId ?? "pi";
 

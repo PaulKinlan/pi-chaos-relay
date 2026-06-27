@@ -26,7 +26,9 @@ import {
 } from "./relay-client.ts";
 import {
   addChannelRecord,
+  DEFAULT_RELAY_URL,
   isConfigured,
+  isValidRelayUrl,
   APPROVAL_MODES,
   type ApprovalMode,
   loadPersisted,
@@ -909,11 +911,23 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     }
 
     const persisted = loadPersisted();
-    const relayUrl =
-      (await ctx.ui.input(
-        "Relay URL",
-        persisted.relayUrl ?? resolveConfig().relayUrl,
-      )) || resolveConfig().relayUrl;
+    // Prompt for the relay URL, re-prompting until the user enters a valid
+    // absolute http(s) URL (or accepts a valid default). This stops malformed
+    // values (empty strings, commands pasted into the field, bare hostnames)
+    // from being persisted and breaking every subsequent request.
+    const defaultUrl = persisted.relayUrl ?? resolveConfig().relayUrl;
+    let relayUrl = (await ctx.ui.input("Relay URL", defaultUrl)) || defaultUrl;
+    while (!isValidRelayUrl(relayUrl)) {
+      ctx.ui.notify(
+        `"${relayUrl}" is not a valid URL. Include the scheme, e.g. https://chaos-relay.com`,
+        "warning",
+      );
+      const re = await ctx.ui.input(
+        "Relay URL (must start with http:// or https://)",
+        DEFAULT_RELAY_URL,
+      );
+      relayUrl = re || DEFAULT_RELAY_URL;
+    }
 
     const agentId =
       (await ctx.ui.input("Agent id to route channels to", persisted.agentId ?? "pi")) || "pi";
