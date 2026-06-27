@@ -52,6 +52,32 @@ test("poller dedupes messages by id across polls", async () => {
   assert.deepEqual(second.map((m) => m.id), ["c"]); // "b" already seen
 });
 
+test("pollRaw advances the cursor but does NOT mark messages seen", async () => {
+  // Regression: the WS catch-up path calls pollRaw() and then routes the result
+  // through onMessage -> accept(). If pollRaw deduped (like poll), accept would
+  // drop everything as already-seen and nothing would reach the agent.
+  let sawSince: string | undefined = "init";
+  const client = {
+    async getMessages(since?: string) {
+      sawSince = since;
+      return { messages: [msg("a"), msg("b")], since: "cursor-1" };
+    },
+  } as unknown as RelayClient;
+  const poller = new MessagePoller(client);
+
+  const raw = await poller.pollRaw();
+  assert.equal(sawSince, undefined); // first call has no cursor
+  assert.deepEqual(raw.map((m) => m.id), ["a", "b"]);
+
+  // The downstream accept() must still surface them (they were NOT pre-consumed).
+  const delivered = poller.accept(raw);
+  assert.deepEqual(delivered.map((m) => m.id), ["a", "b"]);
+
+  // And the cursor advanced, so the next call uses it.
+  await poller.pollRaw();
+  assert.equal(sawSince, "cursor-1");
+});
+
 test("reset clears cursor and dedup state", async () => {
   const client = stubClient([{ messages: [msg("a")], since: "c1" }]);
   const poller = new MessagePoller(client);

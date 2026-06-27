@@ -232,10 +232,13 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         if (!poller) return;
         const fresh = poller.accept(messages);
         if (fresh.length === 0) return;
-        log(`delivering ${fresh.length} message(s) to the agent (push)`);
+        log(`delivering ${fresh.length} message(s) to the agent`);
         pi.sendUserMessage(formatMessagesForAgent(fresh));
       },
-      onCatchUp: async () => (poller ? await poller.poll() : []),
+      // Return RAW messages (cursor advanced, NOT deduped) so the single dedup
+      // happens in onMessage below. Using poller.poll() here would dedup first,
+      // then onMessage's accept() would drop them all as already-seen.
+      onCatchUp: async () => (poller ? await poller.pollRaw() : []),
       onAuthFailure: () => recoverApiKey(),
     });
     ws.start();

@@ -175,7 +175,8 @@ export class RelayWebSocket {
     try {
       const missed = await this.opts.onCatchUp();
       if (missed.length > 0) {
-        this.log(`catch-up delivered ${missed.length} message(s) missed while offline`);
+        this.log(`catch-up: ${missed.length} message(s) missed while offline`);
+        // onMessage dedups and injects into the agent (and logs the delivery).
         this.opts.onMessage(missed);
       }
     } catch (err) {

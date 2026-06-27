@@ -25,14 +25,26 @@ export class MessagePoller {
   }
 
   /**
-   * Fetch any new messages since the last poll. Returns only messages not
-   * previously returned by this poller instance.
+   * Fetch messages since the cursor and advance it, but do NOT mark them seen.
+   * De-duplication is left to a single downstream {@link accept} call so a
+   * delivery path never dedups twice. The WebSocket catch-up uses this and then
+   * routes the result through `onMessage` (which calls `accept`) — if catch-up
+   * used {@link poll} instead, `accept` would run twice and silently drop every
+   * caught-up message as an already-seen "duplicate".
    */
-  async poll(): Promise<ChannelMessage[]> {
+  async pollRaw(): Promise<ChannelMessage[]> {
     const result = await this.client.getMessages(this.since);
     this.since = result.since ?? this.since;
-    const fresh = this.accept(result.messages ?? []);
-    return fresh;
+    return result.messages ?? [];
+  }
+
+  /**
+   * Fetch any new messages since the last poll. Returns only messages not
+   * previously returned by this poller instance (dedups + advances the cursor).
+   * For callers that deliver the result directly (safety poll, on-demand tool).
+   */
+  async poll(): Promise<ChannelMessage[]> {
+    return this.accept(await this.pollRaw());
   }
 
   /**
