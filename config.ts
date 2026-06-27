@@ -7,7 +7,7 @@
  * with 0600 permissions.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -169,6 +169,28 @@ export function setMessagesCursor(cursor: string): void {
 /** Persist the tool-approval policy. */
 export function setApprovalMode(mode: ApprovalMode): void {
   savePersisted({ approvalMode: mode });
+}
+
+/**
+ * Reset persisted config. `scope`:
+ *  - "url"  — clear only `relayUrl` (fixes the common corruption where a bad
+ *            value was pasted/saved; keeps credentials, keypair, channels).
+ *  - "all"  — wipe the config file entirely (full fresh start; the user must
+ *            re-run setup, which registers a new session + keypair).
+ *
+ * Non-interactive and safe: used by `/chaos-relay reset` to recover from a
+ * corrupted config without needing the setup UI.
+ */
+export function resetPersisted(scope: "url" | "all"): void {
+  if (scope === "all") {
+    if (existsSync(CONFIG_PATH)) {
+      unlinkSync(CONFIG_PATH);
+    }
+    return;
+  }
+  // "url": clear just the relayUrl field. savePersisted merges, and
+  // JSON.stringify drops undefined-valued keys, so this removes it cleanly.
+  savePersisted({ relayUrl: undefined });
 }
 
 function envInt(name: string): number | undefined {

@@ -1,12 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, readFileSync, unlinkSync, copyFileSync } from "node:fs";
 import {
   DEFAULT_RELAY_URL,
   MIN_POLL_INTERVAL_MS,
+  CONFIG_PATH,
   isConfigured,
   isValidRelayUrl,
   normalizeApprovalMode,
+  resetPersisted,
   resolveConfig,
+  savePersisted,
 } from "../config.ts";
 
 /** Snapshot and restore the env vars these tests touch. */
@@ -160,5 +164,53 @@ test("resolveConfig keeps a valid persisted relayUrl when env is unset", () => {
   withEnv({ CHAOS_RELAY_URL: undefined }, () => {
     const cfg = resolveConfig({ relayUrl: "https://my-relay.example.com" });
     assert.equal(cfg.relayUrl, "https://my-relay.example.com");
+  });
+});
+
+/**
+ * Back up the user's real config file to a temp path, run `fn`, then restore it
+ * (or remove it if it didn't exist before). Lets us test the file-writing
+ * helpers (savePersisted/resetPersisted) without polluting ~/.pi/chaos-relay.json.
+ */
+function withConfigIsolated(fn: () => void): void {
+  const backup = `${CONFIG_PATH}.bak-${process.pid}-${Date.now()}`;
+  const existed = existsSync(CONFIG_PATH);
+  if (existed) copyFileSync(CONFIG_PATH, backup);
+  if (existed) unlinkSync(CONFIG_PATH);
+  try {
+    fn();
+  } finally {
+    // Restore exactly what was there before (or leave it absent).
+    if (existsSync(CONFIG_PATH)) unlinkSync(CONFIG_PATH);
+    if (existed) copyFileSync(backup, CONFIG_PATH);
+    if (existsSync(backup)) unlinkSync(backup);
+  }
+}
+
+test("resetPersisted('url') clears only relayUrl, keeps credentials + channels", () => {
+  withConfigIsolated(() => {
+    // Seed a config with a corrupted URL plus valid creds and a channel.
+    savePersisted({
+      relayUrl: "/chaos-relay approvals writes",
+      apiKey: "secret-key",
+      userId: "u-1",
+      channels: [{ channelId: "ch-1", type: "telegram", createdAt: "2026-01-01" }],
+    });
+    resetPersisted("url");
+    const after = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+    assert.equal(after.relayUrl, undefined);
+    // Credentials and channels survive.
+    assert.equal(after.apiKey, "secret-key");
+    assert.equal(after.userId, "u-1");
+    assert.equal(after.channels.length, 1);
+  });
+});
+
+test("resetPersisted('all') removes the config file entirely", () => {
+  withConfigIsolated(() => {
+    savePersisted({ relayUrl: "https://x.example.com", apiKey: "k" });
+    assert.equal(existsSync(CONFIG_PATH), true);
+    resetPersisted("all");
+    assert.equal(existsSync(CONFIG_PATH), false);
   });
 });

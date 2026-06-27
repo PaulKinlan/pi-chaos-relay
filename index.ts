@@ -33,11 +33,13 @@ import {
   type ApprovalMode,
   loadPersisted,
   normalizeApprovalMode,
+  resetPersisted,
   resolveConfig,
   savePersisted,
   setApprovalMode,
   setChannelRecords,
   setMessagesCursor,
+  CONFIG_PATH,
   type ResolvedConfig,
   type RegisteredChannelRecord,
 } from "./config.ts";
@@ -836,7 +838,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // --- /chaos-relay command --------------------------------------------------
 
   pi.registerCommand("chaos-relay", {
-    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup, add, status, poll, stop, approvals)",
+    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup, add, status, poll, stop, approvals, reset, doctor)",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parts = args.trim().split(/\s+/);
       const sub = parts[0] || "status";
@@ -852,6 +854,19 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           case "status":
             await runStatus(ctx);
             break;
+          case "doctor":
+            await runDoctor(ctx);
+            break;
+          case "reset": {
+            // `/chaos-relay reset` clears the corrupted relayUrl but keeps
+            // credentials/channels; `reset all` wipes everything. Accepts the
+            // common --all/-y flags and is non-interactive so it works even
+            // when the setup UI is unreachable.
+            const flag = parts[1]?.toLowerCase();
+            const all = flag === "all" || flag === "--all" || flag === "-a";
+            await runReset(ctx, all);
+            break;
+          }
           case "poll":
             await pollAndDeliver();
             ctx.ui.notify("chaos-relay: polled for new messages.", "info");
@@ -885,7 +900,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           }
           default:
             ctx.ui.notify(
-              `Unknown subcommand "${sub}". Use: setup | add | status | poll | stop | approvals`,
+              `Unknown subcommand "${sub}". Use: setup | add | status | poll | stop | approvals | reset | doctor`,
               "warning",
             );
         }
@@ -1031,6 +1046,164 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       }
     }
     ctx.ui.notify(lines.join("\n"), "info");
+  }
+
+  /**
+   * Non-interactive config reset. Used to recover from a corrupted config
+   * (e.g. a bad relayUrl that bricks every request) without needing the
+   * setup UI. `all=false` clears just the relayUrl; `all=true` wipes the file.
+   */
+  async function runReset(ctx: ExtensionCommandContext, all: boolean): Promise<void> {
+    const before = loadPersisted();
+    const hadUrl = Boolean(before.relayUrl);
+    const hadKey = Boolean(before.apiKey);
+    stopPolling();
+    client = undefined;
+    resetPersisted(all ? "all" : "url");
+    cfg = resolveConfig();
+    if (all) {
+      ctx.ui.notify(
+        `chaos-relay: reset complete. Config file removed (${CONFIG_PATH}). ` +
+          `Run /chaos-relay setup to start fresh.`,
+        "info",
+      );
+    } else {
+      const kept = [
+        hadKey ? "apiKey/keypair" : null,
+        before.channels?.length ? `${before.channels.length} channel(s)` : null,
+      ].filter(Boolean).join(", ");
+      ctx.ui.notify(
+        `chaos-relay: cleared relayUrl${hadUrl ? ` (was "${before.relayUrl}")` : ""}. ` +
+          `Kept: ${kept || "nothing else was set"}. ` +
+          `Run /chaos-relay setup to re-enter the URL, or /chaos-relay doctor to diagnose.`,
+        "info",
+      );
+    }
+  }
+
+  /**
+   * Diagnostics: a structured check-list of config validity, credential
+   * state, relay reachability, transport state, and channels. Non-interactive;
+   * safe to run in any state. Designed to be the first thing to run when
+   * something is wrong — including the "Failed to parse URL" failure mode.
+   */
+  async function runDoctor(ctx: ExtensionCommandContext): Promise<void> {
+    const checks: Array<{ ok: boolean; label: string; detail?: string; fix?: string }> = [];
+    const mark = (ok: boolean) => (ok ? "✓" : "✗");
+
+    // 1. Config file exists and parses.
+    let persisted: ReturnType<typeof loadPersisted> = {};
+    let fileOk = true;
+    try {
+      persisted = loadPersisted();
+    } catch (err) {
+      fileOk = false;
+      const message = err instanceof Error ? err.message : String(err);
+      checks.push({
+        ok: false,
+        label: "config file parses",
+        detail: message,
+        fix: "Run /chaos-relay reset all, then /chaos-relay setup.",
+      });
+    }
+    if (fileOk) {
+      checks.push({
+        ok: true,
+        label: `config file (${CONFIG_PATH})`,
+        detail: "present and parses",
+      });
+    }
+
+    // 2. relayUrl validity — the exact failure mode this doctor targets.
+    const envUrl = process.env.CHAOS_RELAY_URL;
+    const effectiveUrl = resolveConfig().relayUrl;
+    const urlOk = isValidRelayUrl(effectiveUrl);
+    const persistedUrl = persisted.relayUrl;
+    const urlDetail = [
+      `effective=${effectiveUrl}`,
+      envUrl ? `env=\"${envUrl}\"` : null,
+      persistedUrl ? `file=\"${persistedUrl}\"` : null,
+    ].filter(Boolean).join(", ");
+    checks.push({
+      ok: urlOk,
+      label: "relay URL is valid http(s)",
+      detail: urlDetail,
+      fix: urlOk
+        ? undefined
+        : "Run /chaos-relay reset to clear the bad URL, then /chaos-relay setup.",
+    });
+
+    // 3. Credentials present.
+    const current = resolveConfig();
+    const keyOk = Boolean(current.apiKey);
+    checks.push({
+      ok: keyOk,
+      label: "API key configured",
+      detail: keyOk ? "set" : "MISSING",
+      fix: keyOk ? undefined : "Run /chaos-relay setup.",
+    });
+    checks.push({
+      ok: Boolean(current.keyPair),
+      label: "ECDSA identity",
+      detail: current.keyPair ? "keypair present (signed requests)" : "Bearer-only (legacy)",
+    });
+
+    // 4. Reachability — only if we have a valid URL + key to try.
+    if (urlOk && keyOk) {
+      try {
+        const c = new RelayClient({
+          relayUrl: current.relayUrl,
+          apiKey: current.apiKey,
+          keyPair: current.keyPair,
+        });
+        const h = await c.health();
+        checks.push({
+          ok: true,
+          label: "relay reachable",
+          detail: `health=${h.status}${h.version ? ` (v${h.version})` : ""}`,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        checks.push({
+          ok: false,
+          label: "relay reachable",
+          detail: message,
+          fix: "Check the URL, your network, or run /chaos-relay setup again.",
+        });
+      }
+    }
+
+    // 5. Transport state.
+    checks.push({
+      ok: Boolean(ws?.connected),
+      label: "WebSocket transport",
+      detail: ws?.connected
+        ? "connected"
+        : ws
+          ? "connecting/reconnecting"
+          : "stopped (polling safety net only)",
+    });
+
+    // 6. Channels.
+    const ch = current.channels ?? [];
+    checks.push({
+      ok: ch.length > 0,
+      label: "channels registered",
+      detail: ch.length
+        ? ch.map((c) => `${c.type}:${c.channelId.slice(0, 8)}`).join(", ")
+        : "none — run /chaos-relay add",
+    });
+
+    // Render.
+    const lines = checks.map((c) => {
+      const base = `  ${mark(c.ok)} ${c.label}${c.detail ? ` — ${c.detail}` : ""}`;
+      return c.fix ? `${base}\n     → ${c.fix}` : base;
+    });
+    const allOk = checks.every((c) => c.ok);
+    const summary = allOk
+      ? "chaos-relay doctor: all checks passed."
+      : `chaos-relay doctor: ${checks.filter((c) => !c.ok).length} issue(s) found above.`;
+    ctx.ui.notify([summary, ...lines].join("\n"), allOk ? "info" : "warning");
   }
 
   // Print a short getting-started guide to the terminal when the extension

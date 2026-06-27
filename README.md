@@ -92,6 +92,21 @@ credentials, starts the background poller, and offers to add your first channel.
 Add more channels any time with `/chaos-relay add`, and check state with
 `/chaos-relay status`.
 
+## Troubleshooting
+
+If setup or a request fails with `Failed to parse URL from /…` (or any
+"relay error" during onboarding), the saved relay URL is malformed — usually
+a command was accidentally pasted into the URL field. Two ways to recover:
+
+- **`/chaos-relay doctor`** — runs a diagnostics check-list (config validity,
+  credentials, reachability, transport, channels) and points at the fix.
+- **`/chaos-relay reset`** — non-interactively clears the bad `relayUrl` but
+  keeps your credentials and channels. Then run `/chaos-relay setup` to re-enter
+  the URL. Use **`/chaos-relay reset all`** for a full wipe.
+
+Since v0.6.2 the setup prompt rejects invalid URLs (must be absolute
+`http(s)://…`), so this should no longer happen on fresh setups.
+
 ## Commands
 
 | Command | Description |
@@ -102,6 +117,8 @@ Add more channels any time with `/chaos-relay add`, and check state with
 | `/chaos-relay poll` | Poll once now and deliver any new messages |
 | `/chaos-relay stop` | Stop the background poller |
 | `/chaos-relay approvals <off\|writes\|all>` | Set/show the tool-approval policy |
+| `/chaos-relay doctor` | Diagnostics: config validity, credentials, relay reachability, transport, channels |
+| `/chaos-relay reset [all]` | Clear a corrupted `relayUrl` (keeps creds/channels); `reset all` wipes the config file |
 
 ## Tools (LLM-callable)
 
