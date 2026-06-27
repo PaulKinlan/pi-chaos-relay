@@ -201,6 +201,17 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     }
   }
 
+  /**
+   * Inject inbound channel messages into the agent. When the agent is mid-turn,
+   * a bare sendUserMessage() throws ("Agent is already processing"), so we pass
+   * deliverAs:"followUp" — that queues the message after the current turn when
+   * streaming and delivers immediately when idle. Matches pi's own extension
+   * examples (reload-runtime, git-merge-and-resolve).
+   */
+  function deliverToAgent(text: string): void {
+    pi.sendUserMessage(text, { deliverAs: "followUp" });
+  }
+
   /** Poll once and, if there are new messages, inject them into the agent. */
   async function pollAndDeliver(): Promise<void> {
     if (!poller) return;
@@ -208,7 +219,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       const messages = await poller.poll();
       if (messages.length === 0) return;
       log(`delivering ${messages.length} new message(s) to the agent`);
-      pi.sendUserMessage(formatMessagesForAgent(messages));
+      deliverToAgent(formatMessagesForAgent(messages));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log(`poll failed: ${msg}`);
@@ -233,7 +244,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         const fresh = poller.accept(messages);
         if (fresh.length === 0) return;
         log(`delivering ${fresh.length} message(s) to the agent`);
-        pi.sendUserMessage(formatMessagesForAgent(fresh));
+        deliverToAgent(formatMessagesForAgent(fresh));
       },
       // Return RAW messages (cursor advanced, NOT deduped) so the single dedup
       // happens in onMessage below. Using poller.poll() here would dedup first,
