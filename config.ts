@@ -34,6 +34,12 @@ export interface PersistedConfig {
   /** Channels registered through this extension (for reference / reply routing). */
   channels?: RegisteredChannelRecord[];
   /**
+   * Cursor (ISO timestamp) of the most recent message delivered to the agent.
+   * Persisted so a restart resumes AFTER it instead of re-reading the relay's
+   * whole 24h backlog. Advanced from delivered message timestamps.
+   */
+  messagesCursor?: string;
+  /**
    * ECDSA P-256 keypair (JWK) bound to this session at registration. The
    * private key is SECRET — it is the client's identity and is never sent to
    * the relay or committed. Stored only in this 0600 file under ~/.pi.
@@ -73,6 +79,8 @@ export interface ResolvedConfig {
   agentId: string;
   pollIntervalMs: number;
   channels: RegisteredChannelRecord[];
+  /** Resume cursor (ISO timestamp) for inbound message polling. File-only. */
+  messagesCursor?: string;
   /** ECDSA keypair for request signing. File-only (never from env). */
   keyPair?: KeyPairJwk;
   /** Pinned server public key (TOFU). File-only. */
@@ -115,6 +123,11 @@ export function setChannelRecords(channels: RegisteredChannelRecord[]): void {
   savePersisted({ channels });
 }
 
+/** Persist the inbound-message resume cursor (ISO timestamp). */
+export function setMessagesCursor(cursor: string): void {
+  savePersisted({ messagesCursor: cursor });
+}
+
 function envInt(name: string): number | undefined {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return undefined;
@@ -147,6 +160,7 @@ export function resolveConfig(persisted = loadPersisted()): ResolvedConfig {
     agentId,
     pollIntervalMs,
     channels: persisted.channels ?? [],
+    messagesCursor: persisted.messagesCursor,
     // The keypair is the client's identity and is intentionally NOT
     // overridable via env — it lives only in the 0600 config file.
     keyPair: persisted.keyPair,

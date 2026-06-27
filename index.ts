@@ -31,6 +31,7 @@ import {
   resolveConfig,
   savePersisted,
   setChannelRecords,
+  setMessagesCursor,
   type ResolvedConfig,
   type RegisteredChannelRecord,
 } from "./config.ts";
@@ -94,7 +95,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       cfg = resolveConfig();
       // Rebuild the HTTP client so catch-up polls use the new key too.
       client = new RelayClient({ relayUrl: cfg.relayUrl, apiKey: reg.apiKey, keyPair: reg.keyPair });
-      if (poller) poller = new MessagePoller(client);
+      if (poller) poller = makePoller(client);
       if (oldUserId && reg.userId === oldUserId) {
         // Same session reclaimed by keypair — channels are intact, nothing to do.
         log(`auth recovered: reclaimed session userId=${reg.userId} (channels intact)`);
@@ -191,6 +192,15 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   }
 
   /** (Re)build the relay client from current config. Returns undefined if no API key. */
+  // Create a poller that resumes from the persisted cursor and writes the
+  // cursor back as it advances, so a restart doesn't re-read the relay backlog.
+  function makePoller(c: RelayClient): MessagePoller {
+    return new MessagePoller(c, {
+      since: loadPersisted().messagesCursor,
+      onAdvance: (s) => setMessagesCursor(s),
+    });
+  }
+
   function ensureClient(): RelayClient | undefined {
     cfg = resolveConfig();
     if (!isConfigured(cfg)) {
@@ -208,7 +218,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         apiKey: cfg.apiKey!,
         keyPair: cfg.keyPair,
       });
-      poller = new MessagePoller(client);
+      poller = makePoller(client);
     }
     return client;
   }

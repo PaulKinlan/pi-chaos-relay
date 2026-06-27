@@ -13,14 +13,27 @@ export class MessagePoller {
   private since: string | undefined;
   private readonly seen = new Set<string>();
   private readonly client: RelayClient;
+  private readonly onAdvance?: (since: string) => void;
 
-  constructor(client: RelayClient) {
+  constructor(
+    client: RelayClient,
+    opts: { since?: string; onAdvance?: (since: string) => void } = {},
+  ) {
     this.client = client;
+    // Resume from a persisted cursor so a restart doesn't re-read the backlog.
+    this.since = opts.since;
+    this.onAdvance = opts.onAdvance;
   }
 
-  /** Reset cursor/dedup state (e.g. between sessions). */
+  /** The current resume cursor (ISO timestamp), or undefined if none yet. */
+  get cursor(): string | undefined {
+    return this.since;
+  }
+
+  /** Reset dedup state. Does NOT clear the resume cursor — that is persisted
+   * and intentionally survives across sessions so old messages aren't
+   * re-delivered. (The in-memory dedup set is per-process and safe to drop.) */
   reset(): void {
-    this.since = undefined;
     this.seen.clear();
   }
 
@@ -34,7 +47,10 @@ export class MessagePoller {
    */
   async pollRaw(): Promise<ChannelMessage[]> {
     const result = await this.client.getMessages(this.since);
-    this.since = result.since ?? this.since;
+    // NOTE: the cursor is advanced in accept() from delivered message
+    // timestamps, NOT from the server's response cursor — that way messages
+    // delivered via WebSocket push (which never hit pollRaw) also advance it,
+    // so a restart resumes correctly.
     return result.messages ?? [];
   }
 
@@ -54,10 +70,17 @@ export class MessagePoller {
    */
   accept(messages: ChannelMessage[]): ChannelMessage[] {
     const fresh: ChannelMessage[] = [];
+    let advanced = false;
     for (const msg of messages) {
       if (!msg?.id || this.seen.has(msg.id)) continue;
       this.seen.add(msg.id);
       fresh.push(msg);
+      // Advance the resume cursor to the latest delivered timestamp. ISO-8601
+      // strings compare chronologically, so a string compare is sufficient.
+      if (msg.timestamp && (!this.since || msg.timestamp > this.since)) {
+        this.since = msg.timestamp;
+        advanced = true;
+      }
     }
     // Keep the dedup set from growing without bound.
     if (this.seen.size > 1000) {
@@ -65,6 +88,7 @@ export class MessagePoller {
       this.seen.clear();
       for (const id of keep) this.seen.add(id);
     }
+    if (advanced && this.since) this.onAdvance?.(this.since);
     return fresh;
   }
 }
