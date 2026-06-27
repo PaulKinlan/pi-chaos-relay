@@ -143,6 +143,12 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           notes.push(
             `Email ${rec.userEmail}: re-registered. Check your inbox and click the verification link to reactivate (then email ${res.inboundAddress}).`,
           );
+        } else if (rec.type === "discord" && rec.botToken) {
+          const res = await c.registerDiscord({ botToken: rec.botToken, agentId: cfg.agentId });
+          updated.push({ ...rec, channelId: res.channelId, label: res.botUsername });
+          notes.push(
+            `Discord ${res.botUsername}: re-registered. Send the pairing code "${res.pairingCode}" to the bot to re-link this channel.`,
+          );
         } else if (rec.type === "webhook") {
           // Recreate with the same id + secret so the public URL is unchanged.
           const res = await c.registerWebhook({
@@ -484,6 +490,53 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     },
   });
 
+  // relay_register_discord — register a Discord bot channel.
+  const dcParams = Type.Object({
+    botToken: Type.String({
+      description: "Discord bot token from the Discord Developer Portal (Bot → Token).",
+    }),
+  });
+  pi.registerTool({
+    name: "relay_register_discord",
+    label: "CHAOS Relay: register Discord",
+    description:
+      "Register a Discord bot as a bidirectional channel on chaos-relay. Returns " +
+      "the channelId, bot username, and a pairing code; send the pairing code to " +
+      "the bot in Discord to finish linking. Note: Discord has no setWebhook — you " +
+      "must point the bot's interaction endpoint (or a gateway relay) at the " +
+      "relay's /discord/<channelId> URL. Requires the relay to be configured.",
+    parameters: dcParams,
+    async execute(_id: string, params: Static<typeof dcParams>) {
+      const c = ensureClient();
+      if (!c) {
+        return textResult("chaos-relay is not configured. Run `/chaos-relay setup` first.");
+      }
+      try {
+        const res = await c.registerDiscord({ botToken: params.botToken, agentId: cfg.agentId });
+        addChannelRecord({
+          channelId: res.channelId,
+          type: "discord",
+          label: res.botUsername,
+          createdAt: new Date().toISOString(),
+          // Persisted (0600, ~/.pi) so the channel can be auto re-registered if
+          // the relay ever loses the session.
+          botToken: params.botToken,
+        });
+        return textResult(
+          `Discord channel registered.\n` +
+            `  channelId:   ${res.channelId}\n` +
+            `  bot:         ${res.botUsername}\n` +
+            `  pairingCode: ${res.pairingCode}\n\n` +
+            `In Discord, message the bot and send the pairing code "${res.pairingCode}" to complete setup. ` +
+            `Make sure the bot forwards events to the relay's /discord/${res.channelId} endpoint.`,
+          res,
+        );
+      } catch (err) {
+        throw toFriendly(err);
+      }
+    },
+  });
+
   // relay_register_email — register an email channel.
   const emailParams = Type.Object({
     userEmail: Type.String({ description: "Your email address to link to this channel." }),
@@ -502,19 +555,26 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       if (!c) {
         return textResult("chaos-relay is not configured. Run `/chaos-relay setup` first.");
       }
+      // The relay requires a channelName (it seeds the inbound address slug).
+      // Default to a slug derived from the email's local part so callers don't
+      // have to supply one.
+      const channelName = params.channelName ||
+        params.userEmail.split("@")[0].replace(/[^a-z0-9]+/gi, "-")
+          .replace(/^-+|-+$/g, "").toLowerCase() ||
+        cfg.agentId || "agent";
       try {
         const res = await c.registerEmail({
           userEmail: params.userEmail,
           agentId: cfg.agentId,
-          channelName: params.channelName,
+          channelName,
         });
         addChannelRecord({
           channelId: res.channelId,
           type: "email",
-          label: params.channelName ?? params.userEmail,
+          label: channelName,
           createdAt: new Date().toISOString(),
           userEmail: params.userEmail,
-          channelName: params.channelName,
+          channelName,
         });
         return textResult(
           `Email channel registered (pending verification).\n` +

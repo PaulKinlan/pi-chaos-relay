@@ -99,6 +99,12 @@ export interface TelegramRegisterResult {
   pairingCode: string;
 }
 
+export interface DiscordRegisterResult {
+  channelId: string;
+  botUsername: string;
+  pairingCode: string;
+}
+
 export interface EmailRegisterResult {
   channelId: string;
   inboundAddress: string;
@@ -403,6 +409,18 @@ export class RelayClient {
     return this.request<TelegramRegisterResult>(
       "POST",
       "/channels/telegram/register",
+      { botToken: params.botToken, agentId: params.agentId },
+    );
+  }
+
+  /** Register a Discord bot as a bidirectional channel. */
+  async registerDiscord(params: {
+    botToken: string;
+    agentId: string;
+  }): Promise<DiscordRegisterResult> {
+    return this.request<DiscordRegisterResult>(
+      "POST",
+      "/channels/discord/register",
       { botToken: params.botToken, agentId: params.agentId },
     );
   }

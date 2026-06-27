@@ -45,7 +45,7 @@ export interface PersistedConfig {
 
 export interface RegisteredChannelRecord {
   channelId: string;
-  type: "telegram" | "email" | "webhook";
+  type: "telegram" | "email" | "webhook" | "discord";
   label?: string;
   createdAt: string;
   /**

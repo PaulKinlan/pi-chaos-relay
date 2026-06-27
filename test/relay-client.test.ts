@@ -123,6 +123,22 @@ test("registerWebhook re-registers with a stable id + secret for URL stability",
   assert.deepEqual(sent.metadata, { webhookSecret: "keep" });
 });
 
+test("registerDiscord hits the right endpoint with agentId", async () => {
+  const { fn, calls } = mockFetch(() => ({
+    status: 201,
+    body: { channelId: "ch_d", botUsername: "pi-bot", pairingCode: "WXYZ" },
+  }));
+  const client = new RelayClient({ relayUrl: "http://relay", apiKey: "k", fetchImpl: fn });
+  const res = await client.registerDiscord({ botToken: "dtok", agentId: "pi" });
+  assert.equal(res.botUsername, "pi-bot");
+  assert.equal(res.pairingCode, "WXYZ");
+  assert.equal(calls[0].url, "http://relay/channels/discord/register");
+  assert.deepEqual(JSON.parse(calls[0].init?.body as string), {
+    botToken: "dtok",
+    agentId: "pi",
+  });
+});
+
 test("registerEmail hits the right endpoint", async () => {
   const { fn, calls } = mockFetch(() => ({
     status: 201,
