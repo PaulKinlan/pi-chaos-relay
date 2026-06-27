@@ -1020,8 +1020,12 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const lines = [
       `relayUrl:      ${current.relayUrl}`,
       `agentId:       ${current.agentId}`,
-      `apiKey:        ${current.apiKey ? "set" : "MISSING (run /chaos-relay setup)"}`,
-      `identity:      ${current.keyPair ? "ECDSA P-256 (signed requests)" : "Bearer-only (legacy)"}`,
+      `identity:      ${current.keyPair ? "ECDSA P-256 keypair (durable identity)" : "Bearer-only (legacy, no keypair)"}`,
+      `apiKey:        ${
+        current.apiKey
+          ? (current.keyPair ? "cached (auto-issued from your ECDSA key)" : "set")
+          : (current.keyPair ? "not cached — auto-issued from your ECDSA key on connect" : "MISSING (run /chaos-relay setup)")
+      }`,
       `userId:        ${current.userId ?? "(unknown)"}`,
       `transport:     WebSocket (${ws?.connected ? "connected" : ws ? "connecting/reconnecting" : "stopped"}) + ${SAFETY_POLL_MS}ms safety poll`,
       `approvals:     ${current.approvalMode} (off=autonomous, writes=shell/edit/write, all=every tool)`,
@@ -1133,27 +1137,50 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         : "Run /chaos-relay reset to clear the bad URL, then /chaos-relay setup.",
     });
 
-    // 3. Credentials present.
+    // 3. Identity + session token.
+    // The ECDSA keypair is the durable identity. The Bearer API key is just a
+    // session token AUTO-ISSUED from that keypair — you never supply it or need
+    // to keep it; if it's absent or stale the client re-issues it from the
+    // keypair on the next connect. So with a keypair present, a missing API key
+    // is NOT an error.
     const current = resolveConfig();
-    const keyOk = Boolean(current.apiKey);
+    const hasKeyPair = Boolean(current.keyPair);
+    const hasApiKey = Boolean(current.apiKey);
+
     checks.push({
-      ok: keyOk,
-      label: "API key configured",
-      detail: keyOk ? "set" : "MISSING",
-      fix: keyOk ? undefined : "Run /chaos-relay setup.",
-    });
-    checks.push({
-      ok: Boolean(current.keyPair),
-      label: "ECDSA identity",
-      detail: current.keyPair ? "keypair present (signed requests)" : "Bearer-only (legacy)",
+      ok: hasKeyPair,
+      label: "ECDSA identity (keypair)",
+      detail: hasKeyPair
+        ? "present — your durable identity; the API key is auto-derived from it"
+        : "missing",
+      fix: hasKeyPair ? undefined : "Run /chaos-relay setup to generate one.",
     });
 
-    // 4. Reachability — only if we have a valid URL + key to try.
-    if (urlOk && keyOk) {
+    if (hasKeyPair) {
+      // With a keypair the API key is disposable/auto-recovered — never an error.
+      checks.push({
+        ok: true,
+        label: "session API key",
+        detail: hasApiKey
+          ? "cached (auto-issued from your ECDSA key)"
+          : "not cached yet — auto-issued from your ECDSA key on next connect",
+      });
+    } else {
+      // Legacy Bearer-only: the API key is the only credential, so it's required.
+      checks.push({
+        ok: hasApiKey,
+        label: "session API key (Bearer-only, no keypair)",
+        detail: hasApiKey ? "set" : "MISSING",
+        fix: hasApiKey ? undefined : "Run /chaos-relay setup.",
+      });
+    }
+
+    // 4. Reachability — /health is unauthenticated, so a valid URL is enough.
+    if (urlOk) {
       try {
         const c = new RelayClient({
           relayUrl: current.relayUrl,
-          apiKey: current.apiKey,
+          apiKey: current.apiKey ?? "",
           keyPair: current.keyPair,
         });
         const h = await c.health();
