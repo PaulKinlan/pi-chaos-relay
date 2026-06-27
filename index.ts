@@ -30,7 +30,9 @@ import {
   loadPersisted,
   resolveConfig,
   savePersisted,
+  setChannelRecords,
   type ResolvedConfig,
+  type RegisteredChannelRecord,
 } from "./config.ts";
 import { MessagePoller, formatMessagesForAgent } from "./poller.ts";
 import { RelayWebSocket } from "./ws-client.ts";
@@ -72,6 +74,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       log("auth recovery skipped: no keypair persisted (run /chaos-relay setup)");
       return null;
     }
+    const oldUserId = persisted.userId;
     try {
       const reg = await registerSessionWithKey(cfg.relayUrl, { keyPair: persisted.keyPair });
       savePersisted({
@@ -84,11 +87,81 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       // Rebuild the HTTP client so catch-up polls use the new key too.
       client = new RelayClient({ relayUrl: cfg.relayUrl, apiKey: reg.apiKey, keyPair: reg.keyPair });
       if (poller) poller = new MessagePoller(client);
-      log(`auth recovered: reclaimed session userId=${reg.userId}`);
+      if (oldUserId && reg.userId === oldUserId) {
+        // Same session reclaimed by keypair — channels are intact, nothing to do.
+        log(`auth recovered: reclaimed session userId=${reg.userId} (channels intact)`);
+      } else {
+        // Forced-new session — the relay lost our channels. Auto re-register them.
+        log(`auth recovered: NEW session userId=${reg.userId} (was ${oldUserId ?? "none"}); re-binding channels`);
+        await rebindChannels();
+      }
       return reg.apiKey;
     } catch (err) {
       log(`auth recovery failed: ${err instanceof Error ? err.message : String(err)}`);
       return null;
+    }
+  }
+
+  /**
+   * Re-register persisted channels against the current (new) session and update
+   * their stored channelIds. Telegram/email re-registration is automatic, but
+   * the relay issues a fresh pairing code / verification step for security — so
+   * we surface that to the user (log + a message injected into the agent) to
+   * complete the one manual step. Channels without stored re-bind material are
+   * skipped with a note.
+   */
+  async function rebindChannels(): Promise<void> {
+    const c = client;
+    if (!c) return;
+    const records = loadPersisted().channels ?? [];
+    if (records.length === 0) return;
+    const updated: RegisteredChannelRecord[] = [];
+    const notes: string[] = [];
+    for (const rec of records) {
+      try {
+        if (rec.type === "telegram" && rec.botToken) {
+          const res = await c.registerTelegram({ botToken: rec.botToken, agentId: cfg.agentId });
+          updated.push({ ...rec, channelId: res.channelId, label: res.botUsername });
+          notes.push(
+            `Telegram @${res.botUsername}: re-registered. Send the pairing code "${res.pairingCode}" to the bot to re-link this chat.`,
+          );
+        } else if (rec.type === "email" && rec.userEmail) {
+          const res = await c.registerEmail({
+            userEmail: rec.userEmail,
+            agentId: cfg.agentId,
+            channelName: rec.channelName,
+          });
+          updated.push({ ...rec, channelId: res.channelId });
+          notes.push(
+            `Email ${rec.userEmail}: re-registered. Check your inbox and click the verification link to reactivate (then email ${res.inboundAddress}).`,
+          );
+        } else {
+          updated.push(rec); // no re-bind material — keep the record, note it
+          notes.push(
+            `${rec.type} channel ${rec.label ?? rec.channelId}: could not auto re-bind (no stored ${rec.type === "telegram" ? "bot token" : "email"}). Re-add it with /chaos-relay or the relay_register_* tool.`,
+          );
+        }
+      } catch (err) {
+        updated.push(rec);
+        notes.push(
+          `${rec.type} channel ${rec.label ?? rec.channelId}: re-bind failed — ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    setChannelRecords(updated);
+    cfg = resolveConfig();
+    if (notes.length > 0) {
+      const summary =
+        "chaos-relay recovered a new session after the relay lost the old one. " +
+        "Channel re-binding status (some need a quick manual step):\n- " +
+        notes.join("\n- ");
+      log(summary);
+      // Surface to the user via the agent so they can complete pairing/verification.
+      try {
+        pi.sendUserMessage(summary);
+      } catch {
+        /* agent may not be ready to receive — the log still records it */
+      }
     }
   }
 
@@ -310,6 +383,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           type: "telegram",
           label: res.botUsername,
           createdAt: new Date().toISOString(),
+          // Persisted (0600, ~/.pi) so the channel can be auto re-registered if
+          // the relay ever loses the session.
+          botToken: params.botToken,
         });
         return textResult(
           `Telegram channel registered.\n` +
@@ -354,6 +430,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           type: "email",
           label: params.channelName ?? params.userEmail,
           createdAt: new Date().toISOString(),
+          userEmail: params.userEmail,
+          channelName: params.channelName,
         });
         return textResult(
           `Email channel registered (pending verification).\n` +

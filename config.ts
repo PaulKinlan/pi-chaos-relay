@@ -48,6 +48,16 @@ export interface RegisteredChannelRecord {
   type: "telegram" | "email";
   label?: string;
   createdAt: string;
+  /**
+   * Material to AUTO RE-REGISTER this channel if the relay loses the session
+   * (a forced-new session, where channels can't be reclaimed by keypair).
+   * Secret — the Telegram bot token especially — so it lives only in this 0600
+   * file under ~/.pi and is never committed. Optional: channels registered
+   * before this existed simply won't auto re-bind.
+   */
+  botToken?: string;
+  userEmail?: string;
+  channelName?: string;
 }
 
 export interface ResolvedConfig {
@@ -91,6 +101,11 @@ export function addChannelRecord(record: RegisteredChannelRecord): void {
   const persisted = loadPersisted();
   const channels = persisted.channels ?? [];
   channels.push(record);
+  savePersisted({ channels });
+}
+
+/** Replace the full channel list (e.g. after auto re-binding to a new session). */
+export function setChannelRecords(channels: RegisteredChannelRecord[]): void {
   savePersisted({ channels });
 }
 
