@@ -21,7 +21,7 @@ Telegram / Email ──> CHAOS relay ──poll GET /messages──> pi agent
 ## Quick start
 
 ```bash
-pi install git:github.com/paulkinlan/pi-chaos-relay
+pi install pi-chaos-relay
 ```
 
 Then, inside pi:
@@ -49,9 +49,14 @@ ask the agent: *"register a Telegram bot, the token is 123:ABC."*
 
 ## Install
 
+Published on npm as [`pi-chaos-relay`](https://www.npmjs.com/package/pi-chaos-relay):
+
 ```bash
+pi install pi-chaos-relay
+# or pin a version:
+pi install pi-chaos-relay@latest
+# or from git / a local checkout:
 pi install git:github.com/paulkinlan/pi-chaos-relay
-# or, from a local checkout:
 pi install ./pi-chaos-relay
 ```
 
