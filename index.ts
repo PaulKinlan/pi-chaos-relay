@@ -738,19 +738,39 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         const { summary } = await addTelegram(c, token.trim());
         ctx.ui.notify(summary, "info");
       } else if (kind === "Discord") {
+        ctx.ui.notify(
+          "To get a Discord bot token: go to discord.com/developers/applications, " +
+            "click New Application, open the Bot tab, click Reset Token, and copy it. " +
+            "Then paste it next. (After this you'll send a pairing code to the bot, " +
+            "and point the bot's events at the relay — I'll show the exact URL.)",
+          "info",
+        );
         const token = await ctx.ui.input("Discord bot token (Developer Portal → Bot → Token)", "");
         if (!token?.trim()) return ctx.ui.notify("No token entered — cancelled.", "warning");
         ctx.ui.notify("Registering Discord bot…", "info");
         const { summary } = await addDiscord(c, token.trim());
         ctx.ui.notify(summary, "info");
       } else if (kind === "Email") {
+        ctx.ui.notify(
+          "Enter the email address you'll send from. I'll give you a private inbound " +
+            "address and email you a verification link — click it to activate, then " +
+            "anything you send to that inbound address reaches the agent.",
+          "info",
+        );
         const email = await ctx.ui.input("Your email address to link", "");
         if (!email?.trim()) return ctx.ui.notify("No email entered — cancelled.", "warning");
         ctx.ui.notify("Registering email channel…", "info");
         const { summary } = await addEmail(c, email.trim());
         ctx.ui.notify(summary, "info");
       } else if (kind?.startsWith("Webhook")) {
-        const name = await ctx.ui.input("Optional name for this webhook (blank for none)", "");
+        ctx.ui.notify(
+          "A webhook is a one-way inbound URL: any service that POSTs to it (GitHub, " +
+            "Zapier, a cron job, your own script…) delivers a message to the agent. " +
+            "You'll get the URL to paste into that service next. Give it a name so you " +
+            "can recognise it later.",
+          "info",
+        );
+        const name = await ctx.ui.input("Name for this webhook (e.g. github, cron)", "");
         ctx.ui.notify("Registering webhook…", "info");
         const { summary } = await addWebhook(c, name?.trim() || undefined);
         ctx.ui.notify(summary, "info");
@@ -968,6 +988,51 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     },
   });
 
+  /** A few playful, kebab-case names to suggest when naming a connection. */
+  function suggestSessionNames(count = 3): string[] {
+    const adjectives = [
+      "brave", "cosmic", "mellow", "swift", "clever", "sunny", "witty", "zen",
+      "turbo", "nifty", "plucky", "fuzzy", "breezy", "snappy", "jolly",
+    ];
+    const creatures = [
+      "otter", "panda", "comet", "ferret", "maple", "robin", "pixel", "walrus",
+      "gecko", "badger", "heron", "yak", "lynx", "puffin", "marmot",
+    ];
+    const pick = (xs: string[]) => xs[Math.floor(Math.random() * xs.length)];
+    const out = new Set<string>();
+    // Bounded attempts so the small word-list can't loop forever.
+    for (let i = 0; out.size < count && i < count * 20; i++) {
+      out.add(`${pick(adjectives)}-${pick(creatures)}`);
+    }
+    return [...out];
+  }
+
+  /**
+   * Ask the user to NAME this connection (stored as `agentId`). It's just a
+   * friendly label so you can tell apart multiple connections to chaos (e.g. one
+   * per device or bot) — routing is by your keypair, not this name. Offers fun
+   * suggestions so nobody has to invent (or Google) anything.
+   */
+  async function promptSessionName(
+    ctx: ExtensionCommandContext,
+    current: string,
+  ): Promise<string> {
+    const suggestions = suggestSessionNames(3);
+    const existing = current && current !== "pi" ? [current] : [];
+    const options = [...new Set([...existing, ...suggestions]), "Enter my own…"];
+    const choice = await ctx.ui.select(
+      "Name this connection (just a label so you can tell several apart — " +
+        "e.g. one per device or bot)",
+      options,
+    );
+    if (!choice) return current || suggestions[0]; // cancelled — keep/auto-pick
+    if (choice !== "Enter my own…") return choice;
+    const custom = await ctx.ui.input("Connection name", current || suggestions[0]);
+    const slug = (custom || "").trim().toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    return slug || current || suggestions[0];
+  }
+
   /**
    * Interactive setup: confirm/register a relay session, persist credentials,
    * and (re)start the poller. Telegram/email registration is left to the
@@ -1015,7 +1080,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         )) || DEFAULT_RELAY_URL;
       }
 
-      agentId = (await ctx.ui.input("Agent id to route channels to", agentId)) || "pi";
+      agentId = await promptSessionName(ctx, agentId);
 
       const haveKey = Boolean(apiKey);
       const action = await ctx.ui.select(
@@ -1095,7 +1160,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const current = resolveConfig();
     const lines = [
       `relayUrl:      ${current.relayUrl}`,
-      `agentId:       ${current.agentId}`,
+      `connection:    ${current.agentId} (this session's name)`,
       `identity:      ${current.keyPair ? "ECDSA P-256 keypair (durable identity)" : "Bearer-only (legacy, no keypair)"}`,
       `apiKey:        ${
         current.apiKey
