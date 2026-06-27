@@ -31,9 +31,19 @@ export class MessagePoller {
   async poll(): Promise<ChannelMessage[]> {
     const result = await this.client.getMessages(this.since);
     this.since = result.since ?? this.since;
+    const fresh = this.accept(result.messages ?? []);
+    return fresh;
+  }
+
+  /**
+   * Filter a batch of messages (e.g. pushed over the WebSocket) through the
+   * same de-dup set, so a message delivered by push and then again by a
+   * catch-up poll is only surfaced once. Returns the fresh ones.
+   */
+  accept(messages: ChannelMessage[]): ChannelMessage[] {
     const fresh: ChannelMessage[] = [];
-    for (const msg of result.messages ?? []) {
-      if (this.seen.has(msg.id)) continue;
+    for (const msg of messages) {
+      if (!msg?.id || this.seen.has(msg.id)) continue;
       this.seen.add(msg.id);
       fresh.push(msg);
     }

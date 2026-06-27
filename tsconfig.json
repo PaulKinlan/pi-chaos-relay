@@ -9,5 +9,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["index.ts", "relay-client.ts", "config.ts", "poller.ts", "crypto.ts", "test/**/*.ts"]
+  "include": ["index.ts", "relay-client.ts", "config.ts", "poller.ts", "crypto.ts", "ws-client.ts", "test/**/*.ts"]
 }

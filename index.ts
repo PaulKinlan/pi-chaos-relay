@@ -33,6 +33,13 @@ import {
   type ResolvedConfig,
 } from "./config.ts";
 import { MessagePoller, formatMessagesForAgent } from "./poller.ts";
+import { RelayWebSocket } from "./ws-client.ts";
+
+/**
+ * Slow safety poll. The WebSocket is the primary transport (instant push);
+ * this only runs as a backstop in case a push is missed between reconnects.
+ */
+const SAFETY_POLL_MS = 120_000;
 
 const LOG_PREFIX = "[pi-chaos-relay]";
 
@@ -48,8 +55,42 @@ function textResult(text: string, details: unknown = {}) {
 export default function chaosRelayExtension(pi: ExtensionAPI): void {
   let client: RelayClient | undefined;
   let poller: MessagePoller | undefined;
+  let ws: RelayWebSocket | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   let cfg: ResolvedConfig = resolveConfig();
+
+  /**
+   * Re-register with the persisted keypair to recover a working apiKey after a
+   * relay data loss (the relay reclaims the SAME session for the same key, so
+   * the userId/channels are preserved when its store still has the index; a
+   * fresh session is created otherwise). Persists and returns the new apiKey,
+   * or null if there's no keypair to recover with.
+   */
+  async function recoverApiKey(): Promise<string | null> {
+    const persisted = loadPersisted();
+    if (!persisted.keyPair) {
+      log("auth recovery skipped: no keypair persisted (run /chaos-relay setup)");
+      return null;
+    }
+    try {
+      const reg = await registerSessionWithKey(cfg.relayUrl, { keyPair: persisted.keyPair });
+      savePersisted({
+        apiKey: reg.apiKey,
+        userId: reg.userId,
+        keyPair: reg.keyPair,
+        serverPublicKey: reg.serverPublicKey ?? persisted.serverPublicKey,
+      });
+      cfg = resolveConfig();
+      // Rebuild the HTTP client so catch-up polls use the new key too.
+      client = new RelayClient({ relayUrl: cfg.relayUrl, apiKey: reg.apiKey, keyPair: reg.keyPair });
+      if (poller) poller = new MessagePoller(client);
+      log(`auth recovered: reclaimed session userId=${reg.userId}`);
+      return reg.apiKey;
+    } catch (err) {
+      log(`auth recovery failed: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+  }
 
   /** (Re)build the relay client from current config. Returns undefined if no API key. */
   function ensureClient(): RelayClient | undefined {
@@ -75,10 +116,15 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   }
 
   function stopPolling(): void {
+    if (ws) {
+      ws.stop();
+      ws = undefined;
+      log("relay WebSocket stopped");
+    }
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = undefined;
-      log("background poller stopped");
+      log("safety poller stopped");
     }
   }
 
@@ -99,14 +145,29 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   function startPolling(): void {
     stopPolling();
     if (!ensureClient()) {
-      log("not configured — background poller idle (run `/chaos-relay setup`)");
+      log("not configured — relay transport idle (run `/chaos-relay setup`)");
       return;
     }
-    log(`background poller starting (every ${cfg.pollIntervalMs}ms)`);
-    // Kick off an immediate poll, then on an interval. `unref` so the timer
-    // never keeps the process alive on its own.
-    void pollAndDeliver();
-    pollTimer = setInterval(() => void pollAndDeliver(), cfg.pollIntervalMs);
+    // Primary transport: WebSocket push. The relay sends inbound messages the
+    // instant they arrive (no 15s lag), and we reply over the same socket.
+    log(`connecting relay WebSocket to ${cfg.relayUrl}`);
+    ws = new RelayWebSocket({
+      relayUrl: cfg.relayUrl,
+      apiKey: cfg.apiKey!,
+      log: (m) => log(m),
+      onMessage: (messages) => {
+        if (!poller) return;
+        const fresh = poller.accept(messages);
+        if (fresh.length === 0) return;
+        log(`delivering ${fresh.length} message(s) to the agent (push)`);
+        pi.sendUserMessage(formatMessagesForAgent(fresh));
+      },
+      onCatchUp: async () => (poller ? await poller.poll() : []),
+      onAuthFailure: () => recoverApiKey(),
+    });
+    ws.start();
+    // Safety net only: a slow poll in case a push is missed between reconnects.
+    pollTimer = setInterval(() => void pollAndDeliver(), SAFETY_POLL_MS);
     if (typeof pollTimer.unref === "function") pollTimer.unref();
   }
 
@@ -183,6 +244,25 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         return textResult(
           "chaos-relay is not configured. Run `/chaos-relay setup` (or set CHAOS_RELAY_API_KEY).",
         );
+      }
+      // Prefer the WebSocket (same socket the message arrived on) for instant
+      // delivery; fall back to a signed HTTP POST /reply if it isn't connected
+      // or the ack times out.
+      if (ws?.connected) {
+        try {
+          const res = await ws.reply({
+            channelType: params.channelType,
+            channelId: params.channelId,
+            content: params.content,
+            replyTo: params.replyTo,
+          });
+          return textResult(
+            `Reply sent to ${params.channelType} channel ${params.channelId} (via WebSocket).`,
+            res,
+          );
+        } catch (err) {
+          log(`WS reply failed, falling back to HTTP: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
       try {
         const res = await c.reply({
@@ -411,8 +491,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       `apiKey:        ${current.apiKey ? "set" : "MISSING (run /chaos-relay setup)"}`,
       `identity:      ${current.keyPair ? "ECDSA P-256 (signed requests)" : "Bearer-only (legacy)"}`,
       `userId:        ${current.userId ?? "(unknown)"}`,
-      `pollInterval:  ${current.pollIntervalMs}ms`,
-      `poller:        ${pollTimer ? "running" : "stopped"}`,
+      `transport:     WebSocket (${ws?.connected ? "connected" : ws ? "connecting/reconnecting" : "stopped"}) + ${SAFETY_POLL_MS}ms safety poll`,
       `channels:      ${current.channels.length}`,
     ];
     for (const ch of current.channels) {
