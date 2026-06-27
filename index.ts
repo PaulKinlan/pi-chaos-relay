@@ -569,6 +569,151 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     },
   });
 
+  // ── Channel registration helpers ──────────────────────────────────────────
+  // Each registers + persists a channel and returns a human-facing summary with
+  // next steps. Shared by the LLM tools AND the interactive `/chaos-relay add`
+  // command so both stay in sync.
+  async function addTelegram(c: RelayClient, botToken: string) {
+    const res = await c.registerTelegram({ botToken, agentId: cfg.agentId });
+    addChannelRecord({
+      channelId: res.channelId,
+      type: "telegram",
+      label: res.botUsername,
+      createdAt: new Date().toISOString(),
+      botToken,
+    });
+    return {
+      res,
+      summary: `Telegram channel registered.\n` +
+        `  channelId:   ${res.channelId}\n` +
+        `  bot:         @${res.botUsername}\n` +
+        `  pairingCode: ${res.pairingCode}\n\n` +
+        `Next: open Telegram, message @${res.botUsername}, and send the pairing ` +
+        `code "${res.pairingCode}" to finish linking.`,
+    };
+  }
+
+  async function addDiscord(c: RelayClient, botToken: string) {
+    const res = await c.registerDiscord({ botToken, agentId: cfg.agentId });
+    addChannelRecord({
+      channelId: res.channelId,
+      type: "discord",
+      label: res.botUsername,
+      createdAt: new Date().toISOString(),
+      botToken,
+    });
+    return {
+      res,
+      summary: `Discord channel registered.\n` +
+        `  channelId:   ${res.channelId}\n` +
+        `  bot:         ${res.botUsername}\n` +
+        `  pairingCode: ${res.pairingCode}\n\n` +
+        `Next: in Discord, message the bot and send the pairing code ` +
+        `"${res.pairingCode}". Make sure the bot forwards events to the relay's ` +
+        `/discord/${res.channelId} endpoint.`,
+    };
+  }
+
+  async function addEmail(c: RelayClient, userEmail: string, channelName?: string) {
+    // The relay requires a channelName (it seeds the inbound address slug);
+    // default it from the email's local part.
+    const name = channelName ||
+      userEmail.split("@")[0].replace(/[^a-z0-9]+/gi, "-")
+        .replace(/^-+|-+$/g, "").toLowerCase() ||
+      cfg.agentId || "agent";
+    const res = await c.registerEmail({ userEmail, agentId: cfg.agentId, channelName: name });
+    addChannelRecord({
+      channelId: res.channelId,
+      type: "email",
+      label: name,
+      createdAt: new Date().toISOString(),
+      userEmail,
+      channelName: name,
+    });
+    return {
+      res,
+      summary: `Email channel registered (pending verification).\n` +
+        `  channelId:      ${res.channelId}\n` +
+        `  inboundAddress: ${res.inboundAddress}\n\n` +
+        `Next: check ${userEmail} for a verification link and click it. Once ` +
+        `active, email ${res.inboundAddress} to reach the agent.`,
+    };
+  }
+
+  async function addWebhook(c: RelayClient, channelName?: string) {
+    const res = await c.registerWebhook({ channelName });
+    addChannelRecord({
+      channelId: res.channelId,
+      type: "webhook",
+      label: channelName ?? "webhook",
+      createdAt: new Date().toISOString(),
+      channelName,
+      webhookSecret: res.webhookSecret,
+    });
+    return {
+      res,
+      summary: `Inbound webhook channel registered.\n` +
+        `  channelId: ${res.channelId}\n` +
+        `  POST to:   ${res.webhookUrl}\n\n` +
+        `Any service that POSTs JSON, form data, or text to that URL delivers a ` +
+        `message to the agent. It is one-way (inbound) — nothing to reply to.`,
+    };
+  }
+
+  /** Interactive "add a channel" wizard for the /chaos-relay command. */
+  async function runAddChannel(ctx: ExtensionCommandContext): Promise<void> {
+    if (!ctx.hasUI) {
+      ctx.ui.notify(
+        'Adding a channel needs interactive UI. Either run this in interactive ' +
+          'mode, or just ask the agent — e.g. "register a telegram bot, token is 123:ABC".',
+        "warning",
+      );
+      return;
+    }
+    const c = ensureClient();
+    if (!c) {
+      ctx.ui.notify("chaos-relay isn't configured yet. Run /chaos-relay setup first.", "warning");
+      return;
+    }
+    const kind = await ctx.ui.select(
+      "Add which channel?",
+      ["Telegram", "Discord", "Email", "Webhook (inbound only)"],
+    );
+    try {
+      if (kind === "Telegram") {
+        const token = await ctx.ui.input("Telegram bot token (from @BotFather)", "");
+        if (!token?.trim()) return ctx.ui.notify("No token entered — cancelled.", "warning");
+        ctx.ui.notify("Registering Telegram bot…", "info");
+        const { summary } = await addTelegram(c, token.trim());
+        ctx.ui.notify(summary, "info");
+      } else if (kind === "Discord") {
+        const token = await ctx.ui.input("Discord bot token (Developer Portal → Bot → Token)", "");
+        if (!token?.trim()) return ctx.ui.notify("No token entered — cancelled.", "warning");
+        ctx.ui.notify("Registering Discord bot…", "info");
+        const { summary } = await addDiscord(c, token.trim());
+        ctx.ui.notify(summary, "info");
+      } else if (kind === "Email") {
+        const email = await ctx.ui.input("Your email address to link", "");
+        if (!email?.trim()) return ctx.ui.notify("No email entered — cancelled.", "warning");
+        ctx.ui.notify("Registering email channel…", "info");
+        const { summary } = await addEmail(c, email.trim());
+        ctx.ui.notify(summary, "info");
+      } else if (kind?.startsWith("Webhook")) {
+        const name = await ctx.ui.input("Optional name for this webhook (blank for none)", "");
+        ctx.ui.notify("Registering webhook…", "info");
+        const { summary } = await addWebhook(c, name?.trim() || undefined);
+        ctx.ui.notify(summary, "info");
+      } else {
+        ctx.ui.notify("Cancelled.", "info");
+      }
+    } catch (err) {
+      ctx.ui.notify(
+        `Channel registration failed: ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+      );
+    }
+  }
+
   // relay_register_telegram — register a Telegram bot channel.
   const tgParams = Type.Object({
     botToken: Type.String({
@@ -589,24 +734,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         return textResult("chaos-relay is not configured. Run `/chaos-relay setup` first.");
       }
       try {
-        const res = await c.registerTelegram({ botToken: params.botToken, agentId: cfg.agentId });
-        addChannelRecord({
-          channelId: res.channelId,
-          type: "telegram",
-          label: res.botUsername,
-          createdAt: new Date().toISOString(),
-          // Persisted (0600, ~/.pi) so the channel can be auto re-registered if
-          // the relay ever loses the session.
-          botToken: params.botToken,
-        });
-        return textResult(
-          `Telegram channel registered.\n` +
-            `  channelId:   ${res.channelId}\n` +
-            `  bot:         @${res.botUsername}\n` +
-            `  pairingCode: ${res.pairingCode}\n\n` +
-            `Open Telegram, message @${res.botUsername}, and send the pairing code "${res.pairingCode}" to complete setup.`,
-          res,
-        );
+        const { res, summary } = await addTelegram(c, params.botToken);
+        return textResult(summary, res);
       } catch (err) {
         throw toFriendly(err);
       }
@@ -635,25 +764,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         return textResult("chaos-relay is not configured. Run `/chaos-relay setup` first.");
       }
       try {
-        const res = await c.registerDiscord({ botToken: params.botToken, agentId: cfg.agentId });
-        addChannelRecord({
-          channelId: res.channelId,
-          type: "discord",
-          label: res.botUsername,
-          createdAt: new Date().toISOString(),
-          // Persisted (0600, ~/.pi) so the channel can be auto re-registered if
-          // the relay ever loses the session.
-          botToken: params.botToken,
-        });
-        return textResult(
-          `Discord channel registered.\n` +
-            `  channelId:   ${res.channelId}\n` +
-            `  bot:         ${res.botUsername}\n` +
-            `  pairingCode: ${res.pairingCode}\n\n` +
-            `In Discord, message the bot and send the pairing code "${res.pairingCode}" to complete setup. ` +
-            `Make sure the bot forwards events to the relay's /discord/${res.channelId} endpoint.`,
-          res,
-        );
+        const { res, summary } = await addDiscord(c, params.botToken);
+        return textResult(summary, res);
       } catch (err) {
         throw toFriendly(err);
       }
@@ -678,35 +790,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       if (!c) {
         return textResult("chaos-relay is not configured. Run `/chaos-relay setup` first.");
       }
-      // The relay requires a channelName (it seeds the inbound address slug).
-      // Default to a slug derived from the email's local part so callers don't
-      // have to supply one.
-      const channelName = params.channelName ||
-        params.userEmail.split("@")[0].replace(/[^a-z0-9]+/gi, "-")
-          .replace(/^-+|-+$/g, "").toLowerCase() ||
-        cfg.agentId || "agent";
       try {
-        const res = await c.registerEmail({
-          userEmail: params.userEmail,
-          agentId: cfg.agentId,
-          channelName,
-        });
-        addChannelRecord({
-          channelId: res.channelId,
-          type: "email",
-          label: channelName,
-          createdAt: new Date().toISOString(),
-          userEmail: params.userEmail,
-          channelName,
-        });
-        return textResult(
-          `Email channel registered (pending verification).\n` +
-            `  channelId:      ${res.channelId}\n` +
-            `  inboundAddress: ${res.inboundAddress}\n\n` +
-            `Check ${params.userEmail} for a verification link and click it to activate. ` +
-            `Once active, email ${res.inboundAddress} to reach the agent.`,
-          res,
-        );
+        const { res, summary } = await addEmail(c, params.userEmail, params.channelName);
+        return textResult(summary, res);
       } catch (err) {
         throw toFriendly(err);
       }
@@ -737,25 +823,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         );
       }
       try {
-        const res = await c.registerWebhook({ channelName: params.channelName });
-        addChannelRecord({
-          channelId: res.channelId,
-          type: "webhook",
-          label: params.channelName ?? "webhook",
-          createdAt: new Date().toISOString(),
-          channelName: params.channelName,
-          // Persisted (0600, ~/.pi) so the SAME URL can be recreated if the
-          // relay ever loses the session.
-          webhookSecret: res.webhookSecret,
-        });
-        return textResult(
-          `Inbound webhook channel registered.\n` +
-            `  channelId: ${res.channelId}\n` +
-            `  POST to:   ${res.webhookUrl}\n\n` +
-            `Any service that POSTs JSON, form data, or text to that URL delivers ` +
-            `a message to the agent. It is one-way (inbound) — there is nothing to reply to.`,
-          res,
-        );
+        const { res, summary } = await addWebhook(c, params.channelName);
+        return textResult(summary, res);
       } catch (err) {
         throw toFriendly(err);
       }
@@ -765,7 +834,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // --- /chaos-relay command --------------------------------------------------
 
   pi.registerCommand("chaos-relay", {
-    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup, status, poll, stop, approvals)",
+    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup, add, status, poll, stop, approvals)",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parts = args.trim().split(/\s+/);
       const sub = parts[0] || "status";
@@ -773,6 +842,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         switch (sub) {
           case "setup":
             await runSetup(ctx);
+            break;
+          case "add":
+          case "channel":
+            await runAddChannel(ctx);
             break;
           case "status":
             await runStatus(ctx);
@@ -810,7 +883,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           }
           default:
             ctx.ui.notify(
-              `Unknown subcommand "${sub}". Use: setup | status | poll | stop | approvals`,
+              `Unknown subcommand "${sub}". Use: setup | add | status | poll | stop | approvals`,
               "warning",
             );
         }
@@ -894,10 +967,23 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
     client = undefined;
     startPolling();
-    ctx.ui.notify(
-      "chaos-relay configured. Use relay_register_telegram / relay_register_email to add channels.",
-      "info",
+    ctx.ui.notify("chaos-relay configured.", "info");
+
+    // Onboarding: offer to add the first channel right now rather than leaving
+    // the user to discover the tools/command on their own.
+    const addNow = await ctx.ui.select(
+      "Add a channel now? (you can also do this later with /chaos-relay add)",
+      ["Yes — add a channel", "Not now"],
     );
+    if (addNow === "Yes — add a channel") {
+      await runAddChannel(ctx);
+    } else {
+      ctx.ui.notify(
+        "When you're ready, run /chaos-relay add — or just ask the agent to register " +
+          "a Telegram/Discord/email/webhook channel.",
+        "info",
+      );
+    }
   }
 
   async function runStatus(ctx: ExtensionCommandContext): Promise<void> {
@@ -932,6 +1018,39 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     }
     ctx.ui.notify(lines.join("\n"), "info");
   }
+
+  // Print a short getting-started guide to the terminal when the extension
+  // loads, so a new user knows the setup → add-channel → chat flow without
+  // having to read the docs.
+  function logGettingStarted(): void {
+    if (!isConfigured(cfg)) {
+      log(
+        "\n" +
+          "  ┌─ chaos-relay ─ drive this pi agent from Telegram / Discord / email / webhooks\n" +
+          "  │  Not set up yet. Three steps:\n" +
+          "  │   1. /chaos-relay setup   — connect to the relay (registers a session)\n" +
+          "  │   2. /chaos-relay add     — add a channel (Telegram bot, email, …)\n" +
+          "  │   3. message that channel — it reaches the agent, which replies back\n" +
+          "  │  Then: /chaos-relay status · /chaos-relay approvals <off|writes|all>\n" +
+          "  └─",
+      );
+      return;
+    }
+    const n = cfg.channels.length;
+    if (n === 0) {
+      log(
+        "chaos-relay connected, but no channels yet. Run /chaos-relay add to add one " +
+          "(Telegram / Discord / email / webhook) — or just ask the agent to register one.",
+      );
+    } else {
+      log(
+        `chaos-relay active — ${n} channel(s), approvals=${cfg.approvalMode}. ` +
+          "Add more with /chaos-relay add; inspect with /chaos-relay status.",
+      );
+    }
+  }
+
+  logGettingStarted();
 }
 
 /** Turn relay errors into agent-friendly Error messages. */

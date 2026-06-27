@@ -1,14 +1,16 @@
 # pi-chaos-relay
 
 A [pi](https://github.com/earendil-works) coding-agent extension that bridges your
-pi agent to a [CHAOS](https://github.com/) **relay server**, so you can drive your
-agent from — and have it reply to — **Telegram** and **email**.
+pi agent to a [CHAOS](https://github.com/PaulKinlan/chaos) **relay server**
+([`packages/server`](https://github.com/PaulKinlan/chaos/tree/main/packages/server)),
+so you can drive your agent from — and have it reply to — **Telegram**, **Discord**,
+**email**, and inbound **webhooks**.
 
-External channels (a Telegram bot, an email address) deliver messages to the relay.
-This extension makes pi the polling client: it polls the relay for new messages,
-surfaces them to the agent, and sends the agent's answers back to the original
-thread. It is the same poll-and-reply pattern the CHAOS Chrome extension and
-Claude Code's Telegram plugin use.
+External channels (a Telegram/Discord bot, an email address, a webhook URL) deliver
+messages to the relay. This extension makes pi the client: it receives new messages
+over a WebSocket (with a polling fallback), surfaces them to the agent, and sends the
+agent's answers back to the original thread. It is the same poll-and-reply pattern the
+CHAOS Chrome extension uses.
 
 ```
 Telegram / Email ──> CHAOS relay ──poll GET /messages──> pi agent
@@ -16,16 +18,34 @@ Telegram / Email ──> CHAOS relay ──poll GET /messages──> pi agent
                           └──────── POST /reply ─────────────┘
 ```
 
+## Quick start
+
+```bash
+pi install git:github.com/paulkinlan/pi-chaos-relay
+```
+
+Then, inside pi:
+
+1. **`/chaos-relay setup`** — connect to the relay (registers a session for you).
+2. **`/chaos-relay add`** — pick a channel (Telegram / Discord / email / webhook) and follow the prompts.
+3. **Message that channel** — it reaches the agent, and the agent replies back.
+
+That's it. `/chaos-relay status` shows state; `/chaos-relay approvals <off|writes|all>`
+gates risky tools behind a yes/no over the channel. Prefer talking? You can also just
+ask the agent: *"register a Telegram bot, the token is 123:ABC."*
+
 ## What it does
 
 - Registers a relay **session** with an **ECDSA P-256 keypair** (the relay's
   real identity model) and stores the credentials + key locally.
 - **Signs every authenticated request** (`X-Timestamp` / `X-Nonce` /
   `X-Signature`) so the relay can verify it really came from this client.
-- Registers a **Telegram bot** channel and an **email** channel via the relay.
-- **Polls** `GET /messages` in the background and injects new messages into the
-  pi agent (also exposed as an on-demand tool).
-- **Replies** to a channel via `POST /reply`.
+- Registers **Telegram**, **Discord**, **email**, and inbound **webhook**
+  channels via the relay.
+- Receives new messages over a **WebSocket** push (background safety poll as a
+  fallback) and injects them into the pi agent (also exposed as an on-demand tool).
+- **Replies** to a channel via the relay; optional **tool approvals** let you
+  gate risky tools from the channel.
 
 ## Install
 
@@ -63,14 +83,16 @@ The quickest start is the interactive setup, which registers a session for you:
 
 It asks for the relay URL and agent id, registers a new session (or lets you reuse
 / paste an existing API key), verifies the relay is reachable, saves the
-credentials, and starts the background poller. Check state any time with
+credentials, starts the background poller, and offers to add your first channel.
+Add more channels any time with `/chaos-relay add`, and check state with
 `/chaos-relay status`.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/chaos-relay setup` | Interactive credential setup + start polling |
+| `/chaos-relay setup` | Interactive credential setup + start polling (then offers to add a channel) |
+| `/chaos-relay add` | Interactive wizard to add a channel (Telegram / Discord / email / webhook) |
 | `/chaos-relay status` | Show config, poller state, and live relay health |
 | `/chaos-relay poll` | Poll once now and deliver any new messages |
 | `/chaos-relay stop` | Stop the background poller |
