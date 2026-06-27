@@ -27,9 +27,13 @@ import {
 import {
   addChannelRecord,
   isConfigured,
+  APPROVAL_MODES,
+  type ApprovalMode,
   loadPersisted,
+  normalizeApprovalMode,
   resolveConfig,
   savePersisted,
+  setApprovalMode,
   setChannelRecords,
   setMessagesCursor,
   type ResolvedConfig,
@@ -67,7 +71,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // only show "typing" in the channel when the agent is actually working on a
   // message from it, not on terminal-driven turns).
   let typingTimer: ReturnType<typeof setInterval> | undefined;
-  let lastChannel: { channelType: string; channelId: string } | undefined;
+  let lastChannel:
+    | { channelType: ChannelMessage["channelType"]; channelId: string }
+    | undefined;
   let relayInputSinceIdle = false;
 
   /**
@@ -274,11 +280,95 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     }
   }
 
+  // ── Tool approval over the channel ─────────────────────────────────────────
+  // When approvalMode != "off", risky tool calls are paused and an approval
+  // request is sent to the active channel; the NEXT message from that channel
+  // is consumed as the yes/no answer (it is not forwarded to the agent).
+  const APPROVAL_TIMEOUT_MS = 5 * 60 * 1000;
+  const RISKY_WRITE_TOOLS = new Set(["bash", "edit", "write"]);
+  let pendingApproval:
+    | { channelId: string; resolve: (approved: boolean) => void; timer: ReturnType<typeof setTimeout> }
+    | undefined;
+
+  function approvalNeeded(toolName: string): boolean {
+    if (cfg.approvalMode === "off") return false;
+    // Never gate the relay's own plumbing (relay_reply etc.) — gating it would
+    // deadlock the very channel we ask over.
+    if (toolName.startsWith("relay_")) return false;
+    if (cfg.approvalMode === "all") return true;
+    return RISKY_WRITE_TOOLS.has(toolName); // "writes"
+  }
+
+  function summarizeToolCall(toolName: string, input: Record<string, unknown>): string {
+    if (toolName === "bash") return `bash: ${String(input.command ?? "").slice(0, 300)}`;
+    if (toolName === "edit" || toolName === "write") {
+      return `${toolName}: ${String(input.path ?? input.file_path ?? "")}`;
+    }
+    const j = JSON.stringify(input ?? {});
+    return `${toolName}: ${j.length > 300 ? j.slice(0, 300) + "…" : j}`;
+  }
+
+  /** Ask the channel to approve a tool call; resolves true=allow, false=deny. */
+  async function requestApproval(
+    toolName: string,
+    input: Record<string, unknown>,
+    ch: { channelType: ChannelMessage["channelType"]; channelId: string },
+  ): Promise<boolean> {
+    const c = ensureClient();
+    if (!c) return true; // can't ask → don't block
+    const question = `⚠️ Approval needed — the agent wants to run:\n` +
+      `${summarizeToolCall(toolName, input)}\n\n` +
+      `Reply "yes" to allow or "no" to deny (auto-denies in 5 min).`;
+    try {
+      if (ws?.connected) {
+        await ws.reply({ channelType: ch.channelType, channelId: ch.channelId, content: question });
+      } else {
+        await c.reply({ channelType: ch.channelType, channelId: ch.channelId, content: question });
+      }
+    } catch (err) {
+      log(`approval: failed to send request, allowing by default: ${err instanceof Error ? err.message : String(err)}`);
+      return true;
+    }
+    log(`approval: requested for ${toolName} via ${ch.channelType}; waiting for reply`);
+    return await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        if (pendingApproval) {
+          pendingApproval = undefined;
+          log("approval: timed out → denied");
+          resolve(false);
+        }
+      }, APPROVAL_TIMEOUT_MS);
+      if (typeof timer.unref === "function") timer.unref();
+      pendingApproval = { channelId: ch.channelId, resolve, timer };
+    });
+  }
+
+  /** If an approval is pending, consume the answering message from `fresh`
+   * (so it is not forwarded to the agent) and resolve the approval. */
+  function consumeApprovalReplies(fresh: ChannelMessage[]): ChannelMessage[] {
+    if (!pendingApproval) return fresh;
+    const out: ChannelMessage[] = [];
+    for (const m of fresh) {
+      if (pendingApproval && m.channelId === pendingApproval.channelId) {
+        const approved = /^\s*(y|yes|yep|ok|okay|approve|allow|sure|do it)\b/i
+          .test(m.content ?? "");
+        clearTimeout(pendingApproval.timer);
+        const resolve = pendingApproval.resolve;
+        pendingApproval = undefined;
+        log(`approval: reply "${(m.content ?? "").slice(0, 24)}" → ${approved ? "approved" : "denied"}`);
+        resolve(approved);
+        continue; // consume — do not forward to the agent
+      }
+      out.push(m);
+    }
+    return out;
+  }
+
   /** Poll once and, if there are new messages, inject them into the agent. */
   async function pollAndDeliver(): Promise<void> {
     if (!poller) return;
     try {
-      const messages = await poller.poll();
+      const messages = consumeApprovalReplies(await poller.poll());
       if (messages.length === 0) return;
       log(`delivering ${messages.length} new message(s) to the agent`);
       deliverToAgent(messages);
@@ -303,7 +393,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       log: (m) => log(m),
       onMessage: (messages) => {
         if (!poller) return;
-        const fresh = poller.accept(messages);
+        const fresh = consumeApprovalReplies(poller.accept(messages));
         if (fresh.length === 0) return;
         log(`delivering ${fresh.length} message(s) to the agent`);
         deliverToAgent(fresh);
@@ -338,6 +428,29 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   pi.on("agent_end", () => {
     stopTyping();
     relayInputSinceIdle = false;
+  });
+
+  // Tool approval: when enabled and the turn came from a channel, pause risky
+  // tools and ask the user over that channel before they run.
+  pi.on("tool_call", async (event) => {
+    if (!approvalNeeded(event.toolName)) return; // allow
+    // Only gate turns driven from a channel — terminal/local use is unaffected.
+    if (!relayInputSinceIdle || !lastChannel) return;
+    // Pause the typing indicator while we wait on the human.
+    stopTyping();
+    const approved = await requestApproval(
+      event.toolName,
+      event.input as Record<string, unknown>,
+      lastChannel,
+    );
+    if (!approved) {
+      return {
+        block: true,
+        reason:
+          `The user denied this ${event.toolName} call over ${lastChannel.channelType}. ` +
+          `Do not retry it; ask them what to do instead.`,
+      };
+    }
   });
 
   // --- Tools the LLM can call ------------------------------------------------
@@ -652,9 +765,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // --- /chaos-relay command --------------------------------------------------
 
   pi.registerCommand("chaos-relay", {
-    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup, status, poll, stop)",
+    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup, status, poll, stop, approvals)",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      const sub = args.trim().split(/\s+/)[0] || "status";
+      const parts = args.trim().split(/\s+/);
+      const sub = parts[0] || "status";
       try {
         switch (sub) {
           case "setup":
@@ -671,9 +785,32 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
             stopPolling();
             ctx.ui.notify("chaos-relay: background poller stopped.", "info");
             break;
+          case "approvals": {
+            const mode = parts[1];
+            if (!mode) {
+              ctx.ui.notify(
+                `Tool approvals: ${cfg.approvalMode}. ` +
+                  `Set with /chaos-relay approvals <off|writes|all> — ` +
+                  `off=autonomous, writes=ask before shell/edit/write, all=ask before every tool.`,
+                "info",
+              );
+              break;
+            }
+            if (!APPROVAL_MODES.includes(mode as ApprovalMode)) {
+              ctx.ui.notify(
+                `Invalid mode "${mode}". Use: off | writes | all.`,
+                "warning",
+              );
+              break;
+            }
+            setApprovalMode(normalizeApprovalMode(mode));
+            cfg = resolveConfig();
+            ctx.ui.notify(`chaos-relay: tool approvals set to "${cfg.approvalMode}".`, "info");
+            break;
+          }
           default:
             ctx.ui.notify(
-              `Unknown subcommand "${sub}". Use: setup | status | poll | stop`,
+              `Unknown subcommand "${sub}". Use: setup | status | poll | stop | approvals`,
               "warning",
             );
         }
@@ -772,6 +909,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       `identity:      ${current.keyPair ? "ECDSA P-256 (signed requests)" : "Bearer-only (legacy)"}`,
       `userId:        ${current.userId ?? "(unknown)"}`,
       `transport:     WebSocket (${ws?.connected ? "connected" : ws ? "connecting/reconnecting" : "stopped"}) + ${SAFETY_POLL_MS}ms safety poll`,
+      `approvals:     ${current.approvalMode} (off=autonomous, writes=shell/edit/write, all=every tool)`,
       `channels:      ${current.channels.length}`,
     ];
     for (const ch of current.channels) {

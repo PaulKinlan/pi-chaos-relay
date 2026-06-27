@@ -4,6 +4,7 @@ import {
   DEFAULT_RELAY_URL,
   MIN_POLL_INTERVAL_MS,
   isConfigured,
+  normalizeApprovalMode,
   resolveConfig,
 } from "../config.ts";
 
@@ -42,6 +43,30 @@ test("resolveConfig falls back to defaults with empty persisted + no env", () =>
       assert.equal(isConfigured(cfg), false);
     },
   );
+});
+
+test("approvalMode defaults off, persists, and respects env override", () => {
+  withEnv({ CHAOS_RELAY_APPROVAL_MODE: undefined }, () => {
+    assert.equal(resolveConfig({}).approvalMode, "off");
+    assert.equal(resolveConfig({ approvalMode: "writes" }).approvalMode, "writes");
+    // Invalid persisted value falls back to off.
+    assert.equal(
+      resolveConfig({ approvalMode: "bogus" as never }).approvalMode,
+      "off",
+    );
+  });
+  withEnv({ CHAOS_RELAY_APPROVAL_MODE: "all" }, () => {
+    // Env wins over persisted.
+    assert.equal(resolveConfig({ approvalMode: "off" }).approvalMode, "all");
+  });
+});
+
+test("normalizeApprovalMode coerces invalid values to off", () => {
+  assert.equal(normalizeApprovalMode("all"), "all");
+  assert.equal(normalizeApprovalMode("writes"), "writes");
+  assert.equal(normalizeApprovalMode("off"), "off");
+  assert.equal(normalizeApprovalMode("nonsense"), "off");
+  assert.equal(normalizeApprovalMode(undefined), "off");
 });
 
 test("env vars override persisted config", () => {

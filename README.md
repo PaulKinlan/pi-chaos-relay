@@ -74,6 +74,7 @@ credentials, and starts the background poller. Check state any time with
 | `/chaos-relay status` | Show config, poller state, and live relay health |
 | `/chaos-relay poll` | Poll once now and deliver any new messages |
 | `/chaos-relay stop` | Stop the background poller |
+| `/chaos-relay approvals <off\|writes\|all>` | Set/show the tool-approval policy |
 
 ## Tools (LLM-callable)
 
@@ -82,7 +83,26 @@ credentials, and starts the background poller. Check state any time with
 | `relay_check_messages` | Pull pending inbound Telegram/email messages |
 | `relay_reply` | Reply to a channel message (`channelType`, `channelId`, `content`, optional `replyTo`) |
 | `relay_register_telegram` | Register a Telegram bot channel |
+| `relay_register_discord` | Register a Discord bot channel |
 | `relay_register_email` | Register an email channel |
+| `relay_register_webhook` | Register an inbound (one-way) webhook URL |
+
+## Tool approvals
+
+pi has no built-in per-tool permission prompts — it runs tools with your account's
+permissions. For turns driven from a channel you can require approval over that
+channel before risky tools run:
+
+| Mode | Behaviour |
+|------|-----------|
+| `off` *(default)* | Fully autonomous — run every tool. Best paired with a sandbox/container. |
+| `writes` | Ask before `bash`, `edit`, and `write`; reads/searches run freely. |
+| `all` | Ask before **every** tool (the `relay_*` plumbing is never gated). |
+
+Set with `/chaos-relay approvals writes` or the `CHAOS_RELAY_APPROVAL_MODE` env var.
+When a tool is gated, the agent pauses and sends an approval request to the active
+channel; **reply `yes` to allow or `no` to deny** (auto-denies after 5 minutes).
+Terminal/local turns are never gated.
 
 ## Telegram setup — end to end
 

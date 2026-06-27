@@ -20,6 +20,14 @@ export const MIN_POLL_INTERVAL_MS = 3_000;
 export const CONFIG_DIR = join(homedir(), ".pi");
 export const CONFIG_PATH = join(CONFIG_DIR, "chaos-relay.json");
 
+export type ApprovalMode = "off" | "writes" | "all";
+export const APPROVAL_MODES: ApprovalMode[] = ["off", "writes", "all"];
+
+/** Coerce an arbitrary value to a valid ApprovalMode, defaulting to "off". */
+export function normalizeApprovalMode(v: unknown): ApprovalMode {
+  return APPROVAL_MODES.includes(v as ApprovalMode) ? (v as ApprovalMode) : "off";
+}
+
 export interface PersistedConfig {
   /** Relay base URL. */
   relayUrl?: string;
@@ -33,6 +41,13 @@ export interface PersistedConfig {
   pollIntervalMs?: number;
   /** Channels registered through this extension (for reference / reply routing). */
   channels?: RegisteredChannelRecord[];
+  /**
+   * Tool-approval policy for channel-driven turns:
+   *  - "off"    (default) — run every tool autonomously (sandbox the agent).
+   *  - "writes" — ask over the channel before shell/edit/write tools run.
+   *  - "all"    — ask before EVERY tool (except the relay_* plumbing).
+   */
+  approvalMode?: ApprovalMode;
   /**
    * Cursor (ISO timestamp) of the most recent message delivered to the agent.
    * Persisted so a restart resumes AFTER it instead of re-reading the relay's
@@ -79,6 +94,8 @@ export interface ResolvedConfig {
   agentId: string;
   pollIntervalMs: number;
   channels: RegisteredChannelRecord[];
+  /** Tool-approval policy for channel-driven turns. */
+  approvalMode: ApprovalMode;
   /** Resume cursor (ISO timestamp) for inbound message polling. File-only. */
   messagesCursor?: string;
   /** ECDSA keypair for request signing. File-only (never from env). */
@@ -128,6 +145,11 @@ export function setMessagesCursor(cursor: string): void {
   savePersisted({ messagesCursor: cursor });
 }
 
+/** Persist the tool-approval policy. */
+export function setApprovalMode(mode: ApprovalMode): void {
+  savePersisted({ approvalMode: mode });
+}
+
 function envInt(name: string): number | undefined {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return undefined;
@@ -160,6 +182,9 @@ export function resolveConfig(persisted = loadPersisted()): ResolvedConfig {
     agentId,
     pollIntervalMs,
     channels: persisted.channels ?? [],
+    approvalMode: normalizeApprovalMode(
+      process.env.CHAOS_RELAY_APPROVAL_MODE ?? persisted.approvalMode,
+    ),
     messagesCursor: persisted.messagesCursor,
     // The keypair is the client's identity and is intentionally NOT
     // overridable via env — it lives only in the 0600 config file.
