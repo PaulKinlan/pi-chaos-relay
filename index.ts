@@ -321,6 +321,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           "chaos-relay is not configured. Run `/chaos-relay setup` (or set CHAOS_RELAY_API_KEY).",
         );
       }
+      const transport = ws?.connected ? "WebSocket" : "HTTP";
+      log(
+        `relay_reply: sending to ${params.channelType}/${params.channelId} ` +
+          `replyTo=${params.replyTo ?? "none"} via ${transport} (${params.content.length} chars)`,
+      );
       // Prefer the WebSocket (same socket the message arrived on) for instant
       // delivery; fall back to a signed HTTP POST /reply if it isn't connected
       // or the ack times out.
@@ -332,12 +337,18 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
             content: params.content,
             replyTo: params.replyTo,
           });
+          log(
+            `relay_reply: WS ack ok=${res.ok} responseId=${res.responseId ?? "?"}. ` +
+              `NOTE: ack means the relay STORED the reply — actual Telegram/email ` +
+              `delivery happens server-side and is logged there.`,
+          );
           return textResult(
-            `Reply sent to ${params.channelType} channel ${params.channelId} (via WebSocket).`,
+            `Reply accepted by relay for ${params.channelType} channel ${params.channelId} (via WebSocket). ` +
+              `Relay will forward it to the channel.`,
             res,
           );
         } catch (err) {
-          log(`WS reply failed, falling back to HTTP: ${err instanceof Error ? err.message : String(err)}`);
+          log(`relay_reply: WS reply failed, falling back to HTTP: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
       try {
@@ -347,14 +358,17 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           content: params.content,
           replyTo: params.replyTo,
         });
+        log(`relay_reply: HTTP ack ok=${(res as { ok?: boolean }).ok ?? "?"}`);
         // The relay returns {ok, channelType, channelId} for telegram and
         // {ok, responseId} for webhook-style channels — fall back to the
         // request values so the confirmation is always meaningful.
         return textResult(
-          `Reply sent to ${res.channelType ?? params.channelType} channel ${res.channelId ?? params.channelId}.`,
+          `Reply accepted by relay for ${res.channelType ?? params.channelType} channel ${res.channelId ?? params.channelId}. ` +
+            `Relay will forward it to the channel.`,
           res,
         );
       } catch (err) {
+        log(`relay_reply: HTTP reply failed: ${err instanceof Error ? err.message : String(err)}`);
         throw toFriendly(err);
       }
     },
