@@ -104,6 +104,14 @@ export interface EmailRegisterResult {
   inboundAddress: string;
 }
 
+export interface WebhookRegisterResult {
+  channelId: string;
+  /** The public URL external services POST to, including the secret token. */
+  webhookUrl: string;
+  /** The secret token embedded in the URL (persist to keep the URL stable). */
+  webhookSecret: string;
+}
+
 export interface ReplyResult {
   ok: boolean;
   /** Present for telegram/discord replies. */
@@ -357,6 +365,34 @@ export class RelayClient {
     } catch {
       // ignore — typing is best-effort
     }
+  }
+
+  /**
+   * Register an inbound (one-way) webhook channel via the generic /channels
+   * endpoint. Pass an existing id + secret to recreate the SAME public URL
+   * (used by session recovery so external callers don't need reconfiguring).
+   */
+  async registerWebhook(params: {
+    channelName?: string;
+    id?: string;
+    webhookSecret?: string;
+  } = {}): Promise<WebhookRegisterResult> {
+    const res = await this.request<{
+      channel: { id: string; metadata?: Record<string, unknown> };
+      webhookUrl: string;
+    }>("POST", "/channels", {
+      type: "webhook",
+      ...(params.id ? { id: params.id } : {}),
+      ...(params.channelName ? { name: params.channelName } : {}),
+      ...(params.webhookSecret
+        ? { metadata: { webhookSecret: params.webhookSecret } }
+        : {}),
+    });
+    return {
+      channelId: res.channel.id,
+      webhookUrl: res.webhookUrl,
+      webhookSecret: res.channel.metadata?.["webhookSecret"] as string,
+    };
   }
 
   /** Register a Telegram bot as a bidirectional channel. */

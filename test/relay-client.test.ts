@@ -89,6 +89,40 @@ test("registerTelegram hits the right endpoint with agentId", async () => {
   assert.deepEqual(sent, { botToken: "tok", agentId: "pi" });
 });
 
+test("registerWebhook posts to /channels and returns the inbound URL", async () => {
+  const { fn, calls } = mockFetch(() => ({
+    status: 201,
+    body: {
+      channel: { id: "ch_w", metadata: { webhookSecret: "s3cr3t" } },
+      webhookUrl: "http://relay/webhook/ch_w?token=s3cr3t",
+    },
+  }));
+  const client = new RelayClient({ relayUrl: "http://relay", apiKey: "k", fetchImpl: fn });
+  const res = await client.registerWebhook({ channelName: "gh" });
+  assert.equal(res.channelId, "ch_w");
+  assert.equal(res.webhookUrl, "http://relay/webhook/ch_w?token=s3cr3t");
+  assert.equal(res.webhookSecret, "s3cr3t");
+  assert.equal(calls[0].url, "http://relay/channels");
+  const sent = JSON.parse(calls[0].init?.body as string);
+  assert.equal(sent.type, "webhook");
+  assert.equal(sent.name, "gh");
+});
+
+test("registerWebhook re-registers with a stable id + secret for URL stability", async () => {
+  const { fn, calls } = mockFetch(() => ({
+    status: 201,
+    body: {
+      channel: { id: "fixed", metadata: { webhookSecret: "keep" } },
+      webhookUrl: "http://relay/webhook/fixed?token=keep",
+    },
+  }));
+  const client = new RelayClient({ relayUrl: "http://relay", apiKey: "k", fetchImpl: fn });
+  await client.registerWebhook({ id: "fixed", webhookSecret: "keep" });
+  const sent = JSON.parse(calls[0].init?.body as string);
+  assert.equal(sent.id, "fixed");
+  assert.deepEqual(sent.metadata, { webhookSecret: "keep" });
+});
+
 test("registerEmail hits the right endpoint", async () => {
   const { fn, calls } = mockFetch(() => ({
     status: 201,

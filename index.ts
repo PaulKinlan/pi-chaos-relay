@@ -143,6 +143,17 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           notes.push(
             `Email ${rec.userEmail}: re-registered. Check your inbox and click the verification link to reactivate (then email ${res.inboundAddress}).`,
           );
+        } else if (rec.type === "webhook") {
+          // Recreate with the same id + secret so the public URL is unchanged.
+          const res = await c.registerWebhook({
+            id: rec.channelId,
+            webhookSecret: rec.webhookSecret,
+            channelName: rec.channelName,
+          });
+          updated.push({ ...rec, channelId: res.channelId });
+          notes.push(
+            `Webhook ${rec.label ?? rec.channelId}: re-registered. URL unchanged — ${res.webhookUrl}`,
+          );
         } else {
           updated.push(rec); // no re-bind material — keep the record, note it
           notes.push(
@@ -511,6 +522,55 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
             `  inboundAddress: ${res.inboundAddress}\n\n` +
             `Check ${params.userEmail} for a verification link and click it to activate. ` +
             `Once active, email ${res.inboundAddress} to reach the agent.`,
+          res,
+        );
+      } catch (err) {
+        throw toFriendly(err);
+      }
+    },
+  });
+
+  // relay_register_webhook — register an inbound (one-way) webhook channel.
+  const webhookParams = Type.Object({
+    channelName: Type.Optional(
+      Type.String({ description: "Optional friendly name for this webhook channel." }),
+    ),
+  });
+  pi.registerTool({
+    name: "relay_register_webhook",
+    label: "CHAOS Relay: register webhook",
+    description:
+      "Register an INBOUND (one-way) webhook channel on chaos-relay. Returns a " +
+      "URL; any external service that POSTs JSON, form data, or plain text to it " +
+      "delivers a message to the agent. Webhooks are inbound only — there is no " +
+      "reply (don't call relay_reply for them). Requires the relay to be configured.",
+    promptSnippet: "relay_register_webhook: create an inbound webhook URL that delivers messages to the agent",
+    parameters: webhookParams,
+    async execute(_id: string, params: Static<typeof webhookParams>, _signal, _onUpdate, _ctx: ExtensionContext) {
+      const c = ensureClient();
+      if (!c) {
+        return textResult(
+          "chaos-relay is not configured. Run `/chaos-relay setup` (or set CHAOS_RELAY_API_KEY).",
+        );
+      }
+      try {
+        const res = await c.registerWebhook({ channelName: params.channelName });
+        addChannelRecord({
+          channelId: res.channelId,
+          type: "webhook",
+          label: params.channelName ?? "webhook",
+          createdAt: new Date().toISOString(),
+          channelName: params.channelName,
+          // Persisted (0600, ~/.pi) so the SAME URL can be recreated if the
+          // relay ever loses the session.
+          webhookSecret: res.webhookSecret,
+        });
+        return textResult(
+          `Inbound webhook channel registered.\n` +
+            `  channelId: ${res.channelId}\n` +
+            `  POST to:   ${res.webhookUrl}\n\n` +
+            `Any service that POSTs JSON, form data, or text to that URL delivers ` +
+            `a message to the agent. It is one-way (inbound) — there is nothing to reply to.`,
           res,
         );
       } catch (err) {

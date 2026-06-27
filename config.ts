@@ -45,7 +45,7 @@ export interface PersistedConfig {
 
 export interface RegisteredChannelRecord {
   channelId: string;
-  type: "telegram" | "email";
+  type: "telegram" | "email" | "webhook";
   label?: string;
   createdAt: string;
   /**
@@ -58,6 +58,12 @@ export interface RegisteredChannelRecord {
   botToken?: string;
   userEmail?: string;
   channelName?: string;
+  /**
+   * For webhook channels: the secret token in the inbound URL. Re-registering
+   * with the same channelId + secret keeps the public webhook URL stable across
+   * session recovery, so external services don't need to be reconfigured.
+   */
+  webhookSecret?: string;
 }
 
 export interface ResolvedConfig {
