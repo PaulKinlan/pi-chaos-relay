@@ -233,6 +233,44 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     return client;
   }
 
+  /**
+   * Like {@link ensureClient}, but if the relay isn't configured yet it
+   * auto-provisions a session (ECDSA keypair at the default relay URL) WITHOUT
+   * any interactive setup. This lets the agent fulfil requests like "register my
+   * telegram bot 123:ABC" directly — the user never has to run /chaos-relay setup
+   * or know what a relay URL is. Returns undefined only if provisioning fails
+   * (e.g. the relay is unreachable).
+   */
+  async function ensureConfigured(): Promise<RelayClient | undefined> {
+    const existing = ensureClient();
+    if (existing) return existing;
+
+    const persisted = loadPersisted();
+    const relayUrl = isValidRelayUrl(persisted.relayUrl ?? "")
+      ? persisted.relayUrl!
+      : DEFAULT_RELAY_URL;
+    try {
+      // Reuse any existing keypair so the identity (and its channels) stay stable.
+      const reg = await registerSessionWithKey(relayUrl, { keyPair: persisted.keyPair });
+      savePersisted({
+        relayUrl,
+        agentId: persisted.agentId ?? "pi",
+        apiKey: reg.apiKey,
+        userId: reg.userId,
+        keyPair: reg.keyPair,
+        serverPublicKey: reg.serverPublicKey ?? persisted.serverPublicKey,
+      });
+      cfg = resolveConfig();
+      client = undefined;
+      startPolling();
+      log(`auto-provisioned relay session userId=${reg.userId} at ${relayUrl}`);
+      return ensureClient();
+    } catch (err) {
+      log(`auto-provision failed: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  }
+
   function stopPolling(): void {
     if (ws) {
       ws.stop();
@@ -674,9 +712,12 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       );
       return;
     }
-    const c = ensureClient();
+    const c = await ensureConfigured();
     if (!c) {
-      ctx.ui.notify("chaos-relay isn't configured yet. Run /chaos-relay setup first.", "warning");
+      ctx.ui.notify(
+        "Couldn't reach the chaos relay to set up your connection. Check your network and try again.",
+        "warning",
+      );
       return;
     }
     const kind = await ctx.ui.select(
@@ -685,6 +726,12 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     );
     try {
       if (kind === "Telegram") {
+        ctx.ui.notify(
+          "To get a Telegram bot token: open Telegram, message @BotFather, send " +
+            "/newbot, pick a name, and it replies with a token like 123456:ABC-DEF. " +
+            "Paste that token next.",
+          "info",
+        );
         const token = await ctx.ui.input("Telegram bot token (from @BotFather)", "");
         if (!token?.trim()) return ctx.ui.notify("No token entered — cancelled.", "warning");
         ctx.ui.notify("Registering Telegram bot…", "info");
@@ -733,9 +780,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       "the bot in Telegram to finish linking. Requires the relay to be configured.",
     parameters: tgParams,
     async execute(_id: string, params: Static<typeof tgParams>) {
-      const c = ensureClient();
+      const c = await ensureConfigured();
       if (!c) {
-        return textResult("chaos-relay is not configured. Run `/chaos-relay setup` first.");
+        return textResult(
+          "Couldn't reach the chaos relay to set up your connection. Check your network and try again.",
+        );
       }
       try {
         const { res, summary } = await addTelegram(c, params.botToken);
@@ -763,9 +812,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       "relay's /discord/<channelId> URL. Requires the relay to be configured.",
     parameters: dcParams,
     async execute(_id: string, params: Static<typeof dcParams>) {
-      const c = ensureClient();
+      const c = await ensureConfigured();
       if (!c) {
-        return textResult("chaos-relay is not configured. Run `/chaos-relay setup` first.");
+        return textResult(
+          "Couldn't reach the chaos relay to set up your connection. Check your network and try again.",
+        );
       }
       try {
         const { res, summary } = await addDiscord(c, params.botToken);
@@ -790,9 +841,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       "it to activate the channel. Requires CHAOS_EMAIL_DOMAIN on the relay server.",
     parameters: emailParams,
     async execute(_id: string, params: Static<typeof emailParams>) {
-      const c = ensureClient();
+      const c = await ensureConfigured();
       if (!c) {
-        return textResult("chaos-relay is not configured. Run `/chaos-relay setup` first.");
+        return textResult(
+          "Couldn't reach the chaos relay to set up your connection. Check your network and try again.",
+        );
       }
       try {
         const { res, summary } = await addEmail(c, params.userEmail, params.channelName);
@@ -820,10 +873,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     promptSnippet: "relay_register_webhook: create an inbound webhook URL that delivers messages to the agent",
     parameters: webhookParams,
     async execute(_id: string, params: Static<typeof webhookParams>, _signal, _onUpdate, _ctx: ExtensionContext) {
-      const c = ensureClient();
+      const c = await ensureConfigured();
       if (!c) {
         return textResult(
-          "chaos-relay is not configured. Run `/chaos-relay setup` (or set CHAOS_RELAY_API_KEY).",
+          "Couldn't reach the chaos relay to set up your connection. Check your network and try again.",
         );
       }
       try {
@@ -838,14 +891,18 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // --- /chaos-relay command --------------------------------------------------
 
   pi.registerCommand("chaos-relay", {
-    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup, add, status, poll, stop, approvals, reset, doctor)",
+    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup [--advanced], add, status, poll, stop, approvals, reset, doctor)",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parts = args.trim().split(/\s+/);
       const sub = parts[0] || "status";
       try {
         switch (sub) {
           case "setup":
-            await runSetup(ctx);
+            await runSetup(ctx, {
+              advanced: parts.slice(1).some((p) =>
+                ["advanced", "--advanced", "-a"].includes(p.toLowerCase())
+              ),
+            });
             break;
           case "add":
           case "channel":
@@ -916,7 +973,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
    * and (re)start the poller. Telegram/email registration is left to the
    * dedicated tools/skills so the agent can drive it conversationally.
    */
-  async function runSetup(ctx: ExtensionCommandContext): Promise<void> {
+  async function runSetup(
+    ctx: ExtensionCommandContext,
+    opts: { advanced?: boolean } = {},
+  ): Promise<void> {
     if (!ctx.hasUI) {
       ctx.ui.notify(
         "Setup needs interactive UI. Set CHAOS_RELAY_URL and CHAOS_RELAY_API_KEY env vars instead.",
@@ -926,57 +986,68 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     }
 
     const persisted = loadPersisted();
-    // Prompt for the relay URL, re-prompting until the user enters a valid
-    // absolute http(s) URL (or accepts a valid default). This stops malformed
-    // values (empty strings, commands pasted into the field, bare hostnames)
-    // from being persisted and breaking every subsequent request.
-    const defaultUrl = persisted.relayUrl ?? resolveConfig().relayUrl;
-    let relayUrl = (await ctx.ui.input("Relay URL", defaultUrl)) || defaultUrl;
-    while (!isValidRelayUrl(relayUrl)) {
-      ctx.ui.notify(
-        `"${relayUrl}" is not a valid URL. Include the scheme, e.g. https://chaos-relay.com`,
-        "warning",
-      );
-      const re = await ctx.ui.input(
-        "Relay URL (must start with http:// or https://)",
-        DEFAULT_RELAY_URL,
-      );
-      relayUrl = re || DEFAULT_RELAY_URL;
-    }
 
-    const agentId =
-      (await ctx.ui.input("Agent id to route channels to", persisted.agentId ?? "pi")) || "pi";
-
-    // Either reuse an existing API key or register a fresh session.
+    // The common case needs ZERO config: a user shouldn't have to know what a
+    // "relay URL" or an "agent id" is, or choose an auth scheme. Default to the
+    // hosted relay and auto-register an ECDSA session. `--advanced` exposes the
+    // URL / agent-id / paste-key prompts for self-hosters.
+    let relayUrl = isValidRelayUrl(persisted.relayUrl ?? "")
+      ? persisted.relayUrl!
+      : DEFAULT_RELAY_URL;
+    let agentId = persisted.agentId ?? "pi";
     let apiKey = persisted.apiKey;
     let userId = persisted.userId;
     let keyPair = persisted.keyPair;
     let serverPublicKey = persisted.serverPublicKey;
-    const haveKey = Boolean(apiKey);
-    const action = await ctx.ui.select(
-      haveKey ? "Relay credentials" : "No API key found",
-      haveKey
-        ? ["Keep existing API key", "Register a new session (ECDSA)", "Paste an existing API key"]
-        : ["Register a new session (ECDSA)", "Paste an existing API key"],
-    );
 
-    if (action === "Register a new session (ECDSA)") {
-      ctx.ui.notify("Generating ECDSA keypair and registering session...", "info");
-      // Reuse the existing keypair if present so the identity stays stable.
+    if (opts.advanced) {
+      // Re-prompt for the relay URL until it's a valid absolute http(s) URL, so
+      // malformed values can't be persisted and break every later request.
+      relayUrl = (await ctx.ui.input("Relay URL", relayUrl)) || relayUrl;
+      while (!isValidRelayUrl(relayUrl)) {
+        ctx.ui.notify(
+          `"${relayUrl}" is not a valid URL. Include the scheme, e.g. https://chaos-relay.com`,
+          "warning",
+        );
+        relayUrl = (await ctx.ui.input(
+          "Relay URL (must start with http:// or https://)",
+          DEFAULT_RELAY_URL,
+        )) || DEFAULT_RELAY_URL;
+      }
+
+      agentId = (await ctx.ui.input("Agent id to route channels to", agentId)) || "pi";
+
+      const haveKey = Boolean(apiKey);
+      const action = await ctx.ui.select(
+        haveKey ? "Relay credentials" : "No API key found",
+        haveKey
+          ? ["Keep existing API key", "Register a new session (ECDSA)", "Paste an existing API key"]
+          : ["Register a new session (ECDSA)", "Paste an existing API key"],
+      );
+      if (action === "Register a new session (ECDSA)") {
+        ctx.ui.notify("Generating ECDSA keypair and registering session...", "info");
+        const reg = await registerSessionWithKey(relayUrl, { keyPair });
+        apiKey = reg.apiKey;
+        userId = reg.userId;
+        keyPair = reg.keyPair;
+        serverPublicKey = reg.serverPublicKey ?? serverPublicKey;
+        ctx.ui.notify(`Registered with ECDSA identity. userId=${userId}`, "info");
+      } else if (action === "Paste an existing API key") {
+        const pasted = await ctx.ui.input("Paste relay API key", "");
+        if (pasted) apiKey = pasted.trim();
+      }
+    } else if (!apiKey) {
+      // Default zero-config path: provision a private session automatically.
+      ctx.ui.notify("Setting up your private relay connection…", "info");
       const reg = await registerSessionWithKey(relayUrl, { keyPair });
       apiKey = reg.apiKey;
       userId = reg.userId;
       keyPair = reg.keyPair;
       serverPublicKey = reg.serverPublicKey ?? serverPublicKey;
-      ctx.ui.notify(`Registered with ECDSA identity. userId=${userId}`, "info");
-    } else if (action === "Paste an existing API key") {
-      const pasted = await ctx.ui.input("Paste relay API key", "");
-      if (pasted) apiKey = pasted.trim();
-      // A pasted key with no local keypair falls back to Bearer-only auth.
     }
 
     if (!apiKey) {
-      ctx.ui.notify("No API key set — aborting setup.", "warning");
+      ctx.ui.notify("Couldn't set up the relay connection — try again.", "warning");
       return;
     }
 
@@ -996,20 +1067,25 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
     client = undefined;
     startPolling();
-    ctx.ui.notify("chaos-relay configured.", "info");
+    ctx.ui.notify(
+      "You're connected to the relay. Next, link a place to chat from " +
+        "(Telegram, Discord, email, or a webhook).",
+      "info",
+    );
 
-    // Onboarding: offer to add the first channel right now rather than leaving
+    // Onboarding: offer to link the first channel right now rather than leaving
     // the user to discover the tools/command on their own.
     const addNow = await ctx.ui.select(
-      "Add a channel now? (you can also do this later with /chaos-relay add)",
-      ["Yes — add a channel", "Not now"],
+      "Link a chat channel now?",
+      ["Yes — link one now", "Not yet"],
     );
-    if (addNow === "Yes — add a channel") {
+    if (addNow === "Yes — link one now") {
       await runAddChannel(ctx);
     } else {
       ctx.ui.notify(
-        "When you're ready, run /chaos-relay add — or just ask the agent to register " +
-          "a Telegram/Discord/email/webhook channel.",
+        "No problem. When you're ready, just tell me in plain English — e.g. " +
+          '"connect my Telegram" — and I\'ll walk you through it. ' +
+          "(Or run /chaos-relay add.)",
         "info",
       );
     }

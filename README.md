@@ -76,21 +76,31 @@ file > default**. The saved config file is `~/.pi/chaos-relay.json` (written wit
 | `CHAOS_RELAY_POLL_MS` | `15000` | Background poll interval in ms (min `3000`) |
 
 The **ECDSA private key** is part of your identity and is deliberately *not*
-configurable via an env var — it lives only in the `0600` config file. Running
-`/chaos-relay setup` → "Register a new session (ECDSA)" generates the keypair,
-sends only the **public** key to the relay, and persists the pair locally.
+configurable via an env var — it lives only in the `0600` config file. Setup
+generates the keypair, sends only the **public** key to the relay, and persists
+the pair locally. The Bearer API key you see in the config is just a session
+token *auto-issued from that keypair* — you never enter or manage it, and it's
+re-issued automatically if it expires.
 
-The quickest start is the interactive setup, which registers a session for you:
+The quickest start is zero-config — just tell the agent what you want:
+
+> "connect my Telegram"
+
+The agent registers a relay session for you on first use (no setup step needed)
+and walks you through linking the channel. Or run the interactive setup:
 
 ```
 /chaos-relay setup
 ```
 
-It asks for the relay URL and agent id, registers a new session (or lets you reuse
-/ paste an existing API key), verifies the relay is reachable, saves the
-credentials, starts the background poller, and offers to add your first channel.
-Add more channels any time with `/chaos-relay add`, and check state with
-`/chaos-relay status`.
+This asks **no questions** in the common case: it connects to the hosted relay,
+auto-registers your private session, starts the background poller, and offers to
+link your first channel. Add more any time with `/chaos-relay add`, and check
+state with `/chaos-relay status`.
+
+**Self-hosting / custom relay?** Use `/chaos-relay setup --advanced` to enter a
+custom relay URL, agent id, or paste an existing API key (or set the
+`CHAOS_RELAY_URL` env var).
 
 ## Troubleshooting
 
@@ -111,7 +121,7 @@ Since v0.6.2 the setup prompt rejects invalid URLs (must be absolute
 
 | Command | Description |
 |---------|-------------|
-| `/chaos-relay setup` | Interactive credential setup + start polling (then offers to add a channel) |
+| `/chaos-relay setup` | Zero-config connect (auto-registers your session) + start polling, then offers to link a channel. `--advanced` for a custom relay URL / agent id / pasted key |
 | `/chaos-relay add` | Interactive wizard to add a channel (Telegram / Discord / email / webhook) |
 | `/chaos-relay status` | Show config, poller state, and live relay health |
 | `/chaos-relay poll` | Poll once now and deliver any new messages |
