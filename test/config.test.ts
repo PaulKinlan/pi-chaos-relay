@@ -5,6 +5,7 @@ import {
   DEFAULT_RELAY_URL,
   MIN_POLL_INTERVAL_MS,
   CONFIG_PATH,
+  configPathFor,
   isConfigured,
   isValidRelayUrl,
   normalizeApprovalMode,
@@ -12,6 +13,43 @@ import {
   resolveConfig,
   savePersisted,
 } from "../config.ts";
+
+test("configPathFor: default profile uses chaos-relay.json", () => {
+  assert.equal(configPathFor({}, "/cfg"), "/cfg/chaos-relay.json");
+  assert.equal(
+    configPathFor({ CHAOS_RELAY_PROFILE: "default" }, "/cfg"),
+    "/cfg/chaos-relay.json",
+  );
+});
+
+test("configPathFor: named profile gets its own file", () => {
+  assert.equal(
+    configPathFor({ CHAOS_RELAY_PROFILE: "work" }, "/cfg"),
+    "/cfg/chaos-relay.work.json",
+  );
+  // Two distinct profiles → two distinct files (separate identities).
+  assert.notEqual(
+    configPathFor({ CHAOS_RELAY_PROFILE: "a" }, "/cfg"),
+    configPathFor({ CHAOS_RELAY_PROFILE: "b" }, "/cfg"),
+  );
+});
+
+test("configPathFor: profile names are slugified safely", () => {
+  assert.equal(
+    configPathFor({ CHAOS_RELAY_PROFILE: "My Work Box!" }, "/cfg"),
+    "/cfg/chaos-relay.my-work-box.json",
+  );
+});
+
+test("configPathFor: explicit CHAOS_RELAY_CONFIG wins over profile", () => {
+  assert.equal(
+    configPathFor(
+      { CHAOS_RELAY_CONFIG: "/abs/custom.json", CHAOS_RELAY_PROFILE: "work" },
+      "/cfg",
+    ),
+    "/abs/custom.json",
+  );
+});
 
 /** Snapshot and restore the env vars these tests touch. */
 function withEnv(vars: Record<string, string | undefined>, fn: () => void) {

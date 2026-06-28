@@ -1217,6 +1217,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   async function runStatus(ctx: ExtensionCommandContext): Promise<void> {
     const current = resolveConfig();
     const lines = [
+      `config file:   ${CONFIG_PATH}`,
       `relayUrl:      ${current.relayUrl}`,
       `connection:    ${current.agentId} (this session's name)`,
       `identity:      ${current.keyPair ? "ECDSA P-256 keypair (durable identity)" : "Bearer-only (legacy, no keypair)"}`,

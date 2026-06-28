@@ -9,7 +9,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import type { KeyPairJwk } from "./crypto.ts";
 
@@ -18,7 +18,36 @@ export const DEFAULT_POLL_INTERVAL_MS = 15_000;
 export const MIN_POLL_INTERVAL_MS = 3_000;
 
 export const CONFIG_DIR = join(homedir(), ".pi");
-export const CONFIG_PATH = join(CONFIG_DIR, "chaos-relay.json");
+
+/**
+ * Resolve the per-instance config file. Each file is a separate relay identity
+ * (its own ECDSA keypair → userId → message queue), so two pi instances on the
+ * same machine can hold distinct connections instead of sharing one:
+ *
+ *   CHAOS_RELAY_CONFIG=/abs/path.json   explicit file (highest precedence)
+ *   CHAOS_RELAY_PROFILE=work            → ~/.pi/chaos-relay.work.json
+ *   (unset / "default")                 → ~/.pi/chaos-relay.json  (back-compat)
+ *
+ * Exported as a pure function so it can be unit-tested without touching env.
+ */
+export function configPathFor(
+  env: Record<string, string | undefined>,
+  dir: string = CONFIG_DIR,
+): string {
+  const explicit = env.CHAOS_RELAY_CONFIG?.trim();
+  if (explicit) return explicit;
+  const profile = (env.CHAOS_RELAY_PROFILE ?? "").trim().toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  const file = profile && profile !== "default"
+    ? `chaos-relay.${profile}.json`
+    : "chaos-relay.json";
+  return join(dir, file);
+}
+
+export const CONFIG_PATH = configPathFor(
+  // process.env is available in the pi runtime (already used below for overrides).
+  (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env ?? {},
+);
 
 export type ApprovalMode = "off" | "writes" | "all";
 export const APPROVAL_MODES: ApprovalMode[] = ["off", "writes", "all"];
@@ -138,7 +167,10 @@ export function loadPersisted(): PersistedConfig {
 export function savePersisted(updates: Partial<PersistedConfig>): PersistedConfig {
   const current = existsSync(CONFIG_PATH) ? loadPersisted() : {};
   const merged: PersistedConfig = { ...current, ...updates };
-  if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+  // Ensure the config file's own directory exists (it may be outside ~/.pi when
+  // CHAOS_RELAY_CONFIG points elsewhere).
+  const dir = dirname(CONFIG_PATH);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   writeFileSync(CONFIG_PATH, JSON.stringify(merged, null, 2) + "\n");
   // Best effort: tighten permissions since this file holds the API key.
   try {
@@ -208,6 +240,8 @@ function envInt(name: string): number | undefined {
  *   CHAOS_RELAY_API_KEY   — Bearer API key (secret)
  *   CHAOS_RELAY_AGENT_ID  — agent id to route channels to
  *   CHAOS_RELAY_POLL_MS   — poll interval (ms)
+ *   CHAOS_RELAY_PROFILE   — separate config file per instance (see configPathFor)
+ *   CHAOS_RELAY_CONFIG    — explicit config file path (see configPathFor)
  */
 export function resolveConfig(persisted = loadPersisted()): ResolvedConfig {
   // Validate at the chokepoint: env > file > default, but fall back to the

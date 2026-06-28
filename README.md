@@ -74,6 +74,26 @@ file > default**. The saved config file is `~/.pi/chaos-relay.json` (written wit
 | `CHAOS_RELAY_API_KEY` | — | Bearer API key from `POST /auth/register` (secret) |
 | `CHAOS_RELAY_AGENT_ID` | `pi` | Agent id channels route to |
 | `CHAOS_RELAY_POLL_MS` | `15000` | Background poll interval in ms (min `3000`) |
+| `CHAOS_RELAY_PROFILE` | `default` | Names a separate config file (`~/.pi/chaos-relay.<profile>.json`) — see Multiple instances |
+| `CHAOS_RELAY_CONFIG` | — | Absolute path to the config file (overrides `CHAOS_RELAY_PROFILE`) |
+
+### Multiple instances / sessions
+
+Each config file is a **separate identity** — its own ECDSA keypair → `userId` →
+message queue. By default every pi instance on a machine shares
+`~/.pi/chaos-relay.json`, so they'd share one connection and all receive the
+same messages. To run two instances you can talk to independently, give each its
+own profile:
+
+```sh
+CHAOS_RELAY_PROFILE=work   pi   # ~/.pi/chaos-relay.work.json
+CHAOS_RELAY_PROFILE=home   pi   # ~/.pi/chaos-relay.home.json
+```
+
+Then register a **separate channel per instance** (e.g. a different Telegram bot,
+or a different email address) so messaging that channel reaches that specific
+instance. `/chaos-relay status` shows the active `config file` so you can tell
+which is which. (`CHAOS_RELAY_CONFIG=/abs/path.json` sets the file explicitly.)
 
 The **ECDSA private key** is part of your identity and is deliberately *not*
 configurable via an env var — it lives only in the `0600` config file. Setup
