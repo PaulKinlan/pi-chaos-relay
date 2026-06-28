@@ -108,9 +108,22 @@ Switching re-points **this** pi instance at that profile's identity (one active
 connection at a time). To have **two connections live simultaneously**, launch
 two instances with `CHAOS_RELAY_PROFILE=<name>` as above.
 
-A switch made inside pi **persists** — close pi and start a fresh session and it
-resumes the profile you last switched to. Startup precedence is: explicit env
-(`CHAOS_RELAY_CONFIG` / `CHAOS_RELAY_PROFILE`) > last in-pi switch > default.
+**Profiles are bound to the pi session.** Each session remembers the profile it
+was using (in `~/.pi/chaos-relay-sessions.json`, keyed by pi's session id), so
+**resuming a session reconnects as the same identity** — not a machine-global
+guess. The profile a session connects as is chosen, in order:
+
+1. **Explicit env** — `CHAOS_RELAY_CONFIG` / `CHAOS_RELAY_PROFILE` (and it pins:
+   the session is recorded as that profile)
+2. **The session's recorded profile** — set by a previous switch / launch
+   (covers resume and reload)
+3. **Inherit** — a `new`/`fork` session adopts the profile of the session it
+   came from
+4. **Default** — `chaos-relay.json`
+
+So: switch a session to `work`, quit, **resume that session** → back on `work`.
+A brand-new session with no env → `default` (or inherits its parent). Two
+instances stay independent because each is a different session.
 
 The **ECDSA private key** is part of your identity and is deliberately *not*
 configurable via an env var — it lives only in the `0600` config file. Setup

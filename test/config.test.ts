@@ -6,7 +6,9 @@ import {
   MIN_POLL_INTERVAL_MS,
   getConfigPath,
   configPathFor,
-  pickConfigPath,
+  envProfileName,
+  applySessionProfile,
+  chooseProfile,
   isConfigured,
   isValidRelayUrl,
   normalizeApprovalMode,
@@ -52,34 +54,78 @@ test("configPathFor: explicit CHAOS_RELAY_CONFIG wins over profile", () => {
   );
 });
 
-test("pickConfigPath: persisted pointer resumes the switched profile (no env)", () => {
+test("envProfileName: undefined when no relevant env is set", () => {
+  assert.equal(envProfileName({}), undefined);
+  assert.equal(envProfileName({ SOMETHING_ELSE: "x" }), undefined);
+});
+
+test("envProfileName: derives the name from env profile / config", () => {
+  assert.equal(envProfileName({ CHAOS_RELAY_PROFILE: "work" }), "work");
+  assert.equal(envProfileName({ CHAOS_RELAY_PROFILE: "default" }), "default");
   assert.equal(
-    pickConfigPath({}, "work", "/cfg"),
-    "/cfg/chaos-relay.work.json",
+    envProfileName({ CHAOS_RELAY_CONFIG: "/abs/chaos-relay.staging.json" }),
+    "staging",
   );
 });
 
-test("pickConfigPath: env profile wins over the persisted pointer", () => {
+test("applySessionProfile: records and updates a session's profile", () => {
+  let map: Record<string, string> = {};
+  map = applySessionProfile(map, "sess-A", "work");
+  map = applySessionProfile(map, "sess-B", "home");
+  assert.deepEqual(map, { "sess-A": "work", "sess-B": "home" });
+  // Re-recording updates the value and moves it to most-recent.
+  map = applySessionProfile(map, "sess-A", "staging");
+  assert.equal(map["sess-A"], "staging");
+  assert.deepEqual(Object.keys(map), ["sess-B", "sess-A"]);
+});
+
+test("applySessionProfile: trims oldest beyond the cap (LRU by write)", () => {
+  let map: Record<string, string> = {};
+  for (let i = 0; i < 5; i++) map = applySessionProfile(map, `s${i}`, "p", 3);
+  // Only the 3 most recently written survive.
+  assert.deepEqual(Object.keys(map), ["s2", "s3", "s4"]);
+});
+
+// One row of the launch/use matrix per assertion.
+test("chooseProfile: env pins and wins over everything", () => {
   assert.equal(
-    pickConfigPath({ CHAOS_RELAY_PROFILE: "home" }, "work", "/cfg"),
-    "/cfg/chaos-relay.home.json",
+    chooseProfile({
+      reason: "resume",
+      envProfile: "work",
+      recordedProfile: "home",
+      inheritedProfile: "staging",
+    }),
+    "work",
   );
 });
 
-test("pickConfigPath: explicit CHAOS_RELAY_CONFIG wins over the pointer", () => {
+test("chooseProfile: resume uses the session's recorded profile", () => {
   assert.equal(
-    pickConfigPath({ CHAOS_RELAY_CONFIG: "/abs/x.json" }, "work", "/cfg"),
-    "/abs/x.json",
+    chooseProfile({ reason: "resume", recordedProfile: "home", inheritedProfile: "x" }),
+    "home",
   );
 });
 
-test("pickConfigPath: no env + no pointer falls back to default", () => {
-  assert.equal(pickConfigPath({}, undefined, "/cfg"), "/cfg/chaos-relay.json");
-  assert.equal(pickConfigPath({}, "", "/cfg"), "/cfg/chaos-relay.json");
+test("chooseProfile: reload uses the recorded profile (same session)", () => {
+  assert.equal(chooseProfile({ reason: "reload", recordedProfile: "home" }), "home");
 });
 
-test("pickConfigPath: pointer 'default' resolves to the base file", () => {
-  assert.equal(pickConfigPath({}, "default", "/cfg"), "/cfg/chaos-relay.json");
+test("chooseProfile: new/fork inherit when nothing recorded", () => {
+  assert.equal(chooseProfile({ reason: "new", inheritedProfile: "work" }), "work");
+  assert.equal(chooseProfile({ reason: "fork", inheritedProfile: "work" }), "work");
+});
+
+test("chooseProfile: cold startup with nothing → default", () => {
+  assert.equal(chooseProfile({ reason: "startup" }), "default");
+  // A plain new session with no inherit/record → default too.
+  assert.equal(chooseProfile({ reason: "new" }), "default");
+});
+
+test("chooseProfile: recorded beats inherit on new/fork", () => {
+  assert.equal(
+    chooseProfile({ reason: "fork", recordedProfile: "home", inheritedProfile: "work" }),
+    "home",
+  );
 });
 
 /** Snapshot and restore the env vars these tests touch. */

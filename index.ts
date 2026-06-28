@@ -41,11 +41,14 @@ import {
   setMessagesCursor,
   getConfigPath,
   setActiveConfigPath,
-  setPersistedActiveProfile,
   profilePathForName,
   profileNameForPath,
   activeProfileName,
   listProfiles,
+  envProfileName,
+  getSessionProfile,
+  setSessionProfile,
+  chooseProfile,
   type ResolvedConfig,
   type RegisteredChannelRecord,
 } from "./config.ts";
@@ -76,6 +79,12 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   let ws: RelayWebSocket | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   let cfg: ResolvedConfig = resolveConfig();
+
+  // Profile/session binding. `currentProfile` is the profile this process is
+  // connected as right now; `currentSessionId` is pi's id for the active session
+  // (so switches/connects can be recorded against the right session).
+  let currentProfile: string = activeProfileName();
+  let currentSessionId: string | undefined;
 
   // Typing indicator state: the channel of the most recent inbound message, and
   // whether the current/next agent run was triggered by a relay message (so we
@@ -279,33 +288,59 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   }
 
   /**
-   * Switch the active connection to a different profile (config file), creating
-   * and auto-provisioning it if it's new. Tears down the current transport,
-   * re-points config at the profile's file, reconnects as that identity, and
-   * restarts polling. Returns a human-readable status line.
+   * Connect this process as the named profile: re-point config at its file,
+   * reconnect as that identity (auto-provisioning if new), restart polling, and
+   * bind the current pi session to it (so a resume reconnects the same way).
+   * Returns whether the profile was freshly created.
    */
-  async function switchProfile(name: string): Promise<string> {
-    const slug = profileNameForPath(profilePathForName(name));
-    const targetPath = profilePathForName(name);
-    if (targetPath === getConfigPath()) {
-      return `Already on profile "${slug}".`;
-    }
-    // Tear down the current connection before re-pointing config.
+  async function connectAsProfile(name: string): Promise<{ isNew: boolean; connected: boolean }> {
     stopPolling();
     client = undefined;
     poller = undefined;
-    setActiveConfigPath(targetPath);
-    // Persist the choice so a plain restart resumes this profile (env still wins).
-    setPersistedActiveProfile(slug);
+    setActiveConfigPath(profilePathForName(name));
     cfg = resolveConfig();
+    currentProfile = activeProfileName();
+    // Bind the active session → this profile so resume/reload restore it.
+    setSessionProfile(currentSessionId, currentProfile);
 
     const isNew = !isConfigured(cfg);
     const c = await ensureConfigured(); // provisions a fresh identity if new
-    if (!c) {
-      return `Switched config to profile "${slug}" but couldn't reach the relay to connect — check your network, then /chaos-relay status.`;
-    }
+    if (!c) return { isNew, connected: false };
     startPolling(); // ensure the poller runs for an already-provisioned profile too
     cfg = resolveConfig();
+    return { isNew, connected: true };
+  }
+
+  /**
+   * Decide which profile a starting/resuming session should use. Precedence:
+   * explicit env (pins) → this session's recorded profile → inherit on new/fork
+   * → default. See the launch/use matrix in the README.
+   */
+  function chooseProfileForSession(
+    reason: "startup" | "reload" | "new" | "resume" | "fork",
+    sessionId: string | undefined,
+  ): string {
+    return chooseProfile({
+      reason,
+      envProfile: envProfileName(), // CHAOS_RELAY_CONFIG/PROFILE — pins
+      recordedProfile: getSessionProfile(sessionId), // resume / reload
+      inheritedProfile: currentProfile, // inherit on new / fork
+    });
+  }
+
+  /**
+   * User-facing profile switch (command/tool). Connects as the profile and binds
+   * it to the current session. Returns a human-readable status line.
+   */
+  async function switchProfile(name: string): Promise<string> {
+    const slug = profileNameForPath(profilePathForName(name));
+    if (profilePathForName(name) === getConfigPath()) {
+      return `Already on profile "${slug}".`;
+    }
+    const { isNew, connected } = await connectAsProfile(name);
+    if (!connected) {
+      return `Switched config to profile "${slug}" but couldn't reach the relay to connect — check your network, then /chaos-relay status.`;
+    }
     const channelCount = cfg.channels.length;
     return isNew
       ? `Created and connected new profile "${slug}" (fresh identity). ` +
@@ -496,9 +531,18 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
   // --- Lifecycle: start/stop the background poller with the session ----------
 
-  pi.on("session_start", () => {
+  pi.on("session_start", async (event, ctx) => {
     if (poller) poller.reset();
-    startPolling();
+    // Bind this connection to the pi session: pick the profile by env → the
+    // session's recorded profile → inherit (new/fork) → default, then connect.
+    currentSessionId = ctx.sessionManager.getSessionId();
+    const profile = chooseProfileForSession(event.reason, currentSessionId);
+    const result = await connectAsProfile(profile);
+    if (!result.connected) {
+      log(`session ${event.reason}: selected profile "${profile}" but couldn't connect (will retry on next poll)`);
+    } else {
+      log(`session ${event.reason}: connected as profile "${profile}"`);
+    }
   });
 
   pi.on("session_shutdown", () => {

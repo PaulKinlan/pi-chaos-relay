@@ -44,61 +44,102 @@ export function configPathFor(
   return join(dir, file);
 }
 
-// Pointer file remembering the last profile switched to from inside pi, so a
-// plain (no-env) restart resumes it instead of snapping back to default. Holds
-// just a profile name — not a secret. Env vars still win over it.
-const ACTIVE_PROFILE_POINTER = join(CONFIG_DIR, "chaos-relay-active");
-
-function readActiveProfilePointer(): string | undefined {
-  try {
-    const name = readFileSync(ACTIVE_PROFILE_POINTER, "utf-8").trim();
-    return name || undefined;
-  } catch {
-    return undefined;
-  }
+function envOf(): Record<string, string | undefined> {
+  // process.env is available in the pi runtime (already used below for overrides).
+  return (globalThis as { process?: { env: Record<string, string | undefined> } })
+    .process?.env ?? {};
 }
 
 /**
- * Persist which profile is active so a plain restart resumes it. Pass "default"
- * to pin the base profile. Best-effort (a failure just means it won't stick).
+ * The profile name an explicit env var forces, or undefined when none is set.
+ * (CHAOS_RELAY_CONFIG / CHAOS_RELAY_PROFILE.) Pure given an env object.
  */
-export function setPersistedActiveProfile(name: string): void {
+export function envProfileName(env: Record<string, string | undefined> = envOf()): string | undefined {
+  const explicit = env.CHAOS_RELAY_CONFIG?.trim() || (env.CHAOS_RELAY_PROFILE ?? "").trim();
+  return explicit ? profileNameForPath(configPathFor(env)) : undefined;
+}
+
+// The config file the extension is currently reading/writing. At load it's just
+// env-or-default; the real per-session selection happens at session_start (see
+// the session→profile map below + chooseProfileForSession in index.ts). Mutable
+// so a profile can be switched at runtime (setActiveConfigPath / switchProfile).
+let activeConfigPath = configPathFor(envOf());
+
+// ── Session → profile map ─────────────────────────────────────────────────
+// Which relay profile each pi SESSION is bound to, so resuming a session
+// reconnects as the identity it was using (not a machine-global guess). Keyed by
+// pi's stable session id. Holds profile names only — not secrets.
+const SESSION_MAP_PATH = join(CONFIG_DIR, "chaos-relay-sessions.json");
+const SESSION_MAP_MAX = 200; // LRU cap so the map can't grow unbounded
+
+export function loadSessionMap(): Record<string, string> {
+  try {
+    const obj = JSON.parse(readFileSync(SESSION_MAP_PATH, "utf-8"));
+    return obj && typeof obj === "object" ? obj as Record<string, string> : {};
+  } catch {
+    return {};
+  }
+}
+
+/** The profile bound to a pi session, or undefined if none recorded. */
+export function getSessionProfile(sessionId: string | undefined): string | undefined {
+  if (!sessionId) return undefined;
+  return loadSessionMap()[sessionId];
+}
+
+/**
+ * Pure: record `sessionId → profile`, moving it to most-recent and trimming the
+ * oldest beyond the cap. Exported for testing.
+ */
+export function applySessionProfile(
+  map: Record<string, string>,
+  sessionId: string,
+  profile: string,
+  cap: number = SESSION_MAP_MAX,
+): Record<string, string> {
+  const next: Record<string, string> = {};
+  // Re-insert all except this id (preserves order), then append this id last.
+  for (const [k, v] of Object.entries(map)) {
+    if (k !== sessionId) next[k] = v;
+  }
+  next[sessionId] = profile;
+  const keys = Object.keys(next);
+  if (keys.length > cap) {
+    for (const k of keys.slice(0, keys.length - cap)) delete next[k];
+  }
+  return next;
+}
+
+/**
+ * Pure profile-selection policy for a session start, by precedence:
+ * env (pins) → the session's recorded profile → inherit on new/fork → default.
+ * Exported so every row of the launch/use matrix is unit-testable.
+ */
+export function chooseProfile(opts: {
+  reason: "startup" | "reload" | "new" | "resume" | "fork";
+  envProfile?: string;
+  recordedProfile?: string;
+  inheritedProfile?: string;
+}): string {
+  if (opts.envProfile) return opts.envProfile;
+  if (opts.recordedProfile) return opts.recordedProfile;
+  if ((opts.reason === "new" || opts.reason === "fork") && opts.inheritedProfile) {
+    return opts.inheritedProfile;
+  }
+  return "default";
+}
+
+/** Persist `sessionId → profile` (best-effort). Bounded by an LRU cap. */
+export function setSessionProfile(sessionId: string | undefined, profile: string): void {
+  if (!sessionId) return;
   try {
     if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
-    writeFileSync(ACTIVE_PROFILE_POINTER, name + "\n");
+    const next = applySessionProfile(loadSessionMap(), sessionId, profile);
+    writeFileSync(SESSION_MAP_PATH, JSON.stringify(next, null, 2) + "\n");
   } catch {
     /* best effort */
   }
 }
-
-/**
- * Choose the startup config path. Precedence: explicit env (CHAOS_RELAY_CONFIG /
- * CHAOS_RELAY_PROFILE) > the persisted in-pi switch pointer > default. Pure +
- * exported so it can be unit-tested without the filesystem.
- */
-export function pickConfigPath(
-  env: Record<string, string | undefined>,
-  pointer: string | undefined,
-  dir: string = CONFIG_DIR,
-): string {
-  const envExplicit = env.CHAOS_RELAY_CONFIG?.trim() ||
-    (env.CHAOS_RELAY_PROFILE ?? "").trim();
-  if (envExplicit) return configPathFor(env, dir);
-  if (pointer && pointer.trim()) {
-    return configPathFor({ CHAOS_RELAY_PROFILE: pointer.trim() }, dir);
-  }
-  return configPathFor(env, dir); // default chaos-relay.json
-}
-
-// The config file the extension is currently reading/writing. Initialised at
-// load (env > persisted switch pointer > default), but mutable at runtime so a
-// profile can be switched from inside pi without relaunching (see
-// setActiveConfigPath / switchProfile).
-let activeConfigPath = pickConfigPath(
-  // process.env is available in the pi runtime (already used below for overrides).
-  (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env ?? {},
-  readActiveProfilePointer(),
-);
 
 /** The config file currently in use. */
 export function getConfigPath(): string {
