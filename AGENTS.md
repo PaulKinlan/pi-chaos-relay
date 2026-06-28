@@ -36,6 +36,24 @@ npm test             # node --test over test/*.test.ts
 
 Both must be green. Add or update tests for behavior changes.
 
+## Keep docs in sync — in the SAME commit
+
+A user-facing change is not done until the docs match it. Update whichever of
+these the change touches, in the same commit as the code:
+
+- **`README.md`** — env-var / command / tool tables, the quick-start and flows,
+  the inbound-delivery and security sections.
+- **`skills/chaos-relay/SKILL.md`** — agent-facing how-to: tools table, commands
+  table, channel + profile flows.
+- **`skills/chaos-relay-troubleshoot/SKILL.md`** — the `doctor` checklist and the
+  symptom → fix steps.
+
+Whenever you add / rename / remove a **command** (`/chaos-relay …`), a **tool**
+(`relay_*`), an **env var** (`CHAOS_RELAY_*`), or change the `doctor` checks:
+grep the docs for the old names and fix **every** table. The command, tool, and
+env-var lists in the README and skills must stay 1:1 with `index.ts` and
+`config.ts` — and never document a knob the code doesn't actually consume.
+
 ## Layout
 
 - `index.ts` — pi extension entry: registers tools (`relay_reply`,

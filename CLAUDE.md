@@ -29,6 +29,15 @@ npm test             # node --test
 
 Both must pass. Add/adjust tests for behavior changes.
 
+## Keep docs in sync (same commit)
+
+Any change to a command (`/chaos-relay …`), tool (`relay_*`), env var
+(`CHAOS_RELAY_*`), or the `doctor` checklist MUST update the docs in the same
+commit: `README.md` (env / command / tool tables + flows),
+`skills/chaos-relay/SKILL.md`, and `skills/chaos-relay-troubleshoot/SKILL.md`.
+Keep those lists 1:1 with `index.ts` / `config.ts`; never document a knob the
+code doesn't consume. See AGENTS.md for the checklist.
+
 ## Gotchas
 
 - Secrets (the ECDSA keypair, apiKey) live in `~/.pi/chaos-relay.json` (0600),
