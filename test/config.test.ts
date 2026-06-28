@@ -6,6 +6,7 @@ import {
   MIN_POLL_INTERVAL_MS,
   getConfigPath,
   configPathFor,
+  pickConfigPath,
   isConfigured,
   isValidRelayUrl,
   normalizeApprovalMode,
@@ -49,6 +50,36 @@ test("configPathFor: explicit CHAOS_RELAY_CONFIG wins over profile", () => {
     ),
     "/abs/custom.json",
   );
+});
+
+test("pickConfigPath: persisted pointer resumes the switched profile (no env)", () => {
+  assert.equal(
+    pickConfigPath({}, "work", "/cfg"),
+    "/cfg/chaos-relay.work.json",
+  );
+});
+
+test("pickConfigPath: env profile wins over the persisted pointer", () => {
+  assert.equal(
+    pickConfigPath({ CHAOS_RELAY_PROFILE: "home" }, "work", "/cfg"),
+    "/cfg/chaos-relay.home.json",
+  );
+});
+
+test("pickConfigPath: explicit CHAOS_RELAY_CONFIG wins over the pointer", () => {
+  assert.equal(
+    pickConfigPath({ CHAOS_RELAY_CONFIG: "/abs/x.json" }, "work", "/cfg"),
+    "/abs/x.json",
+  );
+});
+
+test("pickConfigPath: no env + no pointer falls back to default", () => {
+  assert.equal(pickConfigPath({}, undefined, "/cfg"), "/cfg/chaos-relay.json");
+  assert.equal(pickConfigPath({}, "", "/cfg"), "/cfg/chaos-relay.json");
+});
+
+test("pickConfigPath: pointer 'default' resolves to the base file", () => {
+  assert.equal(pickConfigPath({}, "default", "/cfg"), "/cfg/chaos-relay.json");
 });
 
 /** Snapshot and restore the env vars these tests touch. */

@@ -44,12 +44,60 @@ export function configPathFor(
   return join(dir, file);
 }
 
-// The config file the extension is currently reading/writing. Initialised from
-// env at load, but mutable at runtime so a profile can be switched from inside
-// pi without relaunching (see setActiveConfigPath / switchProfile).
-let activeConfigPath = configPathFor(
+// Pointer file remembering the last profile switched to from inside pi, so a
+// plain (no-env) restart resumes it instead of snapping back to default. Holds
+// just a profile name — not a secret. Env vars still win over it.
+const ACTIVE_PROFILE_POINTER = join(CONFIG_DIR, "chaos-relay-active");
+
+function readActiveProfilePointer(): string | undefined {
+  try {
+    const name = readFileSync(ACTIVE_PROFILE_POINTER, "utf-8").trim();
+    return name || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Persist which profile is active so a plain restart resumes it. Pass "default"
+ * to pin the base profile. Best-effort (a failure just means it won't stick).
+ */
+export function setPersistedActiveProfile(name: string): void {
+  try {
+    if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+    writeFileSync(ACTIVE_PROFILE_POINTER, name + "\n");
+  } catch {
+    /* best effort */
+  }
+}
+
+/**
+ * Choose the startup config path. Precedence: explicit env (CHAOS_RELAY_CONFIG /
+ * CHAOS_RELAY_PROFILE) > the persisted in-pi switch pointer > default. Pure +
+ * exported so it can be unit-tested without the filesystem.
+ */
+export function pickConfigPath(
+  env: Record<string, string | undefined>,
+  pointer: string | undefined,
+  dir: string = CONFIG_DIR,
+): string {
+  const envExplicit = env.CHAOS_RELAY_CONFIG?.trim() ||
+    (env.CHAOS_RELAY_PROFILE ?? "").trim();
+  if (envExplicit) return configPathFor(env, dir);
+  if (pointer && pointer.trim()) {
+    return configPathFor({ CHAOS_RELAY_PROFILE: pointer.trim() }, dir);
+  }
+  return configPathFor(env, dir); // default chaos-relay.json
+}
+
+// The config file the extension is currently reading/writing. Initialised at
+// load (env > persisted switch pointer > default), but mutable at runtime so a
+// profile can be switched from inside pi without relaunching (see
+// setActiveConfigPath / switchProfile).
+let activeConfigPath = pickConfigPath(
   // process.env is available in the pi runtime (already used below for overrides).
   (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env ?? {},
+  readActiveProfilePointer(),
 );
 
 /** The config file currently in use. */

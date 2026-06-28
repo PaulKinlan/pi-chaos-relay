@@ -41,6 +41,7 @@ import {
   setMessagesCursor,
   getConfigPath,
   setActiveConfigPath,
+  setPersistedActiveProfile,
   profilePathForName,
   profileNameForPath,
   activeProfileName,
@@ -294,6 +295,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     client = undefined;
     poller = undefined;
     setActiveConfigPath(targetPath);
+    // Persist the choice so a plain restart resumes this profile (env still wins).
+    setPersistedActiveProfile(slug);
     cfg = resolveConfig();
 
     const isNew = !isConfigured(cfg);
