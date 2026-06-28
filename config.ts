@@ -7,9 +7,9 @@
  * with 0600 permissions.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, chmodSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import type { KeyPairJwk } from "./crypto.ts";
 
@@ -44,10 +44,57 @@ export function configPathFor(
   return join(dir, file);
 }
 
-export const CONFIG_PATH = configPathFor(
+// The config file the extension is currently reading/writing. Initialised from
+// env at load, but mutable at runtime so a profile can be switched from inside
+// pi without relaunching (see setActiveConfigPath / switchProfile).
+let activeConfigPath = configPathFor(
   // process.env is available in the pi runtime (already used below for overrides).
   (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env ?? {},
 );
+
+/** The config file currently in use. */
+export function getConfigPath(): string {
+  return activeConfigPath;
+}
+
+/** Point the extension at a different config file (used when switching profiles). */
+export function setActiveConfigPath(path: string): void {
+  activeConfigPath = path;
+}
+
+/** Absolute path for a named profile ("default" → chaos-relay.json). */
+export function profilePathForName(name: string): string {
+  return configPathFor({ CHAOS_RELAY_PROFILE: name }, CONFIG_DIR);
+}
+
+/** Profile name for a config path ("default" for the base chaos-relay.json). */
+export function profileNameForPath(path: string): string {
+  const m = basename(path).match(/^chaos-relay(?:\.(.+))?\.json$/);
+  return m ? (m[1] ?? "default") : basename(path);
+}
+
+/** The active profile's name. */
+export function activeProfileName(): string {
+  return profileNameForPath(activeConfigPath);
+}
+
+/**
+ * List known profiles — every chaos-relay[.<name>].json in ~/.pi, plus the
+ * active one (which may live elsewhere via CHAOS_RELAY_CONFIG).
+ */
+export function listProfiles(): { name: string; active: boolean }[] {
+  const active = activeProfileName();
+  const names = new Set<string>([active]);
+  try {
+    for (const f of readdirSync(CONFIG_DIR)) {
+      const m = f.match(/^chaos-relay(?:\.(.+))?\.json$/);
+      if (m) names.add(m[1] ?? "default");
+    }
+  } catch {
+    /* ~/.pi may not exist yet */
+  }
+  return [...names].sort().map((name) => ({ name, active: name === active }));
+}
 
 export type ApprovalMode = "off" | "writes" | "all";
 export const APPROVAL_MODES: ApprovalMode[] = ["off", "writes", "all"];
@@ -155,26 +202,26 @@ export interface ResolvedConfig {
 }
 
 export function loadPersisted(): PersistedConfig {
-  if (!existsSync(CONFIG_PATH)) return {};
+  if (!existsSync(activeConfigPath)) return {};
   try {
-    return JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as PersistedConfig;
+    return JSON.parse(readFileSync(activeConfigPath, "utf-8")) as PersistedConfig;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+    throw new Error(`Failed to parse ${activeConfigPath}: ${message}`);
   }
 }
 
 export function savePersisted(updates: Partial<PersistedConfig>): PersistedConfig {
-  const current = existsSync(CONFIG_PATH) ? loadPersisted() : {};
+  const current = existsSync(activeConfigPath) ? loadPersisted() : {};
   const merged: PersistedConfig = { ...current, ...updates };
   // Ensure the config file's own directory exists (it may be outside ~/.pi when
   // CHAOS_RELAY_CONFIG points elsewhere).
-  const dir = dirname(CONFIG_PATH);
+  const dir = dirname(activeConfigPath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(CONFIG_PATH, JSON.stringify(merged, null, 2) + "\n");
+  writeFileSync(activeConfigPath, JSON.stringify(merged, null, 2) + "\n");
   // Best effort: tighten permissions since this file holds the API key.
   try {
-    chmodSync(CONFIG_PATH, 0o600);
+    chmodSync(activeConfigPath, 0o600);
   } catch {
     /* non-POSIX filesystems may not support chmod */
   }
@@ -215,8 +262,8 @@ export function setApprovalMode(mode: ApprovalMode): void {
  */
 export function resetPersisted(scope: "url" | "all"): void {
   if (scope === "all") {
-    if (existsSync(CONFIG_PATH)) {
-      unlinkSync(CONFIG_PATH);
+    if (existsSync(activeConfigPath)) {
+      unlinkSync(activeConfigPath);
     }
     return;
   }

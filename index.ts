@@ -39,7 +39,12 @@ import {
   setApprovalMode,
   setChannelRecords,
   setMessagesCursor,
-  CONFIG_PATH,
+  getConfigPath,
+  setActiveConfigPath,
+  profilePathForName,
+  profileNameForPath,
+  activeProfileName,
+  listProfiles,
   type ResolvedConfig,
   type RegisteredChannelRecord,
 } from "./config.ts";
@@ -270,6 +275,39 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       log(`auto-provision failed: ${err instanceof Error ? err.message : String(err)}`);
       return undefined;
     }
+  }
+
+  /**
+   * Switch the active connection to a different profile (config file), creating
+   * and auto-provisioning it if it's new. Tears down the current transport,
+   * re-points config at the profile's file, reconnects as that identity, and
+   * restarts polling. Returns a human-readable status line.
+   */
+  async function switchProfile(name: string): Promise<string> {
+    const slug = profileNameForPath(profilePathForName(name));
+    const targetPath = profilePathForName(name);
+    if (targetPath === getConfigPath()) {
+      return `Already on profile "${slug}".`;
+    }
+    // Tear down the current connection before re-pointing config.
+    stopPolling();
+    client = undefined;
+    poller = undefined;
+    setActiveConfigPath(targetPath);
+    cfg = resolveConfig();
+
+    const isNew = !isConfigured(cfg);
+    const c = await ensureConfigured(); // provisions a fresh identity if new
+    if (!c) {
+      return `Switched config to profile "${slug}" but couldn't reach the relay to connect — check your network, then /chaos-relay status.`;
+    }
+    startPolling(); // ensure the poller runs for an already-provisioned profile too
+    cfg = resolveConfig();
+    const channelCount = cfg.channels.length;
+    return isNew
+      ? `Created and connected new profile "${slug}" (fresh identity). ` +
+        `No channels yet — add one with /chaos-relay add or by pasting a token.`
+      : `Switched to profile "${slug}" (${channelCount} channel${channelCount === 1 ? "" : "s"}).`;
   }
 
   function stopPolling(): void {
@@ -953,10 +991,58 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     },
   });
 
+  // relay_list_profiles — show the connection profiles and which is active.
+  pi.registerTool({
+    name: "relay_list_profiles",
+    label: "CHAOS Relay: list profiles",
+    description:
+      "List the relay connection profiles (each is a separate identity with its " +
+      "own channels) and mark the active one. Use before switching so the user " +
+      "can pick.",
+    parameters: Type.Object({}),
+    async execute() {
+      const profiles = listProfiles();
+      const active = activeProfileName();
+      return textResult(
+        `Active profile: ${active}\nProfiles: ${profiles.map((p) => p.name).join(", ")}`,
+        { profiles, active },
+      );
+    },
+  });
+
+  // relay_switch_profile — switch to (or create) a connection profile.
+  const switchParams = Type.Object({
+    name: Type.String({
+      description:
+        'Profile name to switch to, e.g. "work" or "home". If it doesn\'t exist ' +
+        'yet it is created with a fresh identity. "default" is the base profile.',
+    }),
+  });
+  pi.registerTool({
+    name: "relay_switch_profile",
+    label: "CHAOS Relay: switch profile",
+    description:
+      "Switch the active relay connection to a different profile, creating and " +
+      "auto-provisioning it if new. Each profile is a separate identity with its " +
+      "own channels and message queue. Note: this changes which single connection " +
+      "this pi instance uses; to run two connections at once, launch separate pi " +
+      "instances with CHAOS_RELAY_PROFILE=<name>.",
+    promptSnippet:
+      "relay_switch_profile: switch this pi to a different (or new) relay connection profile",
+    parameters: switchParams,
+    async execute(_id: string, params: Static<typeof switchParams>) {
+      try {
+        return textResult(await switchProfile(params.name));
+      } catch (err) {
+        throw toFriendly(err);
+      }
+    },
+  });
+
   // --- /chaos-relay command --------------------------------------------------
 
   pi.registerCommand("chaos-relay", {
-    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup [--advanced], connect, add, status, poll, stop, approvals, reset, doctor)",
+    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup [--advanced], connect, profile, add, status, poll, stop, approvals, reset, doctor)",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parts = args.trim().split(/\s+/);
       const sub = parts[0] || "status";
@@ -980,6 +1066,24 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
               break;
             }
             ctx.ui.notify(await runConnect(rest), "info");
+            break;
+          }
+          case "profile": {
+            const name = parts.slice(1).join(" ").trim();
+            if (!name) {
+              const profiles = listProfiles();
+              const lines = profiles.map((p) =>
+                `  ${p.active ? "* " : "  "}${p.name}`
+              ).join("\n");
+              ctx.ui.notify(
+                `Connection profiles (each is a separate identity):\n${lines}\n\n` +
+                  "Switch or create with /chaos-relay profile <name>. " +
+                  "For two live at once, launch each instance with CHAOS_RELAY_PROFILE=<name>.",
+                "info",
+              );
+              break;
+            }
+            ctx.ui.notify(await switchProfile(name), "info");
             break;
           }
           case "add":
@@ -1035,7 +1139,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           }
           default:
             ctx.ui.notify(
-              `Unknown subcommand "${sub}". Use: setup | connect | add | status | poll | stop | approvals | reset | doctor`,
+              `Unknown subcommand "${sub}". Use: setup | connect | profile | add | status | poll | stop | approvals | reset | doctor`,
               "warning",
             );
         }
@@ -1217,7 +1321,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   async function runStatus(ctx: ExtensionCommandContext): Promise<void> {
     const current = resolveConfig();
     const lines = [
-      `config file:   ${CONFIG_PATH}`,
+      `config file:   ${getConfigPath()}`,
       `relayUrl:      ${current.relayUrl}`,
       `connection:    ${current.agentId} (this session's name)`,
       `identity:      ${current.keyPair ? "ECDSA P-256 keypair (durable identity)" : "Bearer-only (legacy, no keypair)"}`,
@@ -1267,7 +1371,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     cfg = resolveConfig();
     if (all) {
       ctx.ui.notify(
-        `chaos-relay: reset complete. Config file removed (${CONFIG_PATH}). ` +
+        `chaos-relay: reset complete. Config file removed (${getConfigPath()}). ` +
           `Run /chaos-relay setup to start fresh.`,
         "info",
       );
@@ -1313,7 +1417,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     if (fileOk) {
       checks.push({
         ok: true,
-        label: `config file (${CONFIG_PATH})`,
+        label: `config file (${getConfigPath()})`,
         detail: "present and parses",
       });
     }

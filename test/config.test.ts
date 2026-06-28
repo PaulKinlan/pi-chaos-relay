@@ -4,7 +4,7 @@ import { existsSync, readFileSync, unlinkSync, copyFileSync } from "node:fs";
 import {
   DEFAULT_RELAY_URL,
   MIN_POLL_INTERVAL_MS,
-  CONFIG_PATH,
+  getConfigPath,
   configPathFor,
   isConfigured,
   isValidRelayUrl,
@@ -211,16 +211,16 @@ test("resolveConfig keeps a valid persisted relayUrl when env is unset", () => {
  * helpers (savePersisted/resetPersisted) without polluting ~/.pi/chaos-relay.json.
  */
 function withConfigIsolated(fn: () => void): void {
-  const backup = `${CONFIG_PATH}.bak-${process.pid}-${Date.now()}`;
-  const existed = existsSync(CONFIG_PATH);
-  if (existed) copyFileSync(CONFIG_PATH, backup);
-  if (existed) unlinkSync(CONFIG_PATH);
+  const backup = `${getConfigPath()}.bak-${process.pid}-${Date.now()}`;
+  const existed = existsSync(getConfigPath());
+  if (existed) copyFileSync(getConfigPath(), backup);
+  if (existed) unlinkSync(getConfigPath());
   try {
     fn();
   } finally {
     // Restore exactly what was there before (or leave it absent).
-    if (existsSync(CONFIG_PATH)) unlinkSync(CONFIG_PATH);
-    if (existed) copyFileSync(backup, CONFIG_PATH);
+    if (existsSync(getConfigPath())) unlinkSync(getConfigPath());
+    if (existed) copyFileSync(backup, getConfigPath());
     if (existsSync(backup)) unlinkSync(backup);
   }
 }
@@ -235,7 +235,7 @@ test("resetPersisted('url') clears only relayUrl, keeps credentials + channels",
       channels: [{ channelId: "ch-1", type: "telegram", createdAt: "2026-01-01" }],
     });
     resetPersisted("url");
-    const after = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+    const after = JSON.parse(readFileSync(getConfigPath(), "utf-8"));
     assert.equal(after.relayUrl, undefined);
     // Credentials and channels survive.
     assert.equal(after.apiKey, "secret-key");
@@ -247,8 +247,8 @@ test("resetPersisted('url') clears only relayUrl, keeps credentials + channels",
 test("resetPersisted('all') removes the config file entirely", () => {
   withConfigIsolated(() => {
     savePersisted({ relayUrl: "https://x.example.com", apiKey: "k" });
-    assert.equal(existsSync(CONFIG_PATH), true);
+    assert.equal(existsSync(getConfigPath()), true);
     resetPersisted("all");
-    assert.equal(existsSync(CONFIG_PATH), false);
+    assert.equal(existsSync(getConfigPath()), false);
   });
 });

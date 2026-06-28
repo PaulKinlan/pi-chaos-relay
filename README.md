@@ -95,6 +95,19 @@ or a different email address) so messaging that channel reaches that specific
 instance. `/chaos-relay status` shows the active `config file` so you can tell
 which is which. (`CHAOS_RELAY_CONFIG=/abs/path.json` sets the file explicitly.)
 
+**Manage profiles from inside pi.** You don't have to relaunch to create or
+switch a profile — just ask the agent ("switch to my work connection", "make a
+new profile called staging") or use the command:
+
+```
+/chaos-relay profile           # list profiles, mark the active one
+/chaos-relay profile work      # switch to "work" (creates + provisions it if new)
+```
+
+Switching re-points **this** pi instance at that profile's identity (one active
+connection at a time). To have **two connections live simultaneously**, launch
+two instances with `CHAOS_RELAY_PROFILE=<name>` as above.
+
 The **ECDSA private key** is part of your identity and is deliberately *not*
 configurable via an env var — it lives only in the `0600` config file. Setup
 generates the keypair, sends only the **public** key to the relay, and persists
@@ -143,6 +156,7 @@ Since v0.6.2 the setup prompt rejects invalid URLs (must be absolute
 |---------|-------------|
 | `/chaos-relay setup` | Zero-config connect (auto-registers your session) + start polling, then offers to link a channel. `--advanced` for a custom relay URL / agent id / pasted key |
 | `/chaos-relay connect <token\|email\|webhook>` | One-shot: paste a Telegram/Discord bot token, an email, or `webhook` and it sets up the relay + registers the channel in a single step |
+| `/chaos-relay profile [name]` | List connection profiles, or switch to / create one (each is a separate identity). No arg lists them |
 | `/chaos-relay add` | Interactive wizard to add a channel (Telegram / Discord / email / webhook) |
 | `/chaos-relay status` | Show config, poller state, and live relay health |
 | `/chaos-relay poll` | Poll once now and deliver any new messages |
@@ -156,6 +170,8 @@ Since v0.6.2 the setup prompt rejects invalid URLs (must be absolute
 | Tool | Description |
 |------|-------------|
 | `relay_connect` | **One-shot**: give it a bot token / email / `webhook` and it sets up the relay (auto-registering your session) and the channel in one step. Lets you just paste a token and say "connect this" |
+| `relay_list_profiles` | List connection profiles and the active one |
+| `relay_switch_profile` | Switch to (or create) a connection profile — "switch to my work connection" |
 | `relay_check_messages` | Pull pending inbound Telegram/email messages |
 | `relay_reply` | Reply to a channel message (`channelType`, `channelId`, `content`, optional `replyTo`) |
 | `relay_register_telegram` | Register a Telegram bot channel |
