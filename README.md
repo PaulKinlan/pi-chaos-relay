@@ -13,9 +13,9 @@ agent's answers back to the original thread. It is the same poll-and-reply patte
 CHAOS Chrome extension uses.
 
 ```
-Telegram / Email ──> CHAOS relay ──poll GET /messages──> pi agent
-                          ^                                  │
-                          └──────── POST /reply ─────────────┘
+Telegram / Discord / Email / Webhook ──> CHAOS relay ──/ws push (poll fallback)──> pi agent
+                          ^                                            │
+                          └──────────────── POST /reply ──────────────┘
 ```
 
 ## Quick start
@@ -72,8 +72,8 @@ file > default**. The saved config file is `~/.pi/chaos-relay.json` (written wit
 |---------|---------|---------|
 | `CHAOS_RELAY_URL` | `https://chaos-relay.com` | Relay base URL |
 | `CHAOS_RELAY_API_KEY` | — | Bearer API key from `POST /auth/register` (secret) |
-| `CHAOS_RELAY_AGENT_ID` | `pi` | Agent id channels route to |
-| `CHAOS_RELAY_POLL_MS` | `15000` | Background poll interval in ms (min `3000`) |
+| `CHAOS_RELAY_AGENT_ID` | `pi` | Connection/session label channels are tagged with |
+| `CHAOS_RELAY_APPROVAL_MODE` | `off` | Tool-approval policy: `off` / `writes` / `all` (see Tool approvals) |
 | `CHAOS_RELAY_PROFILE` | `default` | Names a separate config file (`~/.pi/chaos-relay.<profile>.json`) — see Multiple instances |
 | `CHAOS_RELAY_CONFIG` | — | Absolute path to the config file (overrides `CHAOS_RELAY_PROFILE`) |
 
@@ -164,8 +164,10 @@ a command was accidentally pasted into the URL field. Two ways to recover:
   keeps your credentials and channels. Then run `/chaos-relay setup` to re-enter
   the URL. Use **`/chaos-relay reset all`** for a full wipe.
 
-Since v0.6.2 the setup prompt rejects invalid URLs (must be absolute
-`http(s)://…`), so this should no longer happen on fresh setups.
+Default setup is zero-config and never asks for a URL, so this only affects
+older configs or a bad `CHAOS_RELAY_URL` / `--advanced` entry. Invalid URLs are
+rejected (must be absolute `http(s)://…`) and an invalid saved/env URL falls back
+to the default rather than breaking every request.
 
 ## Commands
 
@@ -243,8 +245,10 @@ Terminal/local turns are never gated.
 
 ## How inbound delivery works
 
-While a pi session is active, a background poller runs every `CHAOS_RELAY_POLL_MS`
-milliseconds. New messages are de-duplicated by id (so nothing is delivered twice)
+While a pi session is active, the extension holds a **WebSocket** to the relay
+and receives messages the instant they arrive. A slow background **safety poll**
+(every ~120s) runs only as a backstop in case a push is missed between
+reconnects. New messages are de-duplicated by id (so nothing is delivered twice)
 and injected into the agent as a user message that includes each message's `id`,
 `channelType`, `channelId`, sender, and content — everything the agent needs to
 call `relay_reply`. You can also force an immediate pull with `relay_check_messages`
@@ -285,10 +289,8 @@ Integration testing against a local relay: run the CHAOS relay server
 
 - **Server response signing / TOFU pinning.** The relay returns its public key
   at registration and we persist it (`serverPublicKey`), but the client does not
-  yet verify server signatures on poll responses. Outbound request signing (the
+  yet verify server signatures on inbound messages. Outbound request signing (the
   key threat: someone spending your API key) is fully implemented.
-- **WebSocket** real-time delivery (`GET /ws`) is not used; the extension polls.
-  Polling is simpler and robust; a WS transport could lower latency later.
 - Email registration depends on relay-side `CHAOS_EMAIL_DOMAIN` + provider config.
 
 ## License

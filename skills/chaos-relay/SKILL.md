@@ -76,8 +76,8 @@ explicitly: `telegram <token>`, `discord <token>`, `email <addr>`,
 
 ## Receiving and replying
 
-- New messages are injected automatically by the background poller. To pull
-  immediately, call `relay_check_messages`.
+- New messages are injected automatically (WebSocket push, with a safety-poll
+  backstop). To pull immediately, call `relay_check_messages`.
 - To answer, call `relay_reply` with the `channelType`, `channelId`, and the
   inbound message `id` (as `replyTo`), plus your `content`.
 - Replies go back to the original channel thread.
@@ -93,6 +93,8 @@ explicitly: `telegram <token>`, `discord <token>`, `email <addr>`,
 | `relay_register_webhook` | Create an inbound-only webhook URL |
 | `relay_check_messages` | Poll for new inbound messages |
 | `relay_reply` | Reply to a channel message |
+| `relay_list_profiles` | List connection profiles and the active one |
+| `relay_switch_profile` | Switch to (or create) a connection profile |
 
 ## Commands
 
@@ -101,6 +103,7 @@ explicitly: `telegram <token>`, `discord <token>`, `email <addr>`,
 | `/chaos-relay connect <value>` | Zero-config: one paste provisions + registers |
 | `/chaos-relay setup [--advanced]` | Interactive credential setup (self-provisions by default) |
 | `/chaos-relay add` | Guided wizard to add a channel |
+| `/chaos-relay profile [name]` | List connection profiles, or switch to / create one |
 | `/chaos-relay status` | Config, poller state, live relay health |
 | `/chaos-relay poll` | Poll once now and deliver any new messages |
 | `/chaos-relay stop` | Stop the background poller |
@@ -108,6 +111,21 @@ explicitly: `telegram <token>`, `discord <token>`, `email <addr>`,
 
 For diagnosis and recovery, see the companion **chaos-relay-troubleshoot** skill
 (`/chaos-relay doctor`, `/chaos-relay reset`).
+
+## Multiple connections (profiles)
+
+Each **profile** is a separate identity (its own keypair → message queue), so a
+user can run more than one connection. The profile is **bound to the pi session**
+and persists across restarts (resuming a session reconnects as the same identity).
+
+- "switch to my work connection" / "make a new profile called staging" →
+  `relay_switch_profile` (creates + auto-provisions if new), or
+  `/chaos-relay profile <name>`.
+- "what connections do I have" → `relay_list_profiles` or `/chaos-relay profile`.
+- Switching changes the **one** connection this pi instance uses. To run two
+  connections **at once**, the user launches separate pi instances with
+  `CHAOS_RELAY_PROFILE=<name>`. Each instance needs its **own channel** (e.g. a
+  different Telegram bot) to be addressable.
 
 ## Tool approvals
 

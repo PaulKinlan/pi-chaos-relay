@@ -19,8 +19,11 @@ It reports ✓/✗ on each of:
 
 1. **Config file parses** — `~/.pi/chaos-relay.json` is valid JSON.
 2. **Relay URL is valid http(s)** — an absolute `http://`/`https://` URL.
-3. **API key configured** — a session is registered.
-4. **ECDSA identity** — keypair present (signed requests) vs Bearer-only (legacy).
+3. **ECDSA identity (keypair)** — the durable identity; the API key is derived
+   from it.
+4. **Session API key** — auto-issued from the keypair (re-issued on next connect
+   if missing, so a missing key is *not* an error when a keypair exists). Only
+   legacy Bearer-only setups treat it as required.
 5. **Relay reachable** — a live `GET /health` against the configured URL.
 6. **WebSocket transport** — connected / reconnecting / stopped.
 7. **Channels registered** — at least one channel wired up.
