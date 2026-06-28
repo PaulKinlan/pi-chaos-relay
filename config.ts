@@ -241,6 +241,14 @@ export interface PersistedConfig {
    */
   messagesCursor?: string;
   /**
+   * Ids of messages already delivered to the agent (capped, most-recent last).
+   * The authoritative de-dup log: it survives restarts so the relay's on-connect
+   * replay (a 5-minute WebSocket lookback) and any catch-up poll never
+   * re-process a message we've already handled. The timestamp cursor only bounds
+   * the fetch window; this is what prevents re-delivery.
+   */
+  seenMessageIds?: string[];
+  /**
    * ECDSA P-256 keypair (JWK) bound to this session at registration. The
    * private key is SECRET — it is the client's identity and is never sent to
    * the relay or committed. Stored only in this 0600 file under ~/.pi.
@@ -332,6 +340,11 @@ export function setChannelRecords(channels: RegisteredChannelRecord[]): void {
 /** Persist the inbound-message resume cursor (ISO timestamp). */
 export function setMessagesCursor(cursor: string): void {
   savePersisted({ messagesCursor: cursor });
+}
+
+/** Persist the de-dup log of already-delivered message ids (capped list). */
+export function setSeenMessageIds(ids: string[]): void {
+  savePersisted({ seenMessageIds: ids });
 }
 
 /** Persist the tool-approval policy. */

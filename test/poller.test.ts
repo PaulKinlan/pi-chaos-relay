@@ -122,6 +122,30 @@ test("a poller created with a since cursor resumes from it", async () => {
   assert.equal(sawSince, "2026-06-01T00:00:00Z"); // resumed, not from scratch
 });
 
+test("persisted seen log: a restart does NOT re-process replayed messages", () => {
+  // Simulates the bug: after restart the relay replays its 5-minute lookback
+  // over the WebSocket. A poller restored with the persisted seen-id log must
+  // drop those already-delivered messages instead of re-injecting them.
+  const persisted = new MessagePoller({} as never, {
+    seen: ["a", "b"], // restored from ~/.pi/chaos-relay.json
+  });
+  const replayed = persisted.accept([msg("a"), msg("b"), msg("c")]);
+  assert.deepEqual(replayed.map((m) => m.id), ["c"]); // only the genuinely-new one
+});
+
+test("accept persists the seen-id log via onSeen when it grows", () => {
+  const writes: string[][] = [];
+  const poller = new MessagePoller({} as never, {
+    onSeen: (ids) => writes.push(ids),
+  });
+  poller.accept([msg("a"), msg("b")]);
+  poller.accept([msg("b")]); // already seen → no new write
+  poller.accept([msg("c")]);
+  assert.equal(writes.length, 2); // only the two batches that added ids
+  assert.deepEqual(writes[0], ["a", "b"]);
+  assert.deepEqual(writes[1], ["a", "b", "c"]);
+});
+
 test("formatMessagesForAgent handles empty and non-empty", () => {
   assert.match(formatMessagesForAgent([]), /No new messages/);
   const out = formatMessagesForAgent([msg("x", "hello world")]);

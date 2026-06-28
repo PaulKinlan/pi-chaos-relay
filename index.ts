@@ -39,6 +39,7 @@ import {
   setApprovalMode,
   setChannelRecords,
   setMessagesCursor,
+  setSeenMessageIds,
   getConfigPath,
   setActiveConfigPath,
   profilePathForName,
@@ -221,9 +222,14 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // Create a poller that resumes from the persisted cursor and writes the
   // cursor back as it advances, so a restart doesn't re-read the relay backlog.
   function makePoller(c: RelayClient): MessagePoller {
+    const persisted = loadPersisted();
     return new MessagePoller(c, {
-      since: loadPersisted().messagesCursor,
+      since: persisted.messagesCursor,
       onAdvance: (s) => setMessagesCursor(s),
+      // Restore + persist the de-dup log so restarts don't re-process the
+      // relay's on-connect message replay.
+      seen: persisted.seenMessageIds,
+      onSeen: (ids) => setSeenMessageIds(ids),
     });
   }
 

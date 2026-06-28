@@ -9,20 +9,35 @@
 
 import type { ChannelMessage, RelayClient } from "./relay-client.ts";
 
+const SEEN_MAX = 1000; // hard cap before trimming
+const SEEN_KEEP = 500; // how many to retain when trimming
+
 export class MessagePoller {
   private since: string | undefined;
-  private readonly seen = new Set<string>();
+  private seen: Set<string>;
   private readonly client: RelayClient;
   private readonly onAdvance?: (since: string) => void;
+  private readonly onSeen?: (ids: string[]) => void;
 
   constructor(
     client: RelayClient,
-    opts: { since?: string; onAdvance?: (since: string) => void } = {},
+    opts: {
+      since?: string;
+      onAdvance?: (since: string) => void;
+      /** Previously-seen message ids, persisted so dedup survives a restart. */
+      seen?: string[];
+      /** Persist the (capped) seen-id list whenever it grows. */
+      onSeen?: (ids: string[]) => void;
+    } = {},
   ) {
     this.client = client;
     // Resume from a persisted cursor so a restart doesn't re-read the backlog.
     this.since = opts.since;
     this.onAdvance = opts.onAdvance;
+    // Restore the persisted de-dup log so the relay's on-connect replay and any
+    // catch-up poll don't re-process messages already delivered before restart.
+    this.seen = new Set(opts.seen ?? []);
+    this.onSeen = opts.onSeen;
   }
 
   /** The current resume cursor (ISO timestamp), or undefined if none yet. */
@@ -30,9 +45,10 @@ export class MessagePoller {
     return this.since;
   }
 
-  /** Reset dedup state. Does NOT clear the resume cursor — that is persisted
-   * and intentionally survives across sessions so old messages aren't
-   * re-delivered. (The in-memory dedup set is per-process and safe to drop.) */
+  /** Reset the in-memory dedup set. Does NOT clear the persisted cursor or
+   * seen-id log — those survive across sessions so old messages aren't
+   * re-delivered. (A freshly constructed poller reloads `seen` from disk, so
+   * dropping the in-memory copy here is safe.) */
   reset(): void {
     this.seen.clear();
   }
@@ -83,12 +99,14 @@ export class MessagePoller {
       }
     }
     // Keep the dedup set from growing without bound.
-    if (this.seen.size > 1000) {
-      const keep = Array.from(this.seen).slice(-500);
-      this.seen.clear();
-      for (const id of keep) this.seen.add(id);
+    if (this.seen.size > SEEN_MAX) {
+      const keep = Array.from(this.seen).slice(-SEEN_KEEP);
+      this.seen = new Set(keep);
     }
     if (advanced && this.since) this.onAdvance?.(this.since);
+    // Persist the de-dup log when it changed, so a restart won't re-process
+    // anything the relay replays on the next WebSocket connect.
+    if (fresh.length > 0) this.onSeen?.(Array.from(this.seen));
     return fresh;
   }
 }

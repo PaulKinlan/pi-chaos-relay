@@ -248,8 +248,11 @@ Terminal/local turns are never gated.
 While a pi session is active, the extension holds a **WebSocket** to the relay
 and receives messages the instant they arrive. A slow background **safety poll**
 (every ~120s) runs only as a backstop in case a push is missed between
-reconnects. New messages are de-duplicated by id (so nothing is delivered twice)
-and injected into the agent as a user message that includes each message's `id`,
+reconnects. New messages are de-duplicated by id — and that de-dup log is
+**persisted** (`seenMessageIds` in the config file), so the relay's on-connect
+replay (a 5-minute lookback it sends every time the WebSocket connects) never
+re-processes a message already handled before a restart. Fresh messages are
+injected into the agent as a user message that includes each message's `id`,
 `channelType`, `channelId`, sender, and content — everything the agent needs to
 call `relay_reply`. You can also force an immediate pull with `relay_check_messages`
 or `/chaos-relay poll`.
