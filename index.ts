@@ -225,11 +225,27 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const persisted = loadPersisted();
     return new MessagePoller(c, {
       since: persisted.messagesCursor,
-      onAdvance: (s) => setMessagesCursor(s),
+      // Persisting the resume cursor is best-effort and runs on the WebSocket
+      // message-delivery path — never let a disk error here become an
+      // uncaughtException that kills pi. Losing a cursor update at worst
+      // re-reads a little backlog; the de-dup log filters the rest.
+      onAdvance: (s) => {
+        try {
+          setMessagesCursor(s);
+        } catch (err) {
+          log(`WARN: failed to persist resume cursor: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      },
       // Restore + persist the de-dup log so restarts don't re-process the
       // relay's on-connect message replay.
       seen: persisted.seenMessageIds,
-      onSeen: (ids) => setSeenMessageIds(ids),
+      onSeen: (ids) => {
+        try {
+          setSeenMessageIds(ids);
+        } catch (err) {
+          log(`WARN: failed to persist seen-message log: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      },
     });
   }
 

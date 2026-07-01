@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, unlinkSync, copyFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync, copyFileSync } from "node:fs";
+import { basename, dirname } from "node:path";
 import {
   DEFAULT_RELAY_URL,
   MIN_POLL_INTERVAL_MS,
@@ -11,6 +12,7 @@ import {
   chooseProfile,
   isConfigured,
   isValidRelayUrl,
+  loadPersisted,
   normalizeApprovalMode,
   resetPersisted,
   resolveConfig,
@@ -327,5 +329,43 @@ test("resetPersisted('all') removes the config file entirely", () => {
     assert.equal(existsSync(getConfigPath()), true);
     resetPersisted("all");
     assert.equal(existsSync(getConfigPath()), false);
+  });
+});
+
+test("loadPersisted tolerates an empty/truncated config file (no crash)", () => {
+  withConfigIsolated(() => {
+    // Reproduces the crash: a reader that caught a truncate-then-write mid-flight
+    // (or a legacy interrupted write) sees an empty file. This used to throw
+    // "Unexpected end of JSON input" on the WebSocket message path and kill pi.
+    writeFileSync(getConfigPath(), "");
+    assert.deepEqual(loadPersisted(), {});
+    writeFileSync(getConfigPath(), "   \n  ");
+    assert.deepEqual(loadPersisted(), {});
+  });
+});
+
+test("savePersisted onto a truncated file still lands the update", () => {
+  withConfigIsolated(() => {
+    writeFileSync(getConfigPath(), "");
+    savePersisted({ relayUrl: "https://x.example.com", apiKey: "k" });
+    const after = JSON.parse(readFileSync(getConfigPath(), "utf-8"));
+    assert.equal(after.relayUrl, "https://x.example.com");
+    assert.equal(after.apiKey, "k");
+  });
+});
+
+test("savePersisted writes atomically and leaves no temp files behind", () => {
+  withConfigIsolated(() => {
+    savePersisted({ relayUrl: "https://x.example.com", apiKey: "k" });
+    // The atomic write goes through a `<config>.tmp.*` file then renames it
+    // over the target; none of those temp files must linger.
+    const dir = dirname(getConfigPath());
+    const name = basename(getConfigPath());
+    const leftovers = readdirSync(dir).filter((f) => f.startsWith(`${name}.tmp.`));
+    assert.deepEqual(leftovers, []);
+    // A genuinely corrupt (non-empty, unparseable) file still surfaces loudly —
+    // we only recover from the unambiguous empty case.
+    writeFileSync(getConfigPath(), "{ not json");
+    assert.throws(() => loadPersisted(), /Failed to parse/);
   });
 });

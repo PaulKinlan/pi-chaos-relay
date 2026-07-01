@@ -7,7 +7,7 @@
  * with 0600 permissions.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, chmodSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, chmodSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -300,13 +300,26 @@ export interface ResolvedConfig {
 
 export function loadPersisted(): PersistedConfig {
   if (!existsSync(activeConfigPath)) return {};
+  const raw = readFileSync(activeConfigPath, "utf-8");
+  // An empty / whitespace-only file is a truncation artifact — e.g. a legacy
+  // non-atomic write that was interrupted, or a reader that caught a
+  // truncate-then-write mid-flight. There are no credentials to lose, so
+  // recover silently instead of throwing. Throwing here was fatal: this runs on
+  // the WebSocket message path (setMessagesCursor → savePersisted →
+  // loadPersisted), so an "Unexpected end of JSON input" became an
+  // uncaughtException that crashed pi.
+  if (raw.trim() === "") return {};
   try {
-    return JSON.parse(readFileSync(activeConfigPath, "utf-8")) as PersistedConfig;
+    return JSON.parse(raw) as PersistedConfig;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`Failed to parse ${activeConfigPath}: ${message}`);
   }
 }
+
+// Monotonic suffix so overlapping writes from one process never collide on the
+// temp path (pid disambiguates across processes sharing a profile file).
+let tmpCounter = 0;
 
 export function savePersisted(updates: Partial<PersistedConfig>): PersistedConfig {
   const current = existsSync(activeConfigPath) ? loadPersisted() : {};
@@ -315,12 +328,33 @@ export function savePersisted(updates: Partial<PersistedConfig>): PersistedConfi
   // CHAOS_RELAY_CONFIG points elsewhere).
   const dir = dirname(activeConfigPath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(activeConfigPath, JSON.stringify(merged, null, 2) + "\n");
-  // Best effort: tighten permissions since this file holds the API key.
+  // Atomic write: serialize to a unique temp file in the same directory, then
+  // rename(2) over the target. The rename is atomic on POSIX, so a concurrent
+  // reader (a cursor advance, or another pi session sharing this profile)
+  // always sees either the complete old file or the complete new one — never a
+  // half-written/truncated file. The previous plain writeFileSync truncated the
+  // target first, which is exactly what let loadPersisted read an empty file
+  // mid-write and crash pi.
+  const tmp = `${activeConfigPath}.tmp.${process.pid}.${tmpCounter++}`;
+  writeFileSync(tmp, JSON.stringify(merged, null, 2) + "\n");
+  // Best effort: tighten permissions since this file holds the API key. Do it
+  // on the temp file so the tightened mode is what lands at the target.
   try {
-    chmodSync(activeConfigPath, 0o600);
+    chmodSync(tmp, 0o600);
   } catch {
     /* non-POSIX filesystems may not support chmod */
+  }
+  try {
+    renameSync(tmp, activeConfigPath);
+  } catch (err) {
+    // Clean up the temp file so a failed rename doesn't leak turds next to the
+    // config; re-throw so the caller still learns the write failed.
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* already gone */
+    }
+    throw err;
   }
   return merged;
 }
