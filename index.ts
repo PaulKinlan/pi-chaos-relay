@@ -1111,12 +1111,18 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // --- /chaos-relay command --------------------------------------------------
 
   pi.registerCommand("chaos-relay", {
-    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup [--advanced], connect, profile, add, status, poll, stop, approvals, reset, doctor)",
+    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup [--advanced], connect, profile, add, status, poll, stop, approvals, reset, doctor, help)",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parts = args.trim().split(/\s+/);
       const sub = parts[0] || "status";
       try {
         switch (sub) {
+          case "help":
+          case "--help":
+          case "-h":
+          case "?":
+            ctx.ui.notify(renderHelp(), "info");
+            break;
           case "setup":
             await runSetup(ctx, {
               advanced: parts.slice(1).some((p) =>
@@ -1208,7 +1214,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           }
           default:
             ctx.ui.notify(
-              `Unknown subcommand "${sub}". Use: setup | connect | profile | add | status | poll | stop | approvals | reset | doctor`,
+              `Unknown subcommand "${sub}". Run /chaos-relay help for the full list.\n\n` +
+                renderHelp(),
               "warning",
             );
         }
@@ -1218,6 +1225,32 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       }
     },
   });
+
+  /**
+   * Human-readable command reference for `/chaos-relay help` (and the fallback
+   * shown on an unknown subcommand). Kept in lockstep with the switch above and
+   * the README Commands table.
+   */
+  function renderHelp(): string {
+    const rows: Array<[string, string]> = [
+      ["setup [--advanced]", "Zero-config connect + start polling, then offer to link a channel. --advanced prompts for a custom relay URL / agent id / pasted key"],
+      ["connect <token|email|webhook [name]>", "One-shot: paste a Telegram/Discord bot token, an email, or 'webhook' and it sets up the relay + registers the channel in one step"],
+      ["profile [name]", "No arg lists connection profiles (each a separate identity); with a name, switches to / creates one"],
+      ["add", "Guided wizard to add a channel (Telegram / Discord / email / webhook)"],
+      ["status", "Show config, poller state, and live relay health (default when run with no subcommand)"],
+      ["poll", "Poll once now and deliver any new messages"],
+      ["stop", "Stop the background poller"],
+      ["approvals [off|writes|all]", "Show or set the tool-approval policy — off=autonomous, writes=ask before shell/edit/write, all=ask before every tool"],
+      ["doctor", "Diagnostics: config validity, credentials, relay reachability, transport, channels"],
+      ["reset [all]", "Clear a corrupted relayUrl (keeps creds/channels); 'reset all' wipes the config file"],
+      ["help", "Show this command reference"],
+    ];
+    const width = Math.max(...rows.map(([cmd]) => cmd.length));
+    const lines = rows.map(([cmd, desc]) => `  ${cmd.padEnd(width)}  ${desc}`);
+    return "CHAOS relay — /chaos-relay <subcommand>\n\n" + lines.join("\n") +
+      "\n\nTools (LLM-callable): relay_connect, relay_check_messages, relay_list_profiles, relay_switch_profile.\n" +
+      "Run two connections at once by launching each pi with CHAOS_RELAY_PROFILE=<name>.";
+  }
 
   /** A few playful, kebab-case names to suggest when naming a connection. */
   function suggestSessionNames(count = 3): string[] {

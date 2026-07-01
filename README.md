@@ -189,6 +189,7 @@ but unparseable), `/chaos-relay reset` (or `reset all`) clears it.
 | `/chaos-relay approvals <off\|writes\|all>` | Set/show the tool-approval policy |
 | `/chaos-relay doctor` | Diagnostics: config validity, credentials, relay reachability, transport, channels |
 | `/chaos-relay reset [all]` | Clear a corrupted `relayUrl` (keeps creds/channels); `reset all` wipes the config file |
+| `/chaos-relay help` | Show the full command reference (also shown on an unknown subcommand) |
 
 ## Tools (LLM-callable)
 
