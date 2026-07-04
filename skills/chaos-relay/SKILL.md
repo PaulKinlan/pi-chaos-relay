@@ -14,7 +14,7 @@ those threads. It is how pi gets a two-way inbox outside the terminal.
 External channels deliver messages to the relay. The extension maintains a
 WebSocket connection (with a safety poll backstop) and surfaces new messages
 automatically while a pi session is active. The agent answers with the
-`relay_reply` tool. You can also pull on demand with `relay_check_messages`.
+`relay_reply` tool (add `files: [absolute paths]` to attach images or files — Telegram shows images inline, email gets real attachments; max 3 files, 5MB each). You can also pull on demand with `relay_check_messages`.
 
 Credentials live in `~/.pi/chaos-relay.json` (0600). Identity is an ECDSA P-256
 keypair generated at first setup — the relay binds the session to it, and every

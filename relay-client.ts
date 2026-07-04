@@ -345,18 +345,20 @@ export class RelayClient {
     return this.request<GetMessagesResult>("GET", `/messages${query}`);
   }
 
-  /** Send a reply back to a channel message. */
+  /** Send a reply back to a channel message, optionally with attachments. */
   async reply(params: {
     channelType: ChannelMessage["channelType"];
     channelId: string;
     content: string;
     replyTo?: string;
+    attachments?: ReplyAttachment[];
   }): Promise<ReplyResult> {
     return this.request<ReplyResult>("POST", "/reply", {
       channelType: params.channelType,
       channelId: params.channelId,
       content: params.content,
       ...(params.replyTo ? { replyTo: params.replyTo } : {}),
+      ...(params.attachments?.length ? { attachments: params.attachments } : {}),
     });
   }
 
@@ -464,4 +466,48 @@ function describeError(body: unknown, status: number): string {
   }
   if (typeof body === "string" && body) return body;
   return `HTTP ${status}`;
+}
+
+/**
+ * An outbound attachment on a reply. The relay forwards it straight to the
+ * channel (Telegram sendPhoto/sendDocument, email attachment) and never stores
+ * it. Limits enforced server-side: max 3 per reply, 5MB decoded each.
+ */
+export interface ReplyAttachment {
+  filename: string;
+  mimeType: string;
+  /** Base64-encoded file bytes. */
+  dataBase64: string;
+}
+
+/** Base64 of raw bytes without Node Buffer (chunked to respect arg limits). */
+export function base64FromBytes(bytes: Uint8Array): string {
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
+/** Best-effort MIME type from a filename extension (default octet-stream). */
+export function mimeForFile(filename: string): string {
+  const ext = filename.toLowerCase().split(".").pop() ?? "";
+  const map: Record<string, string> = {
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    svg: "image/svg+xml",
+    pdf: "application/pdf",
+    txt: "text/plain",
+    md: "text/markdown",
+    csv: "text/csv",
+    json: "application/json",
+    html: "text/html",
+    mp4: "video/mp4",
+    zip: "application/zip",
+  };
+  return map[ext] ?? "application/octet-stream";
 }

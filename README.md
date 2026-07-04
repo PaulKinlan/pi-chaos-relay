@@ -199,7 +199,7 @@ but unparseable), `/chaos-relay reset` (or `reset all`) clears it.
 | `relay_list_profiles` | List connection profiles and the active one |
 | `relay_switch_profile` | Switch to (or create) a connection profile — "switch to my work connection" |
 | `relay_check_messages` | Pull pending inbound Telegram/email messages |
-| `relay_reply` | Reply to a channel message (`channelType`, `channelId`, `content`, optional `replyTo`) |
+| `relay_reply` | Reply to a channel message (`channelType`, `channelId`, `content`, optional `replyTo`, optional `files` — absolute paths to attach; images render inline on Telegram, email gets real attachments; max 3 files, 5MB each, passed through and never stored) |
 | `relay_register_telegram` | Register a Telegram bot channel |
 | `relay_register_discord` | Register a Discord bot channel |
 | `relay_register_email` | Register an email channel |

@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   RelayClient,
   RelayError,
+  base64FromBytes,
+  mimeForFile,
   normalizeRelayUrl,
   registerSession,
   registerSessionWithKey,
@@ -273,4 +275,36 @@ test("error responses throw RelayError with the server message", async () => {
       return true;
     },
   );
+});
+
+test("reply passes attachments through and omits them when absent", async () => {
+  const { fn, calls } = mockFetch(() => ({
+    body: { ok: true, channelType: "telegram", channelId: "ch1" },
+  }));
+  const client = new RelayClient({ relayUrl: "http://relay", apiKey: "k", fetchImpl: fn });
+  await client.reply({
+    channelType: "telegram",
+    channelId: "ch1",
+    content: "here you go",
+    attachments: [{ filename: "chart.png", mimeType: "image/png", dataBase64: "aGk=" }],
+  });
+  const withAtt = JSON.parse(calls[0].init?.body as string);
+  assert.equal(withAtt.attachments.length, 1);
+  assert.equal(withAtt.attachments[0].filename, "chart.png");
+  assert.equal(withAtt.attachments[0].mimeType, "image/png");
+
+  await client.reply({ channelType: "telegram", channelId: "ch1", content: "plain" });
+  const without = JSON.parse(calls[1].init?.body as string);
+  assert.ok(!("attachments" in without));
+});
+
+test("mimeForFile maps common extensions and defaults safely", () => {
+  assert.equal(mimeForFile("/tmp/shot.PNG"), "image/png");
+  assert.equal(mimeForFile("report.pdf"), "application/pdf");
+  assert.equal(mimeForFile("weird.xyz"), "application/octet-stream");
+});
+
+test("base64FromBytes round-trips via atob", () => {
+  const bytes = new TextEncoder().encode("chaos relay");
+  assert.equal(atob(base64FromBytes(bytes)), "chaos relay");
 });

@@ -23,7 +23,12 @@ import {
   registerSession,
   registerSessionWithKey,
   type ChannelMessage,
+  base64FromBytes,
+  mimeForFile,
+  type ReplyAttachment,
 } from "./relay-client.ts";
+import { readFileSync } from "node:fs";
+import { basename } from "node:path";
 import {
   addChannelRecord,
   DEFAULT_RELAY_URL,
@@ -649,6 +654,13 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     replyTo: Type.Optional(
       Type.String({ description: "Optional id of the message being replied to." }),
     ),
+    files: Type.Optional(
+      Type.Array(Type.String(), {
+        description:
+          "Optional absolute file paths to attach (images render inline on Telegram; " +
+          "email gets real attachments). Max 3 files, 5MB each.",
+      }),
+    ),
   });
   pi.registerTool({
     name: "relay_reply",
@@ -656,8 +668,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     description:
       "Send a reply through the chaos-relay server to a Telegram/email (or other) " +
       "channel. Pass the channelType and channelId from the inbound message, and " +
-      "optionally replyTo (the inbound message id).",
-    promptSnippet: "relay_reply: send a reply to a Telegram/email channel via chaos-relay",
+      "optionally replyTo (the inbound message id). Attach images/files with " +
+      "files: [absolute paths] — Telegram shows images inline, email gets real " +
+      "attachments (max 3 files, 5MB each).",
+    promptSnippet:
+      "relay_reply: send a reply (optionally with image/file attachments) to a Telegram/email channel via chaos-relay",
     parameters: replyParams,
     async execute(_id: string, params: Static<typeof replyParams>, _signal, _onUpdate, _ctx: ExtensionContext) {
       const c = ensureClient();
@@ -666,10 +681,42 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           "chaos-relay is not configured. Run `/chaos-relay setup` (or set CHAOS_RELAY_API_KEY).",
         );
       }
+      // Read any attachments up front so path errors surface as a friendly
+      // tool result instead of a mid-send failure. Pass-through: the relay
+      // forwards bytes to the channel and never stores them.
+      let attachments: ReplyAttachment[] | undefined;
+      if (params.files?.length) {
+        if (params.files.length > 3) {
+          return textResult("relay_reply: too many attachments (max 3 files).");
+        }
+        attachments = [];
+        for (const p of params.files) {
+          let bytes: Uint8Array;
+          try {
+            bytes = new Uint8Array(readFileSync(p));
+          } catch (err) {
+            return textResult(
+              `relay_reply: cannot read attachment ${p}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          if (bytes.length > 5 * 1024 * 1024) {
+            return textResult(
+              `relay_reply: attachment ${p} is ${(bytes.length / (1024 * 1024)).toFixed(1)}MB (max 5MB).`,
+            );
+          }
+          attachments.push({
+            filename: basename(p),
+            mimeType: mimeForFile(p),
+            dataBase64: base64FromBytes(bytes),
+          });
+        }
+      }
+
       const transport = ws?.connected ? "WebSocket" : "HTTP";
       log(
         `relay_reply: sending to ${params.channelType}/${params.channelId} ` +
-          `replyTo=${params.replyTo ?? "none"} via ${transport} (${params.content.length} chars)`,
+          `replyTo=${params.replyTo ?? "none"} via ${transport} (${params.content.length} chars` +
+          `${attachments?.length ? `, ${attachments.length} attachment(s)` : ""})`,
       );
       // Prefer the WebSocket (same socket the message arrived on) for instant
       // delivery; fall back to a signed HTTP POST /reply if it isn't connected
@@ -681,6 +728,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
             channelId: params.channelId,
             content: params.content,
             replyTo: params.replyTo,
+            attachments,
           });
           log(
             `relay_reply: WS ack ok=${res.ok} responseId=${res.responseId ?? "?"}. ` +
@@ -702,6 +750,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           channelId: params.channelId,
           content: params.content,
           replyTo: params.replyTo,
+          attachments,
         });
         log(`relay_reply: HTTP ack ok=${(res as { ok?: boolean }).ok ?? "?"}`);
         // The relay returns {ok, channelType, channelId} for telegram and

@@ -253,6 +253,11 @@ export class RelayWebSocket {
       channelId: string;
       content: string;
       replyTo?: string;
+      attachments?: {
+        filename: string;
+        mimeType: string;
+        dataBase64: string;
+      }[];
       metadata?: Record<string, unknown>;
     },
     ackTimeoutMs = 10_000,
