@@ -27,8 +27,9 @@ import {
   mimeForFile,
   type ReplyAttachment,
 } from "./relay-client.ts";
-import { readFileSync } from "node:fs";
-import { basename } from "node:path";
+import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { basename, join } from "node:path";
+import { homedir } from "node:os";
 import {
   addChannelRecord,
   DEFAULT_RELAY_URL,
@@ -69,9 +70,21 @@ import { parseConnectInput } from "./connect.ts";
 const SAFETY_POLL_MS = 120_000;
 
 const LOG_PREFIX = "[pi-chaos-relay]";
+const RELAY_LOG_DIR = join(homedir(), ".pi", "agent", "logs");
+const RELAY_LOG_FILE = join(RELAY_LOG_DIR, "chaos-relay.log");
 
+/** Relay logs are routed to a file ONLY. They must NOT go to stderr, because pi
+ *  renders extension stderr into the TUI prompt/input area, which is noisy
+ *  (e.g. the "WebSocket connected" banner on every (re)connect). Tail
+ *  ~/.pi/agent/logs/chaos-relay.log to see them. */
 function log(message: string, ...rest: unknown[]): void {
-  console.error(`${LOG_PREFIX} ${message}`, ...rest);
+  const line = `${LOG_PREFIX} ${message}${rest.length ? " " + rest.map((r) => String(r)).join(" ") : ""}`;
+  try {
+    mkdirSync(RELAY_LOG_DIR, { recursive: true });
+    appendFileSync(RELAY_LOG_FILE, `[${new Date().toISOString()}] ${line}\n`);
+  } catch {
+    /* never throw from logging */
+  }
 }
 
 /** Wrap text content into the AgentToolResult shape pi expects. */

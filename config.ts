@@ -434,16 +434,9 @@ export function resolveConfig(persisted = loadPersisted()): ResolvedConfig {
   const candidateUrl = process.env.CHAOS_RELAY_URL ?? persisted.relayUrl ?? DEFAULT_RELAY_URL;
   let relayUrl = candidateUrl;
   if (!isValidRelayUrl(candidateUrl)) {
-    // Helpful stderr warning — visible in logs without blocking startup.
-    const where = process.env.CHAOS_RELAY_URL === candidateUrl
-      ? "CHAOS_RELAY_URL env var"
-      : persisted.relayUrl === candidateUrl
-        ? "relayUrl in ~/.pi/chaos-relay.json"
-        : "default";
-    console.warn(
-      `pi-chaos-relay: ignoring invalid relay URL "${candidateUrl}" (from ${where}); ` +
-        `falling back to ${DEFAULT_RELAY_URL}. Run /chaos-relay setup to fix.`,
-    );
+    // Invalid relay URL: fall back to the default silently. (We previously
+    // warned to stderr here, but that renders in the pi TUI input area; the
+    // fallback behaviour is enough — run /chaos-relay setup to fix.)
     relayUrl = DEFAULT_RELAY_URL;
   }
   const apiKey = process.env.CHAOS_RELAY_API_KEY ?? persisted.apiKey;
