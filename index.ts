@@ -27,9 +27,9 @@ import {
   mimeForFile,
   type ReplyAttachment,
 } from "./relay-client.ts";
-import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { readFileSync, appendFileSync, mkdirSync, existsSync, writeFileSync, unlinkSync } from "node:fs";
 import { basename, join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import {
   addChannelRecord,
   DEFAULT_RELAY_URL,
@@ -85,6 +85,47 @@ function log(message: string, ...rest: unknown[]): void {
   } catch {
     /* never throw from logging */
   }
+}
+
+// ── Profile lock: detect concurrent pi instances on the same relay profile ──
+
+function lockFilePath(profile: string): string {
+  return join(homedir(), ".pi", `chaos-relay-${profile}.lock`);
+}
+
+function isProcessAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+/** Check if another live pi process holds the lock for this profile. */
+function checkProfileLock(profile: string): { locked: boolean; pid: number | null } {
+  const path = lockFilePath(profile);
+  if (!existsSync(path)) return { locked: false, pid: null };
+  try {
+    const pid = parseInt(readFileSync(path, "utf-8").trim(), 10);
+    if (isNaN(pid)) return { locked: false, pid: null };
+    if (pid !== process.pid && isProcessAlive(pid)) return { locked: true, pid };
+    // Stale lock (process died) — clean it
+    try { unlinkSync(path); } catch { /* ignore */ }
+    return { locked: false, pid: null };
+  } catch { return { locked: false, pid: null }; }
+}
+
+/** Claim this profile for the current process. */
+function writeProfileLock(profile: string): void {
+  try { writeFileSync(lockFilePath(profile), String(process.pid)); } catch { /* ignore */ }
+}
+
+/** Release the profile lock on shutdown. */
+function removeProfileLock(profile: string): void {
+  try { unlinkSync(lockFilePath(profile)); } catch { /* ignore */ }
+}
+
+/** Generate a unique profile name for a concurrent session. */
+function generateUniqueProfileName(): string {
+  const host = hostname().split(".")[0].toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 12) || "pi";
+  const shortPid = (process.pid % 10000).toString(36);
+  return `${host}-${shortPid}`;
 }
 
 /** Wrap text content into the AgentToolResult shape pi expects. */
@@ -573,21 +614,45 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (event, ctx) => {
     if (poller) poller.reset();
-    // Bind this connection to the pi session: pick the profile by env → the
-    // session's recorded profile → inherit (new/fork) → default, then connect.
     currentSessionId = ctx.sessionManager.getSessionId();
-    const profile = chooseProfileForSession(event.reason, currentSessionId);
+    let profile = chooseProfileForSession(event.reason, currentSessionId);
+
+    // Detect concurrent pi instances on the same relay profile. If another
+    // live process holds the lock, auto-create a new profile so both sessions
+    // get independent push delivery (otherwise the WebSocket conflict means
+    // only one session receives real-time messages).
+    const lock = checkProfileLock(profile);
+    let autoCreated = false;
+    if (lock.locked) {
+      const newProfile = generateUniqueProfileName();
+      log(`another pi instance (PID ${lock.pid}) holds relay profile "${profile}"; auto-creating "${newProfile}"`);
+      profile = newProfile;
+      autoCreated = true;
+    }
+
     const result = await connectAsProfile(profile);
     if (!result.connected) {
       log(`session ${event.reason}: selected profile "${profile}" but couldn't connect (will retry on next poll)`);
     } else {
-      log(`session ${event.reason}: connected as profile "${profile}"`);
+      writeProfileLock(profile);
+      if (autoCreated) {
+        log(`session ${event.reason}: connected as auto-created profile "${profile}" (another instance held the original)`);
+        try {
+          pi.sendUserMessage(
+            `Another pi session was already using relay profile. ` +
+            `Auto-created a new profile "${profile}" for this session so both receive messages independently.`,
+          );
+        } catch { /* agent may not be ready at startup — log is enough */ }
+      } else {
+        log(`session ${event.reason}: connected as profile "${profile}"`);
+      }
     }
   });
 
   pi.on("session_shutdown", () => {
     stopPolling();
     stopTyping();
+    removeProfileLock(currentProfile);
   });
 
   // Show a "typing" indicator in the active channel while the agent works on a
