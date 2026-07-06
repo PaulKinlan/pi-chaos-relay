@@ -1248,7 +1248,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // --- /chaos-relay command --------------------------------------------------
 
   pi.registerCommand("chaos-relay", {
-    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup [--advanced], connect, profile, add, status, poll, stop, approvals, reset, doctor, help)",
+    description: "Set up and inspect the CHAOS relay bridge (subcommands: setup [--advanced], connect, profile, add, configure, status, poll, stop, approvals, reset, doctor, help)",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parts = args.trim().split(/\s+/);
       const sub = parts[0] || "status";
@@ -1301,6 +1301,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           case "add":
           case "channel":
             await runAddChannel(ctx);
+            break;
+          case "configure":
+          case "config":
+            await runConfigure(ctx);
             break;
           case "status":
             await runStatus(ctx);
@@ -1374,6 +1378,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       ["connect <token|email|webhook [name]>", "One-shot: paste a Telegram/Discord bot token, an email, or 'webhook' and it sets up the relay + registers the channel in one step"],
       ["profile [name]", "No arg lists connection profiles (each a separate identity); with a name, switches to / creates one"],
       ["add", "Guided wizard to add a channel (Telegram / Discord / email / webhook)"],
+      ["configure", "Get a one-time browser link to view and manage all channels on this key (no login)"],
       ["status", "Show config, poller state, and live relay health (default when run with no subcommand)"],
       ["poll", "Poll once now and deliver any new messages"],
       ["stop", "Stop the background poller"],
@@ -1714,6 +1719,38 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
    * safe to run in any state. Designed to be the first thing to run when
    * something is wrong — including the "Failed to parse URL" failure mode.
    */
+  /**
+   * `/chaos-relay configure` — mint a one-time link to the browser admin app so
+   * the user can see and manage all the channels on this key (multiple bots,
+   * emails, webhooks). No login: the link carries a short-lived token tied to
+   * this ECDSA identity.
+   */
+  async function runConfigure(ctx: ExtensionCommandContext): Promise<void> {
+    const c = ensureClient();
+    if (!c) {
+      ctx.ui.notify(
+        "chaos-relay is not configured. Run `/chaos-relay setup` first.",
+        "warning",
+      );
+      return;
+    }
+    try {
+      const link = await c.deviceLink();
+      const mins = Math.max(1, Math.round(link.expiresInSeconds / 60));
+      ctx.ui.notify(
+        `Open this link to manage your channels in the browser (valid ~${mins} min, one-time):\n\n${link.url}\n\n` +
+          "No login needed — the link is tied to this key. You can add/remove multiple bots, emails, and webhooks there.",
+        "info",
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      ctx.ui.notify(
+        `Couldn't create a configure link: ${message}. Check the relay connection with /chaos-relay status.`,
+        "warning",
+      );
+    }
+  }
+
   async function runDoctor(ctx: ExtensionCommandContext): Promise<void> {
     const checks: Array<{ ok: boolean; label: string; detail?: string; fix?: string }> = [];
     const mark = (ok: boolean) => (ok ? "✓" : "✗");

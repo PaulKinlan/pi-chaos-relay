@@ -363,6 +363,17 @@ export class RelayClient {
   }
 
   /**
+   * Ask the relay for a one-time device link to the browser admin app, where the
+   * user can see and manage all the channels on this key. Signed request, so only
+   * the holder of this ECDSA key can mint it.
+   */
+  async deviceLink(): Promise<
+    { token: string; url: string; expiresInSeconds: number }
+  > {
+    return this.request("POST", "/app/device-link", {});
+  }
+
+  /**
    * Send a transient activity indicator (e.g. Telegram "typing") to a channel.
    * Best-effort — never throws; typing is non-critical and the relay treats
    * channels without an indicator (email/webhook) as a no-op.
