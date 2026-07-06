@@ -69,6 +69,16 @@ import { parseConnectInput } from "./connect.ts";
  */
 const SAFETY_POLL_MS = 120_000;
 
+const PACKAGE_VERSION = (() => {
+  try {
+    const raw = readFileSync(new URL("./package.json", import.meta.url), "utf-8");
+    const pkg = JSON.parse(raw) as { version?: unknown };
+    return typeof pkg.version === "string" ? pkg.version : "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
+
 const LOG_PREFIX = "[pi-chaos-relay]";
 const RELAY_LOG_DIR = join(homedir(), ".pi", "agent", "logs");
 const RELAY_LOG_FILE = join(RELAY_LOG_DIR, "chaos-relay.log");
@@ -1547,9 +1557,72 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     }
   }
 
+  function asRecord(value: unknown): Record<string, unknown> | undefined {
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : undefined;
+  }
+
+  function asString(value: unknown): string | undefined {
+    return typeof value === "string" && value.trim() ? value : undefined;
+  }
+
+  function asStringArray(value: unknown): string[] {
+    return Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      : [];
+  }
+
+  function renderCallableChannel(channel: unknown): string {
+    const ch = asRecord(channel) ?? {};
+    const metadata = asRecord(ch.metadata) ?? {};
+    const type = asString(ch.type) ?? asString(ch.channelType) ?? "channel";
+    const id = asString(ch.id) ?? asString(ch.channelId) ?? "(unknown id)";
+    const label = asString(ch.label) ?? asString(ch.name) ?? asString(ch.channelName);
+    const enabled = ch.enabled === false ? " [disabled]" : "";
+    const prefix = `  - ${type} ${id}${label ? ` (${label})` : ""}${enabled} — `;
+
+    if (type === "email") {
+      const inboundAddress = asString(metadata.inboundAddress) ?? asString(ch.inboundAddress);
+      const userEmail = asString(metadata.userEmail) ?? asString(ch.userEmail);
+      const allowedSenders = asStringArray(metadata.allowedSenders);
+      const sender = userEmail ?? allowedSenders[0];
+      const verified = metadata.verified === false ? " (not verified yet)" : "";
+      if (inboundAddress) {
+        return `${prefix}send email${sender ? ` from ${sender}` : ""} to ${inboundAddress}${verified}`;
+      }
+      return `${prefix}email channel${sender ? ` for ${sender}` : ""}; relay did not return an inbound address${verified}`;
+    }
+
+    if (type === "telegram") {
+      const botUsername = asString(metadata.botUsername) ?? asString(ch.botUsername);
+      const allowedUsers = asStringArray(metadata.allowedUsers);
+      return `${prefix}${botUsername ? `message @${botUsername}` : "message the registered Telegram bot"}${
+        allowedUsers.length ? ` (allowed users: ${allowedUsers.join(", ")})` : ""
+      }`;
+    }
+
+    if (type === "discord") {
+      const botUsername = asString(metadata.botUsername) ?? asString(ch.botUsername);
+      return `${prefix}${botUsername ? `message the Discord bot ${botUsername}` : "message the configured Discord bot/channel"}`;
+    }
+
+    if (type === "webhook") {
+      const webhookUrl = asString(metadata.webhookUrl) ?? asString(ch.webhookUrl);
+      return `${prefix}${
+        webhookUrl
+          ? `POST to ${webhookUrl}`
+          : "POST to the webhook URL returned when the channel was registered (the relay did not return it in status)"
+      }`;
+    }
+
+    return `${prefix}send a message through this ${type} channel`;
+  }
+
   async function runStatus(ctx: ExtensionCommandContext): Promise<void> {
     const current = resolveConfig();
     const lines = [
+      `extension:     pi-chaos-relay v${PACKAGE_VERSION}`,
       `config file:   ${getConfigPath()}`,
       `relayUrl:      ${current.relayUrl}`,
       `connection:    ${current.agentId} (this session's name)`,
@@ -1562,12 +1635,13 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       `userId:        ${current.userId ?? "(unknown)"}`,
       `transport:     WebSocket (${ws?.connected ? "connected" : ws ? "connecting/reconnecting" : "stopped"}) + ${SAFETY_POLL_MS}ms safety poll`,
       `approvals:     ${current.approvalMode} (off=autonomous, writes=shell/edit/write, all=every tool)`,
-      `channels:      ${current.channels.length}`,
+      `local channels:${current.channels.length ? ` ${current.channels.length} cached record(s)` : " none"}`,
     ];
     for (const ch of current.channels) {
-      lines.push(`  - ${ch.type} ${ch.channelId}${ch.label ? ` (${ch.label})` : ""}`);
+      const label = ch.label ?? ch.channelName ?? ch.userEmail;
+      lines.push(`  - local ${ch.type} ${ch.channelId}${label ? ` (${label})` : ""}`);
     }
-    // Live reachability + channel list from the relay, if configured.
+    // Live reachability + callable channel details from the relay, if configured.
     if (current.apiKey) {
       try {
         const c = new RelayClient({
@@ -1577,6 +1651,22 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         });
         const h = await c.health();
         lines.push(`relay health:  ${h.status}${h.version ? ` (v${h.version})` : ""}`);
+        try {
+          const live = await c.listChannels();
+          const liveChannels = Array.isArray(live.channels) ? live.channels : [];
+          lines.push(`relay channels:${liveChannels.length ? ` ${liveChannels.length} live` : " none live"}`);
+          if (liveChannels.length) {
+            for (const ch of liveChannels) lines.push(renderCallableChannel(ch));
+          } else if (current.channels.length) {
+            lines.push(
+              "  - warning: this profile has cached local channel records, but the relay returned no live channels. " +
+                "They may be stale; re-register with /chaos-relay add or /chaos-relay connect <email|token|webhook>.",
+            );
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          lines.push(`relay channels: unavailable — ${message}`);
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         lines.push(`relay health:  unreachable — ${message}`);
