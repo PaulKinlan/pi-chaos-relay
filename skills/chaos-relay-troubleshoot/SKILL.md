@@ -83,6 +83,16 @@ conflict).
 - Email: the verification link goes to the user's inbox; if it expired,
   re-register with `relay_register_email`.
 
+### Attachment is listed but unavailable
+- The relay requires an ECDSA-signed client for inbound file retrieval; a
+  legacy bearer-only profile can still receive text but cannot fetch files.
+  Run `/chaos-relay doctor`, then reconnect/re-provision the profile if signing
+  is absent.
+- Telegram/Resend provider files and signed URLs can expire. Ask the sender to
+  resend the file rather than weakening the signed endpoint.
+- Files over 5MB or beyond the first 3 attachments are rejected intentionally.
+- Local files are private temporary copies and are cleaned after 24 hours.
+
 ### "unknown" from `connect`
 `/chaos-relay connect` couldn't detect the channel type. Have the user prefix
 it explicitly: `telegram <token>`, `discord <token>`, `email <addr>`,

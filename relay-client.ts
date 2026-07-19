@@ -38,6 +38,34 @@ function isTimeoutError(err: unknown): boolean {
  * settles, so it never lingers (which would trip Deno's test timer sanitizer
  * and needlessly keep the event loop alive).
  */
+async function readBoundedBytes(response: Response, maxBytes: number): Promise<Uint8Array> {
+  if (!response.body) return new Uint8Array();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel("attachment too large");
+        throw new RelayError("Attachment exceeds 5MB limit", 413);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
 function timeoutSignal(ms: number): { signal: AbortSignal; clear: () => void } {
   const controller = new AbortController();
   const timer = setTimeout(
@@ -65,6 +93,20 @@ export interface RelayClientOptions {
   timeoutMs?: number;
 }
 
+export interface InboundAttachment {
+  id: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+  kind: "image" | "file";
+}
+
+export interface DownloadedAttachment {
+  bytes: Uint8Array;
+  filename: string;
+  mimeType: string;
+}
+
 export interface ChannelMessage {
   id: string;
   channelType: "webhook" | "telegram" | "discord" | "email" | "slack";
@@ -72,6 +114,7 @@ export interface ChannelMessage {
   from: string;
   content: string;
   timestamp: string;
+  attachments?: InboundAttachment[];
   metadata?: Record<string, unknown>;
 }
 
@@ -343,6 +386,54 @@ export class RelayClient {
   async getMessages(since?: string): Promise<GetMessagesResult> {
     const query = since ? `?since=${encodeURIComponent(since)}` : "";
     return this.request<GetMessagesResult>("GET", `/messages${query}`);
+  }
+
+  /** Download one inbound attachment through the signed, session-bound proxy. */
+  async downloadAttachment(
+    messageId: string,
+    attachment: InboundAttachment,
+  ): Promise<DownloadedAttachment> {
+    const path = `/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachment.id)}`;
+    const pathname = path.split("?")[0];
+    const headers = await this.buildHeaders(pathname, "");
+    const t = timeoutSignal(this.timeoutMs);
+    try {
+      const res = await this.fetchImpl(`${this.base}${path}`, {
+        method: "GET",
+        headers,
+        signal: t.signal,
+      });
+      if (!res.ok) {
+        const body = await readBody(res);
+        throw new RelayError(
+          `Attachment download failed: ${describeError(body, res.status)}`,
+          res.status,
+          body,
+        );
+      }
+      const declared = Number(res.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > 5 * 1024 * 1024) {
+        await res.body?.cancel();
+        throw new RelayError("Attachment exceeds 5MB limit", 413);
+      }
+      const bytes = await readBoundedBytes(res, 5 * 1024 * 1024);
+      return {
+        bytes,
+        filename: attachment.filename,
+        mimeType: (res.headers.get("content-type") || attachment.mimeType)
+          .split(";", 1)[0].trim().toLowerCase(),
+      };
+    } catch (err) {
+      if (isTimeoutError(err)) {
+        throw new RelayError(
+          `Attachment download timed out after ${this.timeoutMs}ms`,
+          0,
+        );
+      }
+      throw err;
+    } finally {
+      t.clear();
+    }
   }
 
   /** Send a reply back to a channel message, optionally with attachments. */

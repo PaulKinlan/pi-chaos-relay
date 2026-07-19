@@ -44,8 +44,8 @@ override everything for headless/explicit setups.
 2. `/chaos-relay connect <token>` (or `relay_register_telegram`).
 3. Returns `channelId`, `botUsername`, and a `pairingCode`.
 4. **Finishing step for the user:** open Telegram, message the bot, and send
-   the pairing code to link the chat. After that, messages to the bot arrive
-   as inbound messages.
+   the pairing code to link the chat. After that, text, photos, and files sent
+   to the bot arrive as inbound messages.
 
 **Discord**:
 1. User creates a bot in the Discord Developer Portal (Bot → Token).
@@ -61,7 +61,8 @@ override everything for headless/explicit setups.
    (Relay must have `CHAOS_EMAIL_DOMAIN` configured.)
 2. Returns `channelId` and an `inboundAddress`.
 3. **Finishing step for the user:** click the verification link sent to their
-   address. Once verified, mail to the inbound address reaches the agent.
+   address. Once verified, mail text and attachments sent to the inbound
+   address reach the agent.
 
 **Webhook** (inbound only — no reply):
 1. `/chaos-relay connect webhook` or `connect webhook <name>`
@@ -77,7 +78,13 @@ explicitly: `telegram <token>`, `discord <token>`, `email <addr>`,
 ## Receiving and replying
 
 - New messages are injected automatically (WebSocket push, with a safety-poll
-  backstop). To pull immediately, call `relay_check_messages`.
+  backstop). Telegram/email attachments are downloaded through the signed relay,
+  saved to private local paths shown in the message, and supported images are
+  also supplied directly as image context. To pull immediately, call
+  `relay_check_messages`.
+- Attachment limits are 3 files per message and 5MB each. A failed/expired file
+  is reported without losing the accompanying text. Do not claim an attachment
+  was received unless its local path or image content appears in the message.
 - To answer, call `relay_reply` with the `channelType`, `channelId`, and the
   inbound message `id` (as `replyTo`), plus your `content`.
 - Replies go back to the original channel thread.
@@ -91,7 +98,7 @@ explicitly: `telegram <token>`, `discord <token>`, `email <addr>`,
 | `relay_register_discord` | Register a Discord bot channel (explicit) |
 | `relay_register_email` | Register an email channel (explicit) |
 | `relay_register_webhook` | Create an inbound-only webhook URL |
-| `relay_check_messages` | Poll for new inbound messages |
+| `relay_check_messages` | Poll for new inbound messages and materialize attachments |
 | `relay_reply` | Reply to a channel message |
 | `relay_list_profiles` | List connection profiles and the active one |
 | `relay_switch_profile` | Switch to (or create) a connection profile |

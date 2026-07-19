@@ -1,6 +1,6 @@
 {
   "name": "pi-chaos-relay",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "description": "Bridge the pi coding agent to a CHAOS relay server — drive and answer your pi agent over Telegram and email.",
   "type": "module",
   "license": "MIT",
@@ -29,6 +29,7 @@
   "files": [
     "index.ts",
     "relay-client.ts",
+    "inbound-attachments.ts",
     "config.ts",
     "poller.ts",
     "ws-client.ts",
@@ -64,7 +65,7 @@
     }
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.79.0",
+    "@earendil-works/pi-coding-agent": "^0.80.10",
     "@types/node": "^26.0.0",
     "typescript": "^5.0.0"
   }

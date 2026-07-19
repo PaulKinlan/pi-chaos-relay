@@ -308,3 +308,84 @@ test("base64FromBytes round-trips via atob", () => {
   const bytes = new TextEncoder().encode("chaos relay");
   assert.equal(atob(base64FromBytes(bytes)), "chaos relay");
 });
+
+test("downloadAttachment uses a signed, message-bound path and returns bytes", async () => {
+  const keyPair = await generateKeyPair();
+  const calls: { url: string; init?: RequestInit }[] = [];
+  const fn = (async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), init });
+    return new Response(new Uint8Array([1, 2, 3]), {
+      headers: { "Content-Type": "application/octet-stream", "Content-Length": "3" },
+    });
+  }) as typeof fetch;
+  const client = new RelayClient({
+    relayUrl: "http://relay",
+    apiKey: "k",
+    keyPair,
+    fetchImpl: fn,
+  });
+  const result = await client.downloadAttachment("message-1", {
+    id: "attachment-1",
+    filename: "a.bin",
+    mimeType: "application/octet-stream",
+    size: 3,
+    kind: "file",
+  });
+  assert.deepEqual([...result.bytes], [1, 2, 3]);
+  assert.equal(calls[0].url, "http://relay/messages/message-1/attachments/attachment-1");
+  const headers = calls[0].init?.headers as Record<string, string>;
+  assert.equal(await verifyRequest(
+    keyPair.publicKey,
+    headers["X-Signature"],
+    headers["X-Timestamp"],
+    headers["X-Nonce"],
+    "/messages/message-1/attachments/attachment-1",
+    "",
+  ), true);
+});
+
+test("downloadAttachment rejects streamed responses over 5MB without a length header", async () => {
+  let cancelled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(3 * 1024 * 1024));
+      controller.enqueue(new Uint8Array(3 * 1024 * 1024));
+    },
+    cancel() { cancelled = true; },
+  });
+  const fn = (async () => new Response(stream)) as typeof fetch;
+  const client = new RelayClient({ relayUrl: "http://relay", apiKey: "k", fetchImpl: fn });
+  await assert.rejects(
+    client.downloadAttachment("m", {
+      id: "a",
+      filename: "large.bin",
+      mimeType: "application/octet-stream",
+      size: 0,
+      kind: "file",
+    }),
+    /exceeds 5MB/,
+  );
+  assert.equal(cancelled, true);
+});
+
+test("downloadAttachment rejects declared responses over 5MB before buffering", async () => {
+  let cancelled = false;
+  const stream = new ReadableStream({
+    cancel() { cancelled = true; },
+  });
+  const fn = (async () => new Response(stream, {
+    headers: { "Content-Length": String(5 * 1024 * 1024 + 1) },
+  })) as typeof fetch;
+  const client = new RelayClient({ relayUrl: "http://relay", apiKey: "k", fetchImpl: fn });
+  await assert.rejects(
+    client.downloadAttachment("m", {
+      id: "a",
+      filename: "large.bin",
+      mimeType: "application/octet-stream",
+      size: 0,
+      kind: "file",
+    }),
+    /exceeds 5MB/,
+  );
+  assert.equal(cancelled, true);
+});

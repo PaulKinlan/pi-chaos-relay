@@ -31,6 +31,10 @@ import { readFileSync, appendFileSync, mkdirSync, existsSync, writeFileSync, unl
 import { basename, join } from "node:path";
 import { homedir, hostname } from "node:os";
 import {
+  cleanupStaleInboundAttachments,
+  materializeInboundAttachments,
+} from "./inbound-attachments.ts";
+import {
   addChannelRecord,
   DEFAULT_RELAY_URL,
   isConfigured,
@@ -148,6 +152,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   let poller: MessagePoller | undefined;
   let ws: RelayWebSocket | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let attachmentCleanupTimer: ReturnType<typeof setInterval> | undefined;
+  let deliveryQueue: Promise<void> = Promise.resolve();
+  let activeModelAcceptsImages = false;
   let cfg: ResolvedConfig = resolveConfig();
 
   // Profile/session binding. `currentProfile` is the profile this process is
@@ -459,7 +466,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
    * streaming and delivers immediately when idle. Matches pi's own extension
    * examples (reload-runtime, git-merge-and-resolve).
    */
-  function deliverToAgent(messages: ChannelMessage[]): void {
+  async function deliverToAgent(messages: ChannelMessage[]): Promise<void> {
     // Remember where the latest message came from so we can show a typing
     // indicator there while the agent works on it.
     const last = messages[messages.length - 1];
@@ -467,7 +474,34 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       lastChannel = { channelType: last.channelType, channelId: last.channelId };
       relayInputSinceIdle = true;
     }
-    pi.sendUserMessage(formatMessagesForAgent(messages), { deliverAs: "followUp" });
+    const c = ensureClient();
+    const hydrated = c
+      ? await materializeInboundAttachments(c, messages)
+      : { messages, images: [], files: [] };
+    const text = formatMessagesForAgent(hydrated.messages);
+    const includesImages = hydrated.images.length > 0 && activeModelAcceptsImages;
+    const content = includesImages
+      ? [{ type: "text" as const, text }, ...hydrated.images]
+      : text;
+    try {
+      pi.sendUserMessage(content, { deliverAs: "followUp" });
+    } catch (err) {
+      // A text-only model/runtime may reject image content. Never let that drop
+      // the channel message: retry as text with the private file paths intact.
+      if (!includesImages) throw err;
+      log("active model rejected inbound image content; delivering paths as text");
+      pi.sendUserMessage(text, { deliverAs: "followUp" });
+    }
+  }
+
+  /** Serialize downloads/injection so WS push and catch-up cannot race. */
+  function queueDelivery(messages: ChannelMessage[]): Promise<void> {
+    deliveryQueue = deliveryQueue
+      .then(() => deliverToAgent(messages))
+      .catch((err) => {
+        log(`attachment delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    return deliveryQueue;
   }
 
   /** Repeatedly send a "typing" indicator to the active channel until stopped. */
@@ -581,7 +615,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       const messages = consumeApprovalReplies(await poller.poll());
       if (messages.length === 0) return;
       log(`delivering ${messages.length} new message(s) to the agent`);
-      deliverToAgent(messages);
+      await queueDelivery(messages);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log(`poll failed: ${msg}`);
@@ -606,7 +640,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         const fresh = consumeApprovalReplies(poller.accept(messages));
         if (fresh.length === 0) return;
         log(`delivering ${fresh.length} message(s) to the agent`);
-        deliverToAgent(fresh);
+        void queueDelivery(fresh);
       },
       // Return RAW messages (cursor advanced, NOT deduped) so the single dedup
       // happens in onMessage below. Using poller.poll() here would dedup first,
@@ -624,6 +658,16 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (event, ctx) => {
     if (poller) poller.reset();
+    if (attachmentCleanupTimer) clearInterval(attachmentCleanupTimer);
+    await cleanupStaleInboundAttachments();
+    attachmentCleanupTimer = setInterval(
+      () => void cleanupStaleInboundAttachments(),
+      60 * 60 * 1000,
+    );
+    if (typeof attachmentCleanupTimer.unref === "function") {
+      attachmentCleanupTimer.unref();
+    }
+    activeModelAcceptsImages = ctx.model?.input?.includes("image") ?? false;
     currentSessionId = ctx.sessionManager.getSessionId();
     let profile = chooseProfileForSession(event.reason, currentSessionId);
 
@@ -662,7 +706,15 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => {
     stopPolling();
     stopTyping();
+    if (attachmentCleanupTimer) {
+      clearInterval(attachmentCleanupTimer);
+      attachmentCleanupTimer = undefined;
+    }
     removeProfileLock(currentProfile);
+  });
+
+  pi.on("model_select", (event) => {
+    activeModelAcceptsImages = event.model.input?.includes("image") ?? false;
   });
 
   // Show a "typing" indicator in the active channel while the agent works on a
@@ -706,10 +758,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     description:
       "Poll the chaos-relay server for new inbound Telegram/email messages. " +
       "Returns any messages received since the last check. Each message includes " +
-      "an id, channelType, channelId, sender, and content. Use relay_reply to respond.",
+      "an id, channelType, channelId, sender, content, and private local paths for " +
+      "downloaded attachments; supported images are returned as image content. Use relay_reply to respond.",
     promptSnippet: "relay_check_messages: fetch pending Telegram/email messages from chaos-relay",
     parameters: checkParams,
-    async execute(_id: string, _params: Static<typeof checkParams>, _signal, _onUpdate, _ctx: ExtensionContext) {
+    async execute(_id: string, _params: Static<typeof checkParams>, _signal, _onUpdate, ctx: ExtensionContext) {
       const c = ensureClient();
       if (!c || !poller) {
         return textResult(
@@ -718,7 +771,15 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       }
       try {
         const messages = await poller.poll();
-        return textResult(formatMessagesForAgent(messages), { count: messages.length });
+        const hydrated = await materializeInboundAttachments(c, messages);
+        const modelAcceptsImages = ctx.model?.input?.includes("image") ?? false;
+        return {
+          content: [
+            { type: "text" as const, text: formatMessagesForAgent(hydrated.messages) },
+            ...(modelAcceptsImages ? hydrated.images : []),
+          ],
+          details: { count: messages.length, files: hydrated.files },
+        };
       } catch (err) {
         throw toFriendly(err);
       }

@@ -198,7 +198,7 @@ but unparseable), `/chaos-relay reset` (or `reset all`) clears it.
 | `relay_connect` | **One-shot**: give it a bot token / email / `webhook` and it sets up the relay (auto-registering your session) and the channel in one step. Lets you just paste a token and say "connect this" |
 | `relay_list_profiles` | List connection profiles and the active one |
 | `relay_switch_profile` | Switch to (or create) a connection profile — "switch to my work connection" |
-| `relay_check_messages` | Pull pending inbound Telegram/email messages |
+| `relay_check_messages` | Pull pending inbound Telegram/email messages and securely materialize attached images/files |
 | `relay_reply` | Reply to a channel message (`channelType`, `channelId`, `content`, optional `replyTo`, optional `files` — absolute paths to attach; images render inline on Telegram, email gets real attachments; max 3 files, 5MB each, passed through and never stored) |
 | `relay_register_telegram` | Register a Telegram bot channel |
 | `relay_register_discord` | Register a Discord bot channel |
@@ -232,9 +232,9 @@ Terminal/local turns are never gated.
    username**, and a **pairing code**.
 4. Open Telegram, message your bot, and send it the **pairing code** to link your
    chat.
-5. Done. Messages you send the bot now arrive at the agent (auto-injected by the
-   poller). The agent replies with `relay_reply` and they appear in your Telegram
-   thread.
+5. Done. Messages, photos, and files you send the bot now arrive at the agent
+   (auto-injected by the poller). The agent replies with `relay_reply` and they
+   appear in your Telegram thread.
 
 ## Email setup — end to end
 
@@ -247,8 +247,8 @@ Terminal/local turns are never gated.
    and an **inboundAddress** (e.g. `ch_abc123@your-relay-domain`).
 3. Check your inbox for a **verification link** and click it to activate the
    channel.
-4. Done. Email sent to the inbound address reaches the agent; replies go back to
-   the sender via `relay_reply`.
+4. Done. Email text and attachments sent to the inbound address reach the agent;
+   replies go back to the sender via `relay_reply`.
 
 ## How inbound delivery works
 
@@ -261,8 +261,13 @@ replay (a 5-minute lookback it sends every time the WebSocket connects) never
 re-processes a message already handled before a restart. Fresh messages are
 injected into the agent as a user message that includes each message's `id`,
 `channelType`, `channelId`, sender, and content — everything the agent needs to
-call `relay_reply`. You can also force an immediate pull with `relay_check_messages`
-or `/chaos-relay poll`.
+call `relay_reply`. Inbound Telegram/email attachment descriptors are downloaded
+through an ECDSA-signed, user/message-scoped relay endpoint. Files are written to
+private `0700` directories with mode `0600`; supported PNG/JPEG/GIF/WebP images
+are also injected directly into the Pi image context after magic-byte checks.
+Per-file failures are shown without dropping the text message. Stale local files
+are removed after 24 hours. You can force an immediate pull with
+`relay_check_messages` or `/chaos-relay poll`.
 
 ## Security
 
@@ -283,6 +288,10 @@ or `/chaos-relay poll`.
   requests for those; signed is preferred and automatic when a keypair exists.
 - Bot tokens are sent only to the relay's register endpoint over HTTPS; the relay
   encrypts them at rest. They are not persisted by this extension.
+- Inbound attachments are capped at 3 files per message and 5MB each. The relay
+  stores only bounded descriptors and private provider references—not bytes,
+  credentials, or Resend signed URLs. Attachment retrieval requires request
+  signing even for otherwise legacy bearer-only sessions and returns `no-store`.
 
 ## Development
 
