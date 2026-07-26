@@ -285,12 +285,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         "Channel re-binding status (some need a quick manual step):\n- " +
         notes.join("\n- ");
       log(summary);
-      // Surface to the user via the agent so they can complete pairing/verification.
-      try {
-        pi.sendUserMessage(summary, { deliverAs: "followUp" });
-      } catch {
-        /* agent may not be ready to receive — the log still records it */
-      }
+      // Do not start an agent turn from session-start recovery. Starting one here
+      // races the CLI's initial prompt in print/subagent sessions. The durable log
+      // preserves the recovery details for explicit status/doctor inspection.
     }
   }
 
@@ -691,13 +688,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       writeProfileLock(profile);
       if (autoCreated) {
         log(`session ${event.reason}: connected as auto-created profile "${profile}" (another instance held the original)`);
-        try {
-          pi.sendUserMessage(
-            `Another pi session was already using relay profile. ` +
-            `Auto-created a new profile "${profile}" for this session so both receive messages independently.`,
-            { deliverAs: "followUp" },
-          );
-        } catch { /* agent may not be ready at startup — log is enough */ }
+        ctx.ui.notify(
+          `Another pi session was already using relay profile. ` +
+          `Auto-created a new profile "${profile}" for this session so both receive messages independently.`,
+          "info",
+        );
       } else {
         log(`session ${event.reason}: connected as profile "${profile}"`);
       }
