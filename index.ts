@@ -695,6 +695,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           pi.sendUserMessage(
             `Another pi session was already using relay profile. ` +
             `Auto-created a new profile "${profile}" for this session so both receive messages independently.`,
+            { deliverAs: "followUp" },
           );
         } catch { /* agent may not be ready at startup — log is enough */ }
       } else {
