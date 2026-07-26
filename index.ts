@@ -287,7 +287,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       log(summary);
       // Surface to the user via the agent so they can complete pairing/verification.
       try {
-        pi.sendUserMessage(summary);
+        pi.sendUserMessage(summary, { deliverAs: "followUp" });
       } catch {
         /* agent may not be ready to receive — the log still records it */
       }
