@@ -125,6 +125,91 @@ So: switch a session to `work`, quit, **resume that session** → back on `work`
 A brand-new session with no env → `default` (or inherits its parent). Two
 instances stay independent because each is a different session.
 
+#### The collision trap: profiles that name themselves
+
+If the profile a session picks is **already held by another live pi process**,
+the extension auto-creates a new profile so both sessions get independent push
+delivery:
+
+```
+another pi instance (PID 12345) holds relay profile "default"; auto-creating "omarchy-2if"
+```
+
+The name is your **hostname plus a base36 process id**
+(`generateUniqueProfileName()`, `index.ts:139`; the collision check is in
+`session_start`, `index.ts:675`). It looks random — `omarchy-2if`,
+`omarchy-1gm` — but it is derived from the pid. The new profile is recorded
+against that session, so resuming the session resumes *that* identity, and you
+get a `ctx.ui.notify` at the time.
+
+That behaviour is useful (two concurrent sessions both receive messages) and it
+is a trap if you did not mean it: **each collision quietly mints a new identity**
+— a config file, an ECDSA keypair, a relay session. One machine on this project
+accumulated **~3,000 profile files** before anyone noticed, with sessions
+connecting as whichever identity they happened to land on. The files are tiny
+and inert, but that is 3,000 relay identities.
+
+Check what you actually have, and which one is live:
+
+```sh
+ls -lt ~/.pi/chaos-relay*.json | head   # newest first, with times
+/chaos-relay profile                    # inside pi: lists profiles, active marked
+# or, as a tool: relay_list_profiles
+```
+
+#### The pattern: one profile owns the channels, everything else is silent
+
+Pick the **one** session that answers Telegram/email, and point every other
+session at a profile whose config has **no channels** — it registers, polls, and
+receives nothing, so it never races the channel owner.
+
+`no-relay` is a **convention, not a feature**: nothing in the code treats that
+name specially. `configPathFor()` only slugifies whatever you pass in
+`CHAOS_RELAY_PROFILE` (`config.ts:33`), and "silent" simply means the profile
+file has no `channels` array. The name is still worth using because it is
+greppable.
+
+```sh
+# the ONE session that answers Telegram/email
+CHAOS_RELAY_PROFILE=default pi
+
+# every other session: silent, and unable to collide
+export CHAOS_RELAY_PROFILE="no-relay-$$"   # per-shell name — see below
+pi
+```
+
+Or keep the intent in a launcher so it cannot be forgotten:
+
+```sh
+pi-silent() { CHAOS_RELAY_PROFILE="no-relay-$$" pi "$@"; }
+```
+
+**Why `$$`, and the trade-off.** A silent profile is a *single lock-holding
+profile like any other*: two concurrent sessions pinned to the same `no-relay`
+name collide exactly as two `default` sessions do, and the second one **silently
+mints `hostname-pid` anyway** — the hole this pattern exists to close. A
+per-shell name closes it (`no-relay-$$`), at the cost of **one inert profile file
+per shell**: it owns no channels, so it is safe to delete, but it does
+accumulate. The alternative is a small fixed set of per-lane names
+(`no-relay-a`, `no-relay-b`) that you reuse — which is silent only while one
+session uses each name.
+
+Either way, a sweep is cheap and safe **for profiles that own no channels**:
+
+```sh
+for f in ~/.pi/chaos-relay*.json; do
+  printf '%s: ' "$f"
+  node -e "const d=require(process.argv[1]);console.log((d.channels||[]).length+' channel(s)')" "$f"
+done
+```
+
+**Do not sweep the profile that owns your channels.** That file *is* the
+identity the channels are bound to: deleting it loses the keypair, and with it
+the relay session that receives your Telegram/email. Auto-created names
+(`omarchy-…`) and per-shell `no-relay-…` names are the ones that can go; a
+profile you named yourself — or that reports channels above — deserves a look
+first.
+
 The **ECDSA private key** is part of your identity and is deliberately *not*
 configurable via an env var — it lives only in the `0600` config file. Setup
 generates the keypair, sends only the **public** key to the relay, and persists
@@ -175,6 +260,28 @@ never sees a half-written file. An empty/truncated config self-heals on read
 instead of crashing. If a config somehow becomes genuinely corrupt (non-empty
 but unparseable), `/chaos-relay reset` (or `reset all`) clears it.
 
+### "The reply was accepted" does not mean it was delivered
+
+`relay_reply` returning `ok: true` means the relay **stored** the reply. It does
+**not** mean Telegram or email delivered it — delivery happens server-side and is
+not observable from this client. The extension logs exactly that when the ack
+arrives:
+
+```
+relay_reply: WS ack ok=true responseId=… NOTE: ack means the relay STORED the reply —
+actual Telegram/email delivery happens server-side and is logged there.
+```
+
+So when inbound messages arrive fine and your replies vanish, the ack proves only
+that the relay took them. Ask whether the relay stored them and then failed to
+forward — the channel's own state (e.g. can the bot post in that chat? is the
+email address still verified?) — rather than retrying the send.
+
+Two places in this client are weaker than that log line, and worth knowing
+while diagnosing: the **HTTP fallback path logs `ok=` with no note**
+(`index.ts:900`), and the **tool's returned text** says the relay "will forward
+it to the channel". The honest claim is storage; delivery is the server's.
+
 ## Commands
 
 | Command | Description |
@@ -199,7 +306,7 @@ but unparseable), `/chaos-relay reset` (or `reset all`) clears it.
 | `relay_list_profiles` | List connection profiles and the active one |
 | `relay_switch_profile` | Switch to (or create) a connection profile — "switch to my work connection" |
 | `relay_check_messages` | Pull pending inbound Telegram/email messages and securely materialize attached images/files |
-| `relay_reply` | Reply to a channel message (`channelType`, `channelId`, `content`, optional `replyTo`, optional `files` — absolute paths to attach; images render inline on Telegram, email gets real attachments; max 3 files, 5MB each, passed through and never stored) |
+| `relay_reply` | Reply to a channel message (`channelType`, `channelId`, `content`, optional `replyTo`, optional `files` — absolute paths to attach; images render inline on Telegram, email gets real attachments; max 3 files, 5MB each, passed through and never stored). **`ok: true` means the relay stored the reply, not that the channel delivered it** — see Troubleshooting |
 | `relay_register_telegram` | Register a Telegram bot channel |
 | `relay_register_discord` | Register a Discord bot channel |
 | `relay_register_email` | Register an email channel |
@@ -306,6 +413,18 @@ Integration testing against a local relay: run the CHAOS relay server
 
 ## Known gaps / future work
 
+- **A collision silently mints a relay identity.** When another live session
+  holds the chosen profile, `session_start` auto-creates `hostname-pid`
+  (`index.ts:675`) with an `ctx.ui.notify` as the only signal — which is how one
+  machine reached ~3,000 profile files before anyone noticed. Options worth
+  weighing: a `--no-auto-profile` flag, or failing the connection with an
+  explanation ("profile X is held by PID Y; pass CHAOS_RELAY_PROFILE or run
+  `/chaos-relay profile new`"). Making the collision loud, or impossible by
+  default, beats noticing it later.
+- **The reply-ack note is WS-only.** The WebSocket path logs that `ok` means
+  *stored, not delivered* (`index.ts:879`); the HTTP fallback logs a bare `ok=`
+  (`index.ts:900`) and the tool text says "will forward it". One shared sentence
+  in all three places would stop the client from implying more than it knows.
 - **Server response signing / TOFU pinning.** The relay returns its public key
   at registration and we persist it (`serverPublicKey`), but the client does not
   yet verify server signatures on inbound messages. Outbound request signing (the
