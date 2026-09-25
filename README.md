@@ -262,25 +262,34 @@ but unparseable), `/chaos-relay reset` (or `reset all`) clears it.
 
 ### "The reply was accepted" does not mean it was delivered
 
-`relay_reply` returning `ok: true` means the relay **stored** the reply. It does
-**not** mean Telegram or email delivered it — delivery happens server-side and is
-not observable from this client. The extension logs exactly that when the ack
-arrives:
+`relay_reply` returning `ok: true` means the relay **resolved and stored** the
+reply. It does **not** mean Telegram or email delivered it — delivery happens
+server-side and is not observable from this client. Two guarantees back this up
+(since relay v0.17.0 / a journal-xk4 server):
+
+- **Unknown channels are refused by name, before anything is stored.** If the
+  `channelId` matches no channel registered to your session — or your
+  `channelType` contradicts the channel's type — the relay answers `REFUSED`
+  naming the channel (and lists your registered channels). A mistyped id can
+  no longer round-trip as a confirmation; nothing is stored, nothing is sent.
+- **Acceptance names the channel the relay actually resolved.** The success
+  confirmation quotes `type / label / id` from the relay's own answer, not
+  from your request. Against an older relay that names nothing, the tool says
+  so — the confirmation then "only echoes the requested id and is NOT proof of
+  delivery."
+
+The extension logs the same distinction when the ack arrives:
 
 ```
-relay_reply: WS ack ok=true responseId=… NOTE: ack means the relay STORED the reply —
+relay_reply: WS ack ok responseId=… NOTE: ack means the relay RESOLVED + STORED the reply —
 actual Telegram/email delivery happens server-side and is logged there.
 ```
 
-So when inbound messages arrive fine and your replies vanish, the ack proves only
-that the relay took them. Ask whether the relay stored them and then failed to
-forward — the channel's own state (e.g. can the bot post in that chat? is the
-email address still verified?) — rather than retrying the send.
-
-Two places in this client are weaker than that log line, and worth knowing
-while diagnosing: the **HTTP fallback path logs `ok=` with no note**
-(`index.ts:900`), and the **tool's returned text** says the relay "will forward
-it to the channel". The honest claim is storage; delivery is the server's.
+So when inbound messages arrive fine and your replies vanish: a `REFUSED` is
+this client or the relay telling you the target is wrong (fix the id); an
+acceptance means ask whether the relay stored them and then failed to forward
+— the channel's own state (e.g. can the bot post in that chat? is the email
+address still verified?) — rather than retrying the send.
 
 ## Commands
 
@@ -306,7 +315,7 @@ it to the channel". The honest claim is storage; delivery is the server's.
 | `relay_list_profiles` | List connection profiles and the active one |
 | `relay_switch_profile` | Switch to (or create) a connection profile — "switch to my work connection" |
 | `relay_check_messages` | Pull pending inbound Telegram/email messages and securely materialize attached images/files |
-| `relay_reply` | Reply to a channel message (`channelType`, `channelId`, `content`, optional `replyTo`, optional `files` — absolute paths to attach; images render inline on Telegram, email gets real attachments; max 3 files, 5MB each, passed through and never stored). **`ok: true` means the relay stored the reply, not that the channel delivered it** — see Troubleshooting |
+| `relay_reply` | Reply to a channel message (`channelType`, `channelId`, `content`, optional `replyTo`, optional `files` — absolute paths to attach; images render inline on Telegram, email gets real attachments; max 3 files, 5MB each, passed through and never stored). An unknown/mismatched `channelId` is **REFUSED by name** — nothing is stored or sent. **`ok: true` means the relay resolved + stored the reply (naming the resolved channel), not that the channel delivered it** — see Troubleshooting |
 | `relay_register_telegram` | Register a Telegram bot channel |
 | `relay_register_discord` | Register a Discord bot channel |
 | `relay_register_email` | Register an email channel |

@@ -52,8 +52,20 @@ export interface RelayWebSocketOptions {
   maxBackoffMs?: number;
 }
 
+/** The reply-ack the relay answers on the socket (journal-xk4: a refusal
+ * carries ok:false + an `error` naming the channel; an acceptance names the
+ * resolved `channel`). */
+export interface ReplyAck {
+  ok: boolean;
+  responseId?: string;
+  /** Set when the relay refused (e.g. unknown channel — refused by name). */
+  error?: string;
+  /** The channel the relay actually resolved and dispatched against. */
+  channel?: { id: string; type: string; label: string };
+}
+
 interface PendingReply {
-  resolve: (value: { ok: boolean; responseId?: string }) => void;
+  resolve: (value: ReplyAck) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 }
@@ -220,7 +232,12 @@ export class RelayWebSocket {
           const p = this.pending.get(first)!;
           clearTimeout(p.timer);
           this.pending.delete(first);
-          p.resolve({ ok: data.ok !== false, responseId: data.responseId as string | undefined });
+          p.resolve({
+            ok: data.ok !== false,
+            responseId: data.responseId as string | undefined,
+            error: data.error as string | undefined,
+            channel: data.channel as { id: string; type: string; label: string } | undefined,
+          });
         }
         break;
       }
@@ -261,7 +278,7 @@ export class RelayWebSocket {
       metadata?: Record<string, unknown>;
     },
     ackTimeoutMs = 10_000,
-  ): Promise<{ ok: boolean; responseId?: string }> {
+  ): Promise<ReplyAck> {
     return new Promise((resolve, reject) => {
       if (!this.connected) {
         reject(new Error("WebSocket not connected"));

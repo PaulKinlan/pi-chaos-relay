@@ -66,6 +66,12 @@ conflict).
   it self-heals. (Persists the last-delivered timestamp.)
 
 ### Replies not sending / "Relay request failed"
+- **`relay_reply: REFUSED by relay — Unknown channel <id>`** (or a type
+  mismatch naming both types) → the `channelId` names no channel registered on
+  this session: a typo, a deleted channel, or the wrong profile. The refusal
+  lists the registered channels — copy the id from the inbound message you are
+  answering; never retype it. Nothing was stored or sent, so fixing the id and
+  resending is safe (no duplicate).
 - **ECDSA identity** is Bearer-only (legacy session with no keypair) and the
   relay now requires signatures → `/chaos-relay setup` and choose
   "Register a new session (ECDSA)" to bind a keypair. Old Bearer-only sessions

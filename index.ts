@@ -64,6 +64,10 @@ import {
   type RegisteredChannelRecord,
 } from "./config.ts";
 import { MessagePoller, formatMessagesForAgent } from "./poller.ts";
+import {
+  formatReplyConfirmation,
+  formatReplyRefusal,
+} from "./reply-format.ts";
 import { RelayWebSocket } from "./ws-client.ts";
 import { parseConnectInput } from "./connect.ts";
 
@@ -794,7 +798,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       ],
       { description: "Channel type from the inbound message (e.g. 'telegram' or 'email')." },
     ),
-    channelId: Type.String({ description: "channelId from the inbound message." }),
+    channelId: Type.String({ description: "channelId from the inbound message. Must name a channel registered on the relay — an unknown id is REFUSED by name before anything is sent (typo-proof)." }),
     content: Type.String({ description: "The reply text to send back to the channel." }),
     replyTo: Type.Optional(
       Type.String({ description: "Optional id of the message being replied to." }),
@@ -815,7 +819,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       "channel. Pass the channelType and channelId from the inbound message, and " +
       "optionally replyTo (the inbound message id). Attach images/files with " +
       "files: [absolute paths] — Telegram shows images inline, email gets real " +
-      "attachments (max 3 files, 5MB each).",
+      "attachments (max 3 files, 5MB each). A channelId that names no registered " +
+      "channel is REFUSED by name (nothing is stored or sent); an accepted reply " +
+      "names the channel the relay actually resolved.",
     promptSnippet:
       "relay_reply: send a reply (optionally with image/file attachments) to a Telegram/email channel via chaos-relay",
     parameters: replyParams,
@@ -875,14 +881,21 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
             replyTo: params.replyTo,
             attachments,
           });
+          // A refusal (ok:false) is deterministic — the channel check failed
+          // by name. Do NOT fall through to HTTP: replaying the same bad
+          // target just fails again, and a fallback error would bury the
+          // relay's reason. Surface it verbatim.
+          if (res.ok === false) {
+            log(`relay_reply: WS ack REFUSED: ${res.error ?? "no reason given"}`);
+            return textResult(formatReplyRefusal(res), res);
+          }
           log(
-            `relay_reply: WS ack ok=${res.ok} responseId=${res.responseId ?? "?"}. ` +
-              `NOTE: ack means the relay STORED the reply — actual Telegram/email ` +
-              `delivery happens server-side and is logged there.`,
+            `relay_reply: WS ack ok responseId=${res.responseId ?? "?"}. ` +
+              `NOTE: ack means the relay RESOLVED + STORED the reply — actual ` +
+              `Telegram/email delivery happens server-side and is logged there.`,
           );
           return textResult(
-            `Reply accepted by relay for ${params.channelType} channel ${params.channelId} (via WebSocket). ` +
-              `Relay will forward it to the channel.`,
+            formatReplyConfirmation(res, params, "WebSocket"),
             res,
           );
         } catch (err) {
@@ -898,15 +911,24 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           attachments,
         });
         log(`relay_reply: HTTP ack ok=${(res as { ok?: boolean }).ok ?? "?"}`);
-        // The relay returns {ok, channelType, channelId} for telegram and
-        // {ok, responseId} for webhook-style channels — fall back to the
-        // request values so the confirmation is always meaningful.
-        return textResult(
-          `Reply accepted by relay for ${res.channelType ?? params.channelType} channel ${res.channelId ?? params.channelId}. ` +
-            `Relay will forward it to the channel.`,
-          res,
-        );
+        // A non-2xx refusal arrives as a thrown RelayError (carrying the
+        // relay's reason) and is handled by the catch below; a 2xx here is an
+        // acceptance — confirm against what the relay named, never against
+        // the request echo.
+        return textResult(formatReplyConfirmation(res, params, "HTTP"), res);
       } catch (err) {
+        // A 400 from the relay is a refusal by name (unknown channel, type
+        // mismatch, bad content) — the relay's reason is the answer; present
+        // it as a clean refusal rather than a plumbing exception. Other
+        // statuses (401/429/5xx) stay thrown so auth/transport problems
+        // surface as errors.
+        if (err instanceof RelayError && err.status === 400) {
+          log(`relay_reply: HTTP refused: ${err.message}`);
+          return textResult(
+            `relay_reply: REFUSED by relay — ${err.message}. Nothing was sent.`,
+            { ok: false, error: err.message },
+          );
+        }
         log(`relay_reply: HTTP reply failed: ${err instanceof Error ? err.message : String(err)}`);
         throw toFriendly(err);
       }

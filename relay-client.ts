@@ -163,9 +163,15 @@ export interface WebhookRegisterResult {
 
 export interface ReplyResult {
   ok: boolean;
-  /** Present for telegram/discord replies. */
+  /** On ok:false (a 2xx that refuses), the relay's reason — e.g. an unknown
+   * or type-mismatched channel, refused by name (journal-xk4). */
+  error?: string;
+  /** The channel the relay actually resolved and dispatched against
+   * (newer relays). Confirm against this, never against the request echo. */
+  channel?: { id: string; type: string; label: string };
+  /** Legacy: present for some older servers' telegram/discord replies. */
   channelType?: string;
-  /** Present for telegram/discord replies. */
+  /** Legacy: present for some older servers' telegram/discord replies. */
   channelId?: string;
   /** Present for webhook-style channels (reply stored for GET /responses). */
   responseId?: string;

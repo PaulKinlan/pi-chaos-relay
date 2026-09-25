@@ -86,8 +86,13 @@ explicitly: `telegram <token>`, `discord <token>`, `email <addr>`,
   is reported without losing the accompanying text. Do not claim an attachment
   was received unless its local path or image content appears in the message.
 - To answer, call `relay_reply` with the `channelType`, `channelId`, and the
-  inbound message `id` (as `replyTo`), plus your `content`.
-- Replies go back to the original channel thread.
+  inbound message `id` (as `replyTo`), plus your `content`. An unknown or
+  type-mismatched `channelId` is `REFUSED by relay` — the reason names the
+  channel and nothing is stored or sent; take the id from the inbound message
+  rather than retyping it.
+- Replies go back to the original channel thread. An acceptance names the
+  channel the relay resolved against — confirmation is the relay's observation,
+  not your request echo.
 
 ## Tools
 
@@ -99,7 +104,7 @@ explicitly: `telegram <token>`, `discord <token>`, `email <addr>`,
 | `relay_register_email` | Register an email channel (explicit) |
 | `relay_register_webhook` | Create an inbound-only webhook URL |
 | `relay_check_messages` | Poll for new inbound messages and materialize attachments |
-| `relay_reply` | Reply to a channel message |
+| `relay_reply` | Reply to a channel message (unknown/mismatched channelId is REFUSED by name; acceptance names the resolved channel) |
 | `relay_list_profiles` | List connection profiles and the active one |
 | `relay_switch_profile` | Switch to (or create) a connection profile |
 
