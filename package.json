@@ -1,6 +1,6 @@
 {
   "name": "pi-chaos-relay",
-  "version": "0.17.7",
+  "version": "0.17.8",
   "description": "Bridge the pi coding agent to a CHAOS relay server — drive and answer your pi agent over Telegram and email.",
   "type": "module",
   "license": "MIT",
@@ -25,7 +25,7 @@
   ],
   "scripts": {
     "check:version": "node scripts/check-version-consistency.mjs",
-    "pretest": "node scripts/check-version-consistency.mjs --base origin/master",
+    "pretest": "node scripts/check-version-consistency-gate.mjs",
     "test": "node --test"
   },
   "files": [

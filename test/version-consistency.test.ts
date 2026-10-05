@@ -68,7 +68,12 @@ test("version consistency: agreement above the base passes", () => {
 test("version consistency: equal to the base passes (not below is the rule)", () => {
   const dir = makeFixture("0.17.6", {});
   try {
-    assert.equal(run(dir, "HEAD").status, 0);
+    const { status, stdout } = run(dir, "HEAD");
+    assert.equal(status, 0);
+    // Assert the OUTPUT too, not only the exit status: a status-only assertion is
+    // satisfied by any script that exits 0, including one that does nothing.
+    assert.match(stdout, /check-version-consistency: OK/);
+    assert.match(stdout, /package\.json=0\.17\.6/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
