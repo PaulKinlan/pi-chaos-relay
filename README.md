@@ -451,10 +451,13 @@ npm run check:version -- --base origin/master   # package.json/lockfile agreemen
 `npm test` runs the version check first (via `pretest`), so a tree whose
 `package.json` and `package-lock.json` disagree fails the gate instead of shipping —
 that half needs no base and always applies. The check also refuses a version that
-has moved backwards: it compares against `origin/master` when that ref resolves, and
-in a shallow, single-branch, offline or remote-less checkout it falls back to `HEAD`
-and **says which half it could not enforce** and how to enforce it explicitly. The
-strict check takes a required `--base` and fails closed on an unresolvable one.
+has moved backwards: it compares against the default branch (read as the fully
+qualified `refs/remotes/origin/master`, so a local branch named `origin/master`
+cannot shadow it), and in a shallow, single-branch, offline or remote-less checkout
+it falls back to `HEAD` and **says which half it could not enforce** and how to
+enforce it explicitly. The strict check takes a required `--base`, refuses an
+ambiguous bare name rather than resolving it, and fails closed on an unresolvable
+ref.
 
 `npm ci` (or `npm install`) must run before the `npx tsc` check, which needs the
 `typescript` devDependency — without it `npx` instead runs the unrelated

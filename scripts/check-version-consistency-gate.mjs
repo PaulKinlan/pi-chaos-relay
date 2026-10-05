@@ -32,7 +32,12 @@ import { fileURLToPath } from "node:url";
 
 const USAGE = "usage: node scripts/check-version-consistency-gate.mjs [--dir <path>]";
 const CHECKER = join(dirname(fileURLToPath(import.meta.url)), "check-version-consistency.mjs");
-const PREFERRED = "origin/master";
+// FULLY QUALIFIED, deliberately: a bare `origin/master` can be shadowed by a local
+// branch of that name, and git resolves the bare form by precedence (refs/heads
+// before refs/remotes) with only a warning — which is how a check ends up
+// comparing against a stale branch while reporting success.
+const PREFERRED = "refs/remotes/origin/master";
+const PREFERRED_DISPLAY = "origin/master (refs/remotes/origin/master)";
 
 function usageError(message) {
   console.error(`check-version-consistency-gate: ${message}`);
@@ -79,13 +84,13 @@ if (resolves(dir, PREFERRED)) {
   base = PREFERRED;
   enforced = true;
   console.log(
-    `check-version-consistency-gate: base=${PREFERRED} (monotonicity against the default branch is ENFORCED)`,
+    `check-version-consistency-gate: base=${PREFERRED_DISPLAY} (monotonicity against the default branch is ENFORCED)`,
   );
 } else {
   base = "HEAD";
   enforced = false;
   console.log(
-    `check-version-consistency-gate: base=HEAD (FALLBACK: ${PREFERRED} is unavailable in this checkout, ` +
+    `check-version-consistency-gate: base=HEAD (FALLBACK: ${PREFERRED_DISPLAY} is unavailable in this checkout, ` +
       `so the monotonicity-against-the-default-branch half is NOT enforced here; ` +
       `the package.json/package-lock.json AGREEMENT half is enforced regardless)`,
   );
@@ -99,8 +104,8 @@ if (result.error) {
 if (!enforced) {
   console.log(
     "check-version-consistency-gate: note — this run did not compare against " +
-      `${PREFERRED}. To enforce that half explicitly, run: ` +
-      "npm run check:version -- --base origin/master",
+      `${PREFERRED_DISPLAY}. To enforce that half explicitly, run: ` +
+      `npm run check:version -- --base ${PREFERRED}`,
   );
 }
 process.exit(result.status ?? 1);

@@ -14,19 +14,23 @@
  *   node scripts/check-version-consistency.mjs --base <git-ref> [--dir <path>]
  *
  *   --base <ref>  REQUIRED. The ref the current version must not go below,
- *                 normally `origin/master`. Resolved with `git show`.
+ *                 normally `refs/remotes/origin/master`. Resolved with `git show`.
  *   --dir <path>  Directory holding package.json/package-lock.json.
  *                 Defaults to the current working directory.
  *
  * EXIT CODES
  *   0  versions agree and the current version is not below the base's
- *   1  a check failed (disagreement, version regression, unreadable file, or an
- *      unresolvable base ref); every problem found is printed
+ *   1  a check failed (disagreement, version regression, an ambiguous base, an
+ *      unresolvable base, or unreadable files); every problem found is printed
  *   2  usage error (missing --base, unknown flag)
  *
- * FAIL CLOSED: an unresolvable base ref is a FAILURE, never a skip. A check whose
- * precondition does not hold must not report success — "I could not compare" is
- * not "the comparison passed".
+ * FAIL CLOSED, TWICE:
+ *   - an unresolvable base ref is a FAILURE, never a skip — "I could not compare"
+ *     is not "the comparison passed";
+ *   - an AMBIGUOUS bare base name is a FAILURE, never a resolution: git picks one
+ *     ref by precedence (refs/heads before refs/remotes) and only warns, so a
+ *     local branch named `origin/master` can silently become the base. Pass a
+ *     fully-qualified ref (`refs/remotes/origin/master`) to make it unambiguous.
  */
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -61,7 +65,7 @@ function parseArgs(argv) {
     }
   }
   if (!opts.base || opts.base.trim() === "") {
-    usageError("--base is required (for example: --base origin/master)");
+    usageError("--base is required (for example: --base refs/remotes/origin/master)");
   }
   return opts;
 }
@@ -94,6 +98,37 @@ function readJson(dir, name, problems) {
     problems.push(`cannot parse ${name}: ${err.message}`);
     return undefined;
   }
+}
+
+/**
+ * The ref namespaces a bare name can resolve from, in git's own precedence order.
+ * A name matching more than one of them is ambiguous: git picks one and only
+ * prints a warning, so a check can silently compare against a ref the caller
+ * never meant. A local branch named `origin/master` shadowing
+ * `refs/remotes/origin/master` is exactly that case.
+ */
+const RESOLUTION_NAMESPACES = [
+  (n) => `refs/heads/${n}`,
+  (n) => `refs/remotes/${n}`,
+  (n) => `refs/tags/${n}`,
+  (n) => `refs/${n}`,
+];
+
+/** Every existing ref a bare `base` would resolve from. Fully-qualified names cannot be ambiguous. */
+export function ambiguousBaseRefs(dir, base) {
+  if (base.startsWith("refs/")) return [];
+  const found = [];
+  for (const candidate of RESOLUTION_NAMESPACES.map((f) => f(base))) {
+    try {
+      execFileSync("git", ["-C", dir, "rev-parse", "--verify", "--quiet", candidate], {
+        stdio: ["ignore", "ignore", "ignore"],
+      });
+      found.push(candidate);
+    } catch {
+      // This candidate does not exist; not a source of ambiguity.
+    }
+  }
+  return found;
 }
 
 function readBaseVersion(dir, base, problems) {
@@ -147,13 +182,25 @@ if (typeof pkgVersion === "string" && typeof lockRoot === "string" && pkgVersion
   problems.push(`package.json (${pkgVersion}) != package-lock.json packages[""] (${lockRoot})`);
 }
 
-const baseVersion = readBaseVersion(dir, opts.base, problems);
-if (
-  baseVersion !== undefined &&
-  typeof pkgVersion === "string" &&
-  compareVersions(pkgVersion, baseVersion) < 0
-) {
-  problems.push(`version ${pkgVersion} is BELOW ${opts.base} (${baseVersion})`);
+// Ambiguity guard: refuse rather than resolve a bare name by git's precedence.
+const ambiguous = ambiguousBaseRefs(dir, opts.base);
+let baseVersion;
+if (ambiguous.length > 1) {
+  problems.push(
+    `base ref '${opts.base}' is AMBIGUOUS: it resolves to ${ambiguous.join(" and ")}, and git ` +
+      "picks one of them by precedence (refs/heads before refs/remotes) with only a warning. " +
+      "Refusing rather than comparing against a ref you may not have meant; pass a " +
+      `fully-qualified ref, e.g. refs/remotes/${opts.base}`,
+  );
+} else {
+  baseVersion = readBaseVersion(dir, opts.base, problems);
+  if (
+    baseVersion !== undefined &&
+    typeof pkgVersion === "string" &&
+    compareVersions(pkgVersion, baseVersion) < 0
+  ) {
+    problems.push(`version ${pkgVersion} is BELOW ${opts.base} (${baseVersion})`);
+  }
 }
 
 const summary =
