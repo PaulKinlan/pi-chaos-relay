@@ -42,6 +42,7 @@ import {
   APPROVAL_MODES,
   type ApprovalMode,
   loadPersisted,
+  readPersisted,
   normalizeApprovalMode,
   resetPersisted,
   resolveConfig,
@@ -1834,22 +1835,19 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const checks: Array<{ ok: boolean; label: string; detail?: string; fix?: string }> = [];
     const mark = (ok: boolean) => (ok ? "✓" : "✗");
 
-    // 1. Config file exists and parses.
-    let persisted: ReturnType<typeof loadPersisted> = {};
-    let fileOk = true;
-    try {
-      persisted = loadPersisted();
-    } catch (err) {
-      fileOk = false;
-      const message = err instanceof Error ? err.message : String(err);
+    // 1. Config file exists and parses. loadPersisted never throws (a corrupt
+    // file degrades to defaults with a warning), so ask readPersisted which
+    // case we are in rather than treating "did not throw" as "parses".
+    const read = readPersisted();
+    const persisted: ReturnType<typeof loadPersisted> = read.config;
+    if (read.corrupt) {
       checks.push({
         ok: false,
         label: "config file parses",
-        detail: message,
+        detail: read.corrupt.reason,
         fix: "Run /chaos-relay reset all, then /chaos-relay setup.",
       });
-    }
-    if (fileOk) {
+    } else {
       checks.push({
         ok: true,
         label: `config file (${getConfigPath()})`,

@@ -47,7 +47,10 @@ setup prompt rejects these, but old corrupted configs still exist.)
 
 ### Config file won't parse
 `~/.pi/chaos-relay.json` is corrupt JSON (hand-edited, partial write, merge
-conflict).
+conflict). This no longer breaks the bridge: the file is ignored with one
+warning naming the path and the parse error, and the extension runs on defaults
+— so `doctor` reports **Config file parses** ✗ while delivery still works
+unconfigured rather than crashing.
 
 **Fix:** `/chaos-relay reset all`, then `/chaos-relay setup` or
 `/chaos-relay connect <value>`.

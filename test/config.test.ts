@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync, copyFileSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync, copyFileSync, mkdirSync, rmdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import {
   DEFAULT_RELAY_URL,
   MIN_POLL_INTERVAL_MS,
@@ -13,6 +14,8 @@ import {
   isConfigured,
   isValidRelayUrl,
   loadPersisted,
+  readPersisted,
+  setActiveConfigPath,
   normalizeApprovalMode,
   resetPersisted,
   resolveConfig,
@@ -304,6 +307,40 @@ function withConfigIsolated(fn: () => void): void {
   }
 }
 
+/**
+ * Run `fn` with the active config path pointed at a fresh temp file and with
+ * `console.warn` captured. Each case gets its own path, which keeps the
+ * module's once-per-reason warning dedupe from letting one case suppress
+ * another — and keeps these tests off the user's real ~/.pi config.
+ */
+let tempConfigCounter = 0;
+function withTempConfig(fn: (path: string, warnings: string[]) => void): void {
+  const previous = getConfigPath();
+  const path = join(tmpdir(), `chaos-relay-test-${process.pid}-${tempConfigCounter++}.json`);
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map((a) => String(a)).join(" "));
+  };
+  setActiveConfigPath(path);
+  try {
+    fn(path, warnings);
+  } finally {
+    console.warn = originalWarn;
+    setActiveConfigPath(previous);
+    if (existsSync(path)) unlinkSync(path);
+  }
+}
+
+/** Env vars resolveConfig reads, neutralised so a corrupt-file case is isolated. */
+const NO_RELAY_ENV = {
+  CHAOS_RELAY_URL: undefined,
+  CHAOS_RELAY_API_KEY: undefined,
+  CHAOS_RELAY_AGENT_ID: undefined,
+  CHAOS_RELAY_POLL_MS: undefined,
+  CHAOS_RELAY_APPROVAL_MODE: undefined,
+};
+
 test("resetPersisted('url') clears only relayUrl, keeps credentials + channels", () => {
   withConfigIsolated(() => {
     // Seed a config with a corrupted URL plus valid creds and a channel.
@@ -344,6 +381,114 @@ test("loadPersisted tolerates an empty/truncated config file (no crash)", () => 
   });
 });
 
+test("readPersisted: an empty file recovers silently, with no warning", () => {
+  withTempConfig((path, warnings) => {
+    writeFileSync(path, "");
+    withEnv(NO_RELAY_ENV, () => {
+      const read = readPersisted();
+      assert.deepEqual(read.config, {});
+      assert.equal(read.corrupt, undefined);
+      // Empty/whitespace is the documented truncation artifact: silent recovery.
+      assert.deepEqual(warnings, []);
+      assert.equal(resolveConfig().relayUrl, DEFAULT_RELAY_URL);
+    });
+  });
+});
+
+test("readPersisted: truncated JSON degrades to defaults with one warning", () => {
+  withTempConfig((path, warnings) => {
+    // A partial write / hand-edit that lost its tail.
+    writeFileSync(path, '{ "relayUrl": "https://x.example.com", "apiKey": "sk-1');
+    withEnv(NO_RELAY_ENV, () => {
+      const read = readPersisted();
+      assert.deepEqual(read.config, {});
+      assert.match(read.corrupt!.reason, /Failed to parse/);
+      assert.ok(read.corrupt!.reason.includes(path));
+      // The warning names the path and the parse error.
+      assert.equal(warnings.length, 1);
+      assert.ok(warnings[0].includes(path));
+      assert.match(warnings[0], /Failed to parse/);
+      // resolveConfig does not throw and returns the absent-file defaults.
+      const cfg = resolveConfig();
+      assert.equal(cfg.relayUrl, DEFAULT_RELAY_URL);
+      assert.equal(cfg.agentId, "pi");
+      assert.equal(cfg.apiKey, undefined);
+      assert.deepEqual(cfg.channels, []);
+      assert.equal(isConfigured(cfg), false);
+      // loadPersisted runs on the message path — it must warn once, not per read.
+      loadPersisted();
+      loadPersisted();
+      assert.equal(warnings.length, 1);
+    });
+  });
+});
+
+test("readPersisted: garbage non-JSON content degrades to defaults with one warning", () => {
+  withTempConfig((path, warnings) => {
+    writeFileSync(path, "this is not json at all\n");
+    withEnv(NO_RELAY_ENV, () => {
+      const read = readPersisted();
+      assert.deepEqual(read.config, {});
+      assert.match(read.corrupt!.reason, /Failed to parse/);
+      assert.equal(warnings.length, 1);
+      assert.ok(warnings[0].includes(path));
+      assert.equal(resolveConfig().relayUrl, DEFAULT_RELAY_URL);
+      // A corrupt file must not outrank env: precedence is still env > file.
+      withEnv({ CHAOS_RELAY_URL: "https://env.example.com" }, () => {
+        assert.equal(resolveConfig().relayUrl, "https://env.example.com");
+      });
+    });
+  });
+});
+
+test("readPersisted: valid JSON that is not an object degrades to defaults", () => {
+  // Each of these parses as JSON but has no config fields — `null` would throw
+  // in resolveConfig (reading a property off null) if it were passed through.
+  for (const content of ["null", "[]", "42", '"hello"']) {
+    withTempConfig((path, warnings) => {
+      writeFileSync(path, content);
+      withEnv(NO_RELAY_ENV, () => {
+        const read = readPersisted();
+        assert.deepEqual(read.config, {});
+        assert.match(read.corrupt!.reason, /expected a JSON object/);
+        assert.equal(warnings.length, 1);
+        const cfg = resolveConfig();
+        assert.equal(cfg.relayUrl, DEFAULT_RELAY_URL);
+        assert.equal(cfg.agentId, "pi");
+      });
+    });
+  }
+});
+
+test("readPersisted: a read error that is not ENOENT degrades to defaults", () => {
+  // existsSync is true but readFileSync fails (EISDIR) — this used to escape as
+  // a raw fs error out of resolveConfig.
+  withTempConfig((path, warnings) => {
+    mkdirSync(path);
+    withEnv(NO_RELAY_ENV, () => {
+      const read = readPersisted();
+      assert.deepEqual(read.config, {});
+      assert.match(read.corrupt!.reason, /Failed to read/);
+      assert.equal(warnings.length, 1);
+      assert.equal(resolveConfig().relayUrl, DEFAULT_RELAY_URL);
+    });
+    rmdirSync(path);
+  });
+});
+
+test("readPersisted: a missing file stays silent (no warning, no corruption flag)", () => {
+  withTempConfig((path, warnings) => {
+    assert.equal(existsSync(path), false);
+    withEnv(NO_RELAY_ENV, () => {
+      const read = readPersisted();
+      assert.deepEqual(read.config, {});
+      assert.equal(read.corrupt, undefined);
+      assert.deepEqual(warnings, []);
+      assert.equal(resolveConfig().relayUrl, DEFAULT_RELAY_URL);
+    });
+  });
+});
+
 test("savePersisted onto a truncated file still lands the update", () => {
   withConfigIsolated(() => {
     writeFileSync(getConfigPath(), "");
@@ -363,9 +508,9 @@ test("savePersisted writes atomically and leaves no temp files behind", () => {
     const name = basename(getConfigPath());
     const leftovers = readdirSync(dir).filter((f) => f.startsWith(`${name}.tmp.`));
     assert.deepEqual(leftovers, []);
-    // A genuinely corrupt (non-empty, unparseable) file still surfaces loudly —
-    // we only recover from the unambiguous empty case.
+    // A genuinely corrupt (non-empty, unparseable) file no longer throws: it
+    // degrades to defaults and warns (see the readPersisted cases above).
     writeFileSync(getConfigPath(), "{ not json");
-    assert.throws(() => loadPersisted(), /Failed to parse/);
+    assert.deepEqual(loadPersisted(), {});
   });
 });
