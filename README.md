@@ -396,7 +396,12 @@ Terminal/local turns are never gated.
 While a pi session is active, the extension holds a **WebSocket** to the relay
 and receives messages the instant they arrive. A slow background **safety poll**
 (every ~120s) runs only as a backstop in case a push is missed between
-reconnects. New messages are de-duplicated by id — and that de-dup log is
+reconnects. Reconnects back off exponentially (2s→4s→…→30s), and the fast
+first retry is earned, not given: the backoff only resets once a connection
+has stayed open for 30 seconds, so a relay that accepts the WebSocket and
+immediately drops it gets the full exponential curve instead of hammering a
+2-second reconnect floor forever. New messages are de-duplicated by id — and
+that de-dup log is
 **persisted** (in a small side-car `<config>.state` file next to the config,
 written once per delivery batch), so the relay's on-connect
 replay (a 5-minute lookback it sends every time the WebSocket connects) never

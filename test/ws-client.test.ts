@@ -722,10 +722,14 @@ test("a socket that opens and immediately dies keeps the exponential backoff", (
 
   h.last().open(); // opens…
   h.last().drop(1006); // …and dies immediately (inside the stability window)
-  // attempt 2: 4000ms — the open-then-die did NOT reset the backoff.
-  t.mock.timers.tick(1_999);
+  // attempt 2 is scheduled at 4000ms — the open-then-die did NOT reset the
+  // backoff. Probe INSIDE (2000ms, 4000ms): the pre-fix code reconnected at
+  // 2000ms, so ticking only to 1999ms/4000ms would let this test pass against
+  // the unfixed code (review finding: the assertion interval must exclude the
+  // reset-at-open delay).
+  t.mock.timers.tick(3_999);
   assert.equal(h.sockets.length, 2, "reconnected before the doubled backoff elapsed");
-  t.mock.timers.tick(2_001);
+  t.mock.timers.tick(1);
   assert.equal(h.sockets.length, 3);
 
   h.ws.stop();
