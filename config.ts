@@ -521,18 +521,17 @@ function envInt(name: string): number | undefined {
  *   CHAOS_RELAY_CONFIG    — explicit config file path (see configPathFor)
  */
 export function resolveConfig(persisted = loadPersisted()): ResolvedConfig {
-  // Validate at the chokepoint: env > file > default, but fall back to the
-  // default if the chosen value isn't an absolute http(s) URL. This prevents a
-  // malformed value (e.g. a command accidentally pasted into the URL field)
-  // from ever reaching fetch() and throwing "Failed to parse URL".
-  const candidateUrl = process.env.CHAOS_RELAY_URL ?? persisted.relayUrl ?? DEFAULT_RELAY_URL;
-  let relayUrl = candidateUrl;
-  if (!isValidRelayUrl(candidateUrl)) {
-    // Invalid relay URL: fall back to the default silently. (We previously
-    // warned to stderr here, but that renders in the pi TUI input area; the
-    // fallback behaviour is enough — run /chaos-relay setup to fix.)
-    relayUrl = DEFAULT_RELAY_URL;
-  }
+  // Pick the FIRST VALID candidate in precedence order (env > file > default).
+  // Each candidate is validated, not just the ??-winner: a set-but-invalid env
+  // value must not win the chain, fail validation, and then fall back to the
+  // default — that silently discarded a valid persisted self-hosted URL. Skipping
+  // a malformed value (e.g. a command accidentally pasted into the URL field)
+  // also prevents it from ever reaching fetch() and throwing "Failed to parse
+  // URL". DEFAULT_RELAY_URL is always valid, so the find always resolves.
+  const relayUrl =
+    [process.env.CHAOS_RELAY_URL, persisted.relayUrl, DEFAULT_RELAY_URL].find(
+      (candidate) => isValidRelayUrl(candidate),
+    ) ?? DEFAULT_RELAY_URL;
   const apiKey = process.env.CHAOS_RELAY_API_KEY ?? persisted.apiKey;
   const agentId = process.env.CHAOS_RELAY_AGENT_ID ?? persisted.agentId ?? "pi";
 

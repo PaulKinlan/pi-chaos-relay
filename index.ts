@@ -365,6 +365,29 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     );
   }
 
+  /** Warning when CHAOS_RELAY_URL is set but malformed and a valid persisted URL
+   *  exists — resolveConfig uses the persisted URL, but the operator should know
+   *  their env value is being ignored. */
+  function invalidEnvIgnoredWarning(value: string, used: string): string {
+    return (
+      `CHAOS_RELAY_URL is set to an invalid value "${value}" (must be an absolute ` +
+      `http(s):// URL) — ignoring it and using the persisted relay ${used}. ` +
+      `Fix CHAOS_RELAY_URL to make it take effect.`
+    );
+  }
+
+  /** Warning + refusal when CHAOS_RELAY_URL is malformed and no persisted URL
+   *  exists: auto-provisioning would otherwise mint an identity against the
+   *  production default, which the operator clearly did not intend. */
+  function invalidEnvRefusal(value: string): string {
+    return (
+      `CHAOS_RELAY_URL is set to an invalid value "${value}" (must be an absolute ` +
+      `http(s):// URL) and no relay URL is configured — refusing to auto-provision ` +
+      `an identity against the default relay. Fix CHAOS_RELAY_URL or run ` +
+      `/chaos-relay setup.`
+    );
+  }
+
   /**
    * Like {@link ensureClient}, but if the relay isn't configured yet it
    * auto-provisions a session (ECDSA keypair at the default relay URL) WITHOUT
@@ -391,14 +414,28 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // own relay.
     const relayUrl = resolveConfig(persisted).relayUrl;
 
-    // Loud warning when registration targets a URL the operator never configured
-    // (no CHAOS_RELAY_URL and no persisted relayUrl → the default relay). A fresh
-    // profile would otherwise silently mint an identity + apiKey against
-    // chaos-relay.com.
-    const envUrl = process.env.CHAOS_RELAY_URL ?? "";
-    const persistedUrl = persisted.relayUrl ?? "";
-    const operatorConfiguredUrl = isValidRelayUrl(envUrl) || isValidRelayUrl(persistedUrl);
-    if (!operatorConfiguredUrl) {
+    // Loud warnings around the registration URL. Three distinct states:
+    //  - env set but INVALID + no valid persisted URL → refuse (auto-provisioning
+    //    would silently mint against the production default the operator did not
+    //    intend, so never register on a malformed env value);
+    //  - env set but INVALID + valid persisted URL → warn, then use the persisted
+    //    URL (resolveConfig already picked it over the malformed env);
+    //  - nothing configured anywhere → warn, then use the documented default.
+    const envRaw = process.env.CHAOS_RELAY_URL ?? "";
+    const envSet = envRaw.trim() !== "";
+    const envValid = isValidRelayUrl(envRaw);
+    const persistedValid = isValidRelayUrl(persisted.relayUrl ?? "");
+    if (envSet && !envValid) {
+      if (!persistedValid) {
+        const warning = invalidEnvRefusal(envRaw);
+        log(`WARN: ${warning}`);
+        notify?.(warning);
+        return undefined;
+      }
+      const warning = invalidEnvIgnoredWarning(envRaw, relayUrl);
+      log(`WARN: ${warning}`);
+      notify?.(warning);
+    } else if (!envSet && !persistedValid) {
       const warning = unconfiguredRelayWarning(relayUrl);
       log(`WARN: ${warning}`);
       notify?.(warning);
