@@ -439,10 +439,11 @@ let tmpCounter = 0;
  * Crash residual, stated rather than glossed: this is atomic-replace, not
  * crash-without-trace. If the process dies between the temp write and the
  * rename, an inert `<target>.tmp.<pid>.<n>` orphan is left beside the target
- * and the PREVIOUS complete file survives at the target (a later batch may
- * therefore replay after restart — the de-dup log's job). The chmod to 0600
- * is best-effort: on filesystems that reject it the file keeps the temp
- * file's default mode. Neither residual affects a concurrent reader.
+ * and the PREVIOUS complete file survives at the target, if one existed (on a
+ * first-ever write there is no previous file, so the target is simply absent
+ * and a later batch may replay after restart — the de-dup log's job). The
+ * chmod to 0600 is best-effort: on filesystems that reject it the file keeps
+ * the temp file's default mode. Neither residual affects a concurrent reader.
  */
 function atomicWriteSync(path: string, contents: string): void {
   // Ensure the target's directory exists (the config may live outside ~/.pi
@@ -607,6 +608,14 @@ let stateMigrated = false;
  * `seenMessageIds` out of the config so later config writes stop re-serializing
  * the (potentially 1000-id) de-dup log. The migration flag resets on profile
  * switches so each active config gets its own one-time pass.
+ *
+ * Residual, documented not fixed: the backfill can only diagnose a side-car
+ * loss that happens AFTER the tombstone exists. A profile that migrated
+ * BEFORE the tombstone was introduced, and whose side-car was lost BEFORE its
+ * first post-upgrade flush, still resets de-dup silently once — that loss
+ * precedes the tombstone that would have made it loud, and there is no cheap
+ * way to tell a never-yet-flushed profile from a lost one. The tombstone
+ * makes every LATER loss loud.
  */
 export function saveMessageState(state: MessageTrackingState): void {
   atomicWriteSync(
@@ -614,7 +623,6 @@ export function saveMessageState(state: MessageTrackingState): void {
     JSON.stringify({ cursor: state.cursor, seenIds: state.seenIds }, null, 2) + "\n",
   );
   if (stateMigrated) return;
-  stateMigrated = true;
   const persisted = loadPersisted();
   // One-time pass per process/profile: strip any legacy in-config fields, and
   // make sure the tombstone exists even for profiles that migrated before the
@@ -631,6 +639,14 @@ export function saveMessageState(state: MessageTrackingState): void {
       messageStateMigrated: true,
     });
   }
+  // Arm the flag ONLY after the tombstone config write succeeded. Arming it
+  // before (as a prior revision did) would make a FAILED write — after the
+  // side-car write already succeeded — silently skip migration on every later
+  // batch, leaving the tombstone unwritten so a subsequent side-car loss
+  // resets de-dup silently: exactly the failure the tombstone exists to make
+  // loud. If savePersisted throws above, stateMigrated stays false and the
+  // next batch retries the one-time pass.
+  stateMigrated = true;
 }
 
 /** Persist the tool-approval policy. */
