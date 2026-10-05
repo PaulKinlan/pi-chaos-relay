@@ -634,6 +634,38 @@ test("stop cancels a scheduled reconnect", async () => {
   assert.equal(h.ws.connected, false);
 });
 
+test("stop is safe before start and when called twice", () => {
+  const h = harness();
+  assert.doesNotThrow(() => h.ws.stop());
+  assert.equal(h.sockets.length, 0, "stop did not open a socket");
+
+  h.ws.start();
+  h.last().open();
+  h.ws.stop();
+  assert.doesNotThrow(() => h.ws.stop(), "a second stop threw");
+  assert.equal(h.last().closeCalls, 1, "was the socket closed once");
+  assert.equal(h.ws.connected, false);
+});
+
+test("a socket error is logged and left to the close handler", async () => {
+  const h = harness({ maxBackoffMs: 0 });
+  h.ws.start();
+  const socket = h.last();
+  socket.open();
+
+  assert.doesNotThrow(() => socket.onerror?.({ type: "error" }));
+  assert.ok(
+    h.logs.some((l) => l.includes("WebSocket error")),
+    `expected an error log, saw ${JSON.stringify(h.logs)}`,
+  );
+  // The transport deliberately does not reconnect from onerror — a real socket
+  // follows an error with onclose, and that is what schedules the reconnect.
+  await flush(20);
+  assert.equal(h.sockets.length, 1, "onerror opened a second socket");
+  assert.equal(h.ws.connected, true, "onerror did not tear down the socket");
+  h.ws.stop();
+});
+
 // --- reconnect backoff -----------------------------------------------------
 
 test("backoff doubles per attempt while the handshake keeps failing", (t) => {
