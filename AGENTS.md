@@ -34,6 +34,8 @@ npx tsc --noEmit     # type-check (no emit)
 npm test             # node --test over test/*.test.ts
 ```
 
+`npm ci` (or `npm install`) must run before the `npx tsc --noEmit` gate, which needs the `typescript` devDependency — without it `npx` instead runs the unrelated `tsc@2.0.4` package and reports "This is not the tsc command you are looking for"; `npm test` needs no install.
+
 Both must be green. Add or update tests for behavior changes.
 
 ## Keep docs in sync — in the SAME commit
