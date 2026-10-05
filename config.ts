@@ -129,6 +129,40 @@ export function chooseProfile(opts: {
   return "default";
 }
 
+export type ProfileLockOutcome =
+  | { action: "connect"; profile: string }
+  | { action: "refuse"; profile: string; pid: number | null; message: string };
+
+/**
+ * Pure decision for the profile-lock collision path: given the profile a session
+ * chose and whether another live process holds its lock, either connect on that
+ * profile or refuse (never mint a new identity).
+ *
+ * Refusing is deliberate. Auto-creating `hostname-pid` on every collision
+ * produced unbounded config files — each one a fresh keypair and relay identity —
+ * and could silently put an operator on an identity they never chose. The
+ * refusal names both the profile and its lock file, and says how to resolve it.
+ * Exported so the collision path is unit-testable without the pi runtime.
+ */
+export function resolveProfileLockCollision(opts: {
+  profile: string;
+  locked: boolean;
+  pid?: number | null;
+  lockPath: string;
+}): ProfileLockOutcome {
+  if (!opts.locked) return { action: "connect", profile: opts.profile };
+  const pid = opts.pid ?? null;
+  const holder =
+    pid === null ? "another live pi session" : `another live pi session (PID ${pid})`;
+  const message =
+    `Relay profile "${opts.profile}" is already held by ${holder}. ` +
+    `Lock file: ${opts.lockPath}. ` +
+    `This session will not switch to a new identity. ` +
+    `Resolve it by closing that session, or give this one its own profile: ` +
+    `launch with CHAOS_RELAY_PROFILE=<name> pi, or run /chaos-relay profile <name> here.`;
+  return { action: "refuse", profile: opts.profile, pid, message };
+}
+
 /** Persist `sessionId → profile` (best-effort). Bounded by an LRU cap. */
 export function setSessionProfile(sessionId: string | undefined, profile: string): void {
   if (!sessionId) return;

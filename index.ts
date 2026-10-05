@@ -29,7 +29,7 @@ import {
 } from "./relay-client.ts";
 import { readFileSync, appendFileSync, mkdirSync, existsSync, writeFileSync, unlinkSync } from "node:fs";
 import { basename, join } from "node:path";
-import { homedir, hostname } from "node:os";
+import { homedir } from "node:os";
 import {
   cleanupStaleInboundAttachments,
   materializeInboundAttachments,
@@ -61,6 +61,7 @@ import {
   getSessionProfile,
   setSessionProfile,
   chooseProfile,
+  resolveProfileLockCollision,
   type ResolvedConfig,
   type RegisteredChannelRecord,
 } from "./config.ts";
@@ -135,16 +136,15 @@ function writeProfileLock(profile: string): void {
   try { writeFileSync(lockFilePath(profile), String(process.pid)); } catch { /* ignore */ }
 }
 
-/** Release the profile lock on shutdown. */
+/** Release the profile lock on shutdown — but only a lock this process wrote.
+ *  A session that refused a collision stays bound to its previous profile name,
+ *  and must not unlock the session that legitimately holds it. */
 function removeProfileLock(profile: string): void {
-  try { unlinkSync(lockFilePath(profile)); } catch { /* ignore */ }
-}
-
-/** Generate a unique profile name for a concurrent session. */
-function generateUniqueProfileName(): string {
-  const host = hostname().split(".")[0].toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 12) || "pi";
-  const shortPid = (process.pid % 10000).toString(36);
-  return `${host}-${shortPid}`;
+  try {
+    const path = lockFilePath(profile);
+    if (readFileSync(path, "utf-8").trim() !== String(process.pid)) return;
+    unlinkSync(path);
+  } catch { /* ignore */ }
 }
 
 /** Wrap text content into the AgentToolResult shape pi expects. */
@@ -671,36 +671,34 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     }
     activeModelAcceptsImages = ctx.model?.input?.includes("image") ?? false;
     currentSessionId = ctx.sessionManager.getSessionId();
-    let profile = chooseProfileForSession(event.reason, currentSessionId);
+    const chosenProfile = chooseProfileForSession(event.reason, currentSessionId);
 
-    // Detect concurrent pi instances on the same relay profile. If another
-    // live process holds the lock, auto-create a new profile so both sessions
-    // get independent push delivery (otherwise the WebSocket conflict means
-    // only one session receives real-time messages).
-    const lock = checkProfileLock(profile);
-    let autoCreated = false;
-    if (lock.locked) {
-      const newProfile = generateUniqueProfileName();
-      log(`another pi instance (PID ${lock.pid}) holds relay profile "${profile}"; auto-creating "${newProfile}"`);
-      profile = newProfile;
-      autoCreated = true;
+    // Detect concurrent pi instances on the same relay profile. Two live
+    // sessions on one profile fight over the WebSocket push, but auto-creating a
+    // fresh identity to dodge the collision mints a config file, keypair and
+    // relay session the operator never chose — and one per collision, unbounded.
+    // Refuse instead: name the profile and its lock file, and stay on the
+    // previous profile (or unbound) rather than silently switching identity.
+    const lock = checkProfileLock(chosenProfile);
+    const decision = resolveProfileLockCollision({
+      profile: chosenProfile,
+      locked: lock.locked,
+      pid: lock.pid,
+      lockPath: lockFilePath(chosenProfile),
+    });
+    if (decision.action === "refuse") {
+      log(`session ${event.reason}: ${decision.message}`);
+      ctx.ui.notify(decision.message, "warning");
+      return;
     }
+    const profile = decision.profile;
 
     const result = await connectAsProfile(profile);
     if (!result.connected) {
       log(`session ${event.reason}: selected profile "${profile}" but couldn't connect (will retry on next poll)`);
     } else {
       writeProfileLock(profile);
-      if (autoCreated) {
-        log(`session ${event.reason}: connected as auto-created profile "${profile}" (another instance held the original)`);
-        ctx.ui.notify(
-          `Another pi session was already using relay profile. ` +
-          `Auto-created a new profile "${profile}" for this session so both receive messages independently.`,
-          "info",
-        );
-      } else {
-        log(`session ${event.reason}: connected as profile "${profile}"`);
-      }
+      log(`session ${event.reason}: connected as profile "${profile}"`);
     }
   });
 

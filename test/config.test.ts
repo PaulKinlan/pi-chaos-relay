@@ -19,6 +19,7 @@ import {
   normalizeApprovalMode,
   resetPersisted,
   resolveConfig,
+  resolveProfileLockCollision,
   savePersisted,
 } from "../config.ts";
 
@@ -131,6 +132,53 @@ test("chooseProfile: recorded beats inherit on new/fork", () => {
     chooseProfile({ reason: "fork", recordedProfile: "home", inheritedProfile: "work" }),
     "home",
   );
+});
+
+test("resolveProfileLockCollision: no lock → connect on the chosen profile", () => {
+  // Negative control: an ordinary startup resolves to the session's persisted
+  // profile, and the unlocked path hands exactly that name back — the extension
+  // connects as it, and mints no new identity.
+  const persisted = chooseProfile({ reason: "resume", recordedProfile: "work" });
+  const outcome = resolveProfileLockCollision({
+    profile: persisted,
+    locked: false,
+    pid: null,
+    lockPath: "/cfg/chaos-relay.work.lock",
+  });
+  assert.deepEqual(outcome, { action: "connect", profile: "work" });
+});
+
+test("resolveProfileLockCollision: a held lock refuses on the same profile (no new identity)", () => {
+  const outcome = resolveProfileLockCollision({
+    profile: "default",
+    locked: true,
+    pid: 12345,
+    lockPath: "/home/me/.pi/chaos-relay-default.lock",
+  });
+  assert.ok(outcome.action === "refuse", "a held lock must refuse, not connect");
+  // The profile is never replaced by a freshly minted hostname-pid.
+  assert.equal(outcome.profile, "default");
+  assert.equal(outcome.pid, 12345);
+  // Actionable: names the profile, the lock file, the holder, and both fixes.
+  assert.match(outcome.message, /"default"/);
+  assert.match(outcome.message, /\/home\/me\/\.pi\/chaos-relay-default\.lock/);
+  assert.match(outcome.message, /PID 12345/);
+  assert.match(outcome.message, /CHAOS_RELAY_PROFILE/);
+  assert.match(outcome.message, /\/chaos-relay profile/);
+});
+
+test("resolveProfileLockCollision: unknown holder still refuses without inventing a PID", () => {
+  const outcome = resolveProfileLockCollision({
+    profile: "work",
+    locked: true,
+    pid: null,
+    lockPath: "/cfg/chaos-relay.work.lock",
+  });
+  assert.ok(outcome.action === "refuse", "a held lock must refuse, not connect");
+  assert.equal(outcome.profile, "work");
+  assert.equal(outcome.pid, null);
+  assert.match(outcome.message, /"work"/);
+  assert.doesNotMatch(outcome.message, /PID (null|undefined|NaN)/);
 });
 
 /** Snapshot and restore the env vars these tests touch. */
