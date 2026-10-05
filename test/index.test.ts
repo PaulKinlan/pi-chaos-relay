@@ -523,11 +523,19 @@ test("auto-provision falls through to persisted relayUrl when CHAOS_RELAY_URL is
   };
   assert.equal(persisted.relayUrl, localUrl, "persisted relayUrl unchanged");
   assert.equal(persisted.apiKey, "ak_persisted", "persisted the local relay's apiKey");
-  // The malformed env value was called out by name, not described as "unconfigured".
+  // The invalid-env state is called out (reason + persisted fallback), without
+  // echoing the malformed value itself.
   const warned = notifications.some(
-    (n) => n.level === "warning" && /invalid value "not a url"/.test(n.message),
+    (n) =>
+      n.level === "warning" &&
+      /not an absolute http\(s\):\/\/ URL/.test(n.message) &&
+      n.message.includes("persisted relay"),
   );
-  assert.ok(warned, `warning named the malformed env value (${JSON.stringify(notifications)})`);
+  assert.ok(warned, `warning named the invalid-env state (${JSON.stringify(notifications)})`);
+  assert.ok(
+    !notifications.some((n) => n.message.includes("not a url")),
+    `the malformed value was not echoed (${JSON.stringify(notifications)})`,
+  );
 });
 
 test("a configured profile never re-registers (no POST /auth/register)", async (t) => {
@@ -657,4 +665,111 @@ test("auto-provision warns loudly when no relay URL is configured anywhere", asy
   assert.ok(warned, `warning surfaced to the user (${JSON.stringify(fake.notifications)})`);
   // Nothing was registered: the fetch stub threw, so no config file was written.
   assert.equal(existsSync(configPath), false, "no config/identity was persisted");
+});
+
+test("a malformed CHAOS_RELAY_URL is never echoed and refuses without a fetch", async (t) => {
+  resetState();
+  const configPath = join(PI_DIR, "chaos-relay.json");
+  if (existsSync(configPath)) unlinkSync(configPath);
+
+  // A secret-shaped, malformed value: the warning must name the VARIABLE and
+  // the reason, never the value — it reaches both the TUI and the durable log.
+  const secret = "sk-secret-pasted-token-1234567890";
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  process.env.CHAOS_RELAY_URL = secret;
+  let fetchCalls = 0;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = ((..._a: unknown[]) => {
+    fetchCalls++;
+    return Promise.reject(new Error("should not be called"));
+  }) as unknown as typeof fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(
+    fake.handlers,
+    "session_start",
+    { reason: "startup" },
+    makeCtx("sess-secret", fake.notifications),
+  );
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-secret", fake.notifications)));
+
+  const warned = fake.notifications.some(
+    (n) => n.level === "warning" && /not an absolute http\(s\):\/\/ URL/.test(n.message),
+  );
+  assert.ok(warned, `warning fired (${JSON.stringify(fake.notifications)})`);
+  // The malformed value never appears in any notification…
+  for (const n of fake.notifications) {
+    assert.ok(!n.message.includes(secret), `notification must not echo the env value: ${n.message}`);
+  }
+  // …nor in the durable log file.
+  const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+  const logRaw = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+  assert.ok(!logRaw.includes(secret), "log file must not echo the env value");
+  // The refusal returns before any registration, so fetch was never called.
+  assert.equal(fetchCalls, 0, "no fetch attempt on the refusal path");
+  assert.equal(existsSync(configPath), false, "no config/identity was persisted");
+});
+
+test("auto-provision trims surrounding whitespace from CHAOS_RELAY_URL", async (t) => {
+  resetState();
+  const configPath = join(PI_DIR, "chaos-relay.json");
+  if (existsSync(configPath)) unlinkSync(configPath);
+
+  const seenPaths: string[] = [];
+  const server = createServer((req, res) => {
+    seenPaths.push(req.url ?? "");
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url === "/auth/register") res.end(JSON.stringify({ userId: "u_ws", apiKey: "ak_ws" }));
+      else if (req.url === "/channels/telegram/register") res.end(JSON.stringify({ channelId: "ch_ws", botUsername: "wsbot", pairingCode: "7" }));
+      else res.end(JSON.stringify({}));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const port = (server.address() as { port: number }).port;
+  const trimmedUrl = `http://127.0.0.1:${port}`;
+
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  process.env.CHAOS_RELAY_URL = `  ${trimmedUrl}  `; // surrounding whitespace
+  const prevFetch = blockNonLoopbackFetch();
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = prevFetch;
+  });
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-ws", fake.notifications)));
+  const tg = fake.tools.find((tool) => tool.name === "relay_register_telegram");
+  assert.ok(tg, "extension registers relay_register_telegram");
+  const execute = tg.execute as (
+    id: string,
+    params: { botToken: string },
+    signal: unknown,
+    onUpdate: unknown,
+    ctx: unknown,
+  ) => Promise<unknown>;
+  await execute("t1", { botToken: "123:ABC" }, undefined, undefined, {
+    ui: { notify: () => {} },
+  });
+
+  assert.ok(
+    seenPaths.includes("/auth/register"),
+    `registration reached the trimmed relay URL (saw ${JSON.stringify(seenPaths)})`,
+  );
+  const persisted = JSON.parse(readFileSync(configPath, "utf-8")) as {
+    relayUrl?: string;
+    apiKey?: string;
+  };
+  assert.equal(persisted.relayUrl, trimmedUrl, "persisted the TRIMMED relay URL (no surrounding spaces)");
 });

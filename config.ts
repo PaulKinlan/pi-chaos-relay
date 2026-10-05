@@ -527,11 +527,15 @@ export function resolveConfig(persisted = loadPersisted()): ResolvedConfig {
   // default — that silently discarded a valid persisted self-hosted URL. Skipping
   // a malformed value (e.g. a command accidentally pasted into the URL field)
   // also prevents it from ever reaching fetch() and throwing "Failed to parse
-  // URL". DEFAULT_RELAY_URL is always valid, so the find always resolves.
-  const relayUrl =
+  // URL". The selected value is TRIMMED: isValidRelayUrl validates url.trim(),
+  // so a value with surrounding whitespace would otherwise be returned (and
+  // persisted) with the space, breaking fetch and the WebSocket URL.
+  // DEFAULT_RELAY_URL is always valid, so the find always resolves.
+  const relayUrl = (
     [process.env.CHAOS_RELAY_URL, persisted.relayUrl, DEFAULT_RELAY_URL].find(
       (candidate) => isValidRelayUrl(candidate),
-    ) ?? DEFAULT_RELAY_URL;
+    ) ?? DEFAULT_RELAY_URL
+  ).trim();
   const apiKey = process.env.CHAOS_RELAY_API_KEY ?? persisted.apiKey;
   const agentId = process.env.CHAOS_RELAY_AGENT_ID ?? persisted.agentId ?? "pi";
 

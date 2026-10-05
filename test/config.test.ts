@@ -346,6 +346,24 @@ test("resolveConfig keeps a valid persisted relayUrl when env is unset", () => {
   });
 });
 
+test("resolveConfig trims surrounding whitespace from the selected URL", () => {
+  // isValidRelayUrl validates url.trim(), so a value with surrounding
+  // whitespace passes validation — the SELECTED value must then be returned
+  // trimmed, or fetch/WebSocket get a URL with a trailing space baked in.
+  withEnv(
+    { CHAOS_RELAY_URL: "  http://127.0.0.1:8787  ", CHAOS_RELAY_API_KEY: undefined },
+    () => {
+      assert.equal(resolveConfig({}).relayUrl, "http://127.0.0.1:8787");
+    },
+  );
+  withEnv({ CHAOS_RELAY_URL: undefined }, () => {
+    assert.equal(
+      resolveConfig({ relayUrl: "  https://persisted.example.com  " }).relayUrl,
+      "https://persisted.example.com",
+    );
+  });
+});
+
 /**
  * Back up the user's real config file to a temp path, run `fn`, then restore it
  * (or remove it if it didn't exist before). Lets us test the file-writing

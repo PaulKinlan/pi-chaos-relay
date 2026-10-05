@@ -367,24 +367,25 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
   /** Warning when CHAOS_RELAY_URL is set but malformed and a valid persisted URL
    *  exists — resolveConfig uses the persisted URL, but the operator should know
-   *  their env value is being ignored. */
-  function invalidEnvIgnoredWarning(value: string, used: string): string {
+   *  their env value is being ignored. Deliberately does NOT echo the env value:
+   *  a malformed URL can be a pasted secret/command, and this text reaches both
+   *  the durable log and the TUI. */
+  function invalidEnvIgnoredWarning(used: string): string {
     return (
-      `CHAOS_RELAY_URL is set to an invalid value "${value}" (must be an absolute ` +
-      `http(s):// URL) — ignoring it and using the persisted relay ${used}. ` +
-      `Fix CHAOS_RELAY_URL to make it take effect.`
+      `CHAOS_RELAY_URL is set but is not an absolute http(s):// URL — ignoring it ` +
+      `and using the persisted relay ${used}. Fix CHAOS_RELAY_URL to make it take effect.`
     );
   }
 
   /** Warning + refusal when CHAOS_RELAY_URL is malformed and no persisted URL
    *  exists: auto-provisioning would otherwise mint an identity against the
-   *  production default, which the operator clearly did not intend. */
-  function invalidEnvRefusal(value: string): string {
+   *  production default, which the operator clearly did not intend. The malformed
+   *  value itself is never echoed (see invalidEnvIgnoredWarning). */
+  function invalidEnvRefusal(): string {
     return (
-      `CHAOS_RELAY_URL is set to an invalid value "${value}" (must be an absolute ` +
-      `http(s):// URL) and no relay URL is configured — refusing to auto-provision ` +
-      `an identity against the default relay. Fix CHAOS_RELAY_URL or run ` +
-      `/chaos-relay setup.`
+      `CHAOS_RELAY_URL is set but is not an absolute http(s):// URL, and no relay ` +
+      `URL is configured — refusing to auto-provision an identity against the ` +
+      `default relay. Fix CHAOS_RELAY_URL or run /chaos-relay setup.`
     );
   }
 
@@ -427,12 +428,12 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const persistedValid = isValidRelayUrl(persisted.relayUrl ?? "");
     if (envSet && !envValid) {
       if (!persistedValid) {
-        const warning = invalidEnvRefusal(envRaw);
+        const warning = invalidEnvRefusal();
         log(`WARN: ${warning}`);
         notify?.(warning);
         return undefined;
       }
-      const warning = invalidEnvIgnoredWarning(envRaw, relayUrl);
+      const warning = invalidEnvIgnoredWarning(relayUrl);
       log(`WARN: ${warning}`);
       notify?.(warning);
     } else if (!envSet && !persistedValid) {
@@ -1671,6 +1672,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       }
     } else if (!apiKey) {
       // Default zero-config path: provision a private session automatically.
+      // Deliberately differs from the silent auto-provision refusal in
+      // ensureConfigured(): this is an EXPLICIT interactive action (the user ran
+      // /chaos-relay setup), so a malformed CHAOS_RELAY_URL falls through to the
+      // default here rather than refusing — the user sees the result on screen.
       ctx.ui.notify("Setting up your private relay connection…", "info");
       const reg = await registerSessionWithKey(relayUrl, { keyPair });
       apiKey = reg.apiKey;
