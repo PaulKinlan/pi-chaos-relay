@@ -125,29 +125,38 @@ So: switch a session to `work`, quit, **resume that session** → back on `work`
 A brand-new session with no env → `default` (or inherits its parent). Two
 instances stay independent because each is a different session.
 
-#### The collision trap: profiles that name themselves
+#### The collision: a held profile is refused, never replaced
 
 If the profile a session picks is **already held by another live pi process**,
-the extension auto-creates a new profile so both sessions get independent push
-delivery:
+the extension **refuses to connect** rather than switching identity:
 
 ```
-another pi instance (PID 12345) holds relay profile "default"; auto-creating "omarchy-2if"
+Relay profile "default" is already held by another live pi session (PID 12345).
+Lock file: /home/you/.pi/chaos-relay-default.lock. This session will not switch
+to a new identity. Resolve it by closing that session, or give this one its own
+profile: launch with CHAOS_RELAY_PROFILE=<name> pi, or run /chaos-relay profile
+<name> here.
 ```
 
-The name is your **hostname plus a base36 process id**
-(`generateUniqueProfileName()`, `index.ts:139`; the collision check is in
-`session_start`, `index.ts:675`). It looks random — `omarchy-2if`,
-`omarchy-1gm` — but it is derived from the pid. The new profile is recorded
-against that session, so resuming the session resumes *that* identity, and you
-get a `ctx.ui.notify` at the time.
+You get that as a `ctx.ui.notify` at `session_start` and in
+`~/.pi/agent/logs/chaos-relay.log`. The session is left **unbound** — on the
+profile it was already using, or with the relay idle if it had none — so the
+collision is obvious instead of quietly becoming someone else.
 
-That behaviour is useful (two concurrent sessions both receive messages) and it
-is a trap if you did not mean it: **each collision quietly mints a new identity**
-— a config file, an ECDSA keypair, a relay session. One machine on this project
-accumulated **~3,000 profile files** before anyone noticed, with sessions
-connecting as whichever identity they happened to land on. The files are tiny
-and inert, but that is 3,000 relay identities.
+**Why not auto-create.** Until v0.17.2 the extension dodged the collision by
+minting a new profile named `hostname-pid` (a base36 process id). The name
+looked random (`omarchy-2if`) but was derived from the pid, and every collision
+minted a new identity — a config file, an ECDSA keypair, a relay session. One
+machine on this project accumulated **~3,000 profile files** before anyone
+noticed, with sessions connecting as whichever identity they happened to land on.
+
+**To run two sessions at once**, name them yourself — that is the supported path,
+and it is one env var (or one command from inside pi):
+
+```sh
+CHAOS_RELAY_PROFILE=work pi     # ~/.pi/chaos-relay.work.json
+CHAOS_RELAY_PROFILE=home pi     # ~/.pi/chaos-relay.home.json
+```
 
 Check what you actually have, and which one is live:
 
@@ -186,8 +195,9 @@ pi-silent() { CHAOS_RELAY_PROFILE="no-relay-$$" pi "$@"; }
 
 **Why `$$`, and the trade-off.** A silent profile is a *single lock-holding
 profile like any other*: two concurrent sessions pinned to the same `no-relay`
-name collide exactly as two `default` sessions do, and the second one **silently
-mints `hostname-pid` anyway** — the hole this pattern exists to close. A
+name collide exactly as two `default` sessions do, and the second one is
+**refused** (no minted identity, no relay delivery) — the hole this pattern
+exists to close. A
 per-shell name closes it (`no-relay-$$`), at the cost of **one inert profile file
 per shell**: it owns no channels, so it is safe to delete, but it does
 accumulate. The alternative is a small fixed set of per-lane names
@@ -205,10 +215,10 @@ done
 
 **Do not sweep the profile that owns your channels.** That file *is* the
 identity the channels are bound to: deleting it loses the keypair, and with it
-the relay session that receives your Telegram/email. Auto-created names
-(`omarchy-…`) and per-shell `no-relay-…` names are the ones that can go; a
-profile you named yourself — or that reports channels above — deserves a look
-first.
+the relay session that receives your Telegram/email. Legacy auto-created names
+(`omarchy-…`, minted before v0.17.2) and per-shell `no-relay-…` names are the
+ones that can go; a profile you named yourself — or that reports channels above
+— deserves a look first.
 
 The **ECDSA private key** is part of your identity and is deliberately *not*
 configurable via an env var — it lives only in the `0600` config file. Setup
@@ -427,14 +437,14 @@ Integration testing against a local relay: run the CHAOS relay server
 
 ## Known gaps / future work
 
-- **A collision silently mints a relay identity.** When another live session
-  holds the chosen profile, `session_start` auto-creates `hostname-pid`
-  (`index.ts:675`) with an `ctx.ui.notify` as the only signal — which is how one
-  machine reached ~3,000 profile files before anyone noticed. Options worth
-  weighing: a `--no-auto-profile` flag, or failing the connection with an
-  explanation ("profile X is held by PID Y; pass CHAOS_RELAY_PROFILE or run
-  `/chaos-relay profile new`"). Making the collision loud, or impossible by
-  default, beats noticing it later.
+- **A locked profile leaves the session without relay delivery.** A collision is
+  now refused instead of auto-replaced (see *The collision: a held profile is
+  refused, never replaced*), so the losing session has no push connection until
+  you close the holder or give it its own `CHAOS_RELAY_PROFILE`. That trade is
+  deliberate — an inert session you can see beats a new identity you never chose
+  — and the check still runs at `session_start` only, so a collision that only
+  appears later (a second instance that starts while this one is still
+  provisioning) is not re-checked until the next `session_start`.
 - **The reply-ack note is WS-only.** The WebSocket path logs that `ok` means
   *stored, not delivered* (`index.ts:879`); the HTTP fallback logs a bare `ok=`
   (`index.ts:900`) and the tool text says "will forward it". One shared sentence
