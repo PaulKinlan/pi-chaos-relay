@@ -40,6 +40,9 @@ commit: `README.md` (env / command / tool tables + flows),
 Keep those lists 1:1 with `index.ts` / `config.ts`; never document a knob the
 code doesn't consume. See AGENTS.md for the checklist.
 
+`CLAUDE.md` mirrors the load-bearing rules from `AGENTS.md`; a rule change must
+update both together.
+
 ## Gotchas
 
 - Secrets (the ECDSA keypair, apiKey) live in `~/.pi/chaos-relay.json` (0600),
