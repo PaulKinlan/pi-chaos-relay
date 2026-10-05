@@ -19,9 +19,23 @@
  *    after a relay data loss), an optional onAuthFailure callback can mint a
  *    fresh apiKey (re-registering with the stored keypair, which reclaims the
  *    same session) before the next attempt.
+ *  - The backoff counter is reset only once a connection has stayed OPEN for
+ *    STABLE_UPTIME_MS (see the constant): a socket that opens and immediately
+ *    dies — an accept-then-drop relay — keeps the exponential floor instead of
+ *    reconnecting at a flat 2s forever.
  */
 
 import type { ChannelMessage } from "./relay-client.ts";
+
+/**
+ * How long a socket must stay OPEN before its (rare) drop is treated as a fresh
+ * failure eligible for a fast first retry. A socket that opens and dies inside
+ * this window is treated as a failed attempt and keeps the exponential backoff,
+ * so an accept-then-drop relay cannot hold the client at the flat 2s floor
+ * (~29 reconnects/min). Matches the keepalive ping cadence: a connection that
+ * has survived a full ping interval is "established", not flapping.
+ */
+const STABLE_UPTIME_MS = 30_000;
 
 export interface RelayWebSocketOptions {
   /** Relay base URL (http/https) — converted to ws/wss internally. */
@@ -82,6 +96,8 @@ export class RelayWebSocket {
   private socket: WebSocket | undefined;
   private pingTimer: ReturnType<typeof setInterval> | undefined;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Fires STABLE_UPTIME_MS after a successful open; resets the backoff counter. */
+  private stabilityTimer: ReturnType<typeof setTimeout> | undefined;
   private attempts = 0;
   /** Consecutive failures where the socket never reached OPEN (auth/handshake). */
   private failedHandshakes = 0;
@@ -116,6 +132,7 @@ export class RelayWebSocket {
     this.closedByUs = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
+    this.clearStabilityTimer();
     this.clearPing();
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
@@ -135,8 +152,14 @@ export class RelayWebSocket {
     this.pingTimer = undefined;
   }
 
+  private clearStabilityTimer(): void {
+    if (this.stabilityTimer) clearTimeout(this.stabilityTimer);
+    this.stabilityTimer = undefined;
+  }
+
   private connect(): void {
     this.openedSinceAttempt = false;
+    this.clearStabilityTimer();
     const url = toWsUrl(this.opts.relayUrl, this.apiKey);
     let socket: WebSocket;
     try {
@@ -152,11 +175,20 @@ export class RelayWebSocket {
 
     socket.onopen = () => {
       this.openedSinceAttempt = true;
-      this.attempts = 0;
       this.failedHandshakes = 0;
       this.triedAuthRecovery = false;
       this.log("WebSocket connected (push delivery active)");
       this.startPing();
+      // Arm the stability timer: the backoff counter resets ONLY if this socket
+      // survives STABLE_UPTIME_MS. Resetting here (at open) is exactly what let
+      // an accept-then-drop relay hold the client at a flat 2s reconnect floor.
+      this.stabilityTimer = setTimeout(() => {
+        this.attempts = 0;
+        this.stabilityTimer = undefined;
+      }, STABLE_UPTIME_MS);
+      if (typeof this.stabilityTimer.unref === "function") {
+        this.stabilityTimer.unref();
+      }
       // Catch up on anything missed while we were disconnected.
       void this.runCatchUp();
     };
@@ -172,6 +204,7 @@ export class RelayWebSocket {
 
     socket.onclose = (event: CloseEvent) => {
       this.clearPing();
+      this.clearStabilityTimer();
       if (!this.openedSinceAttempt) this.failedHandshakes++;
       if (this.closedByUs) return;
       this.log(
