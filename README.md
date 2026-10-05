@@ -438,9 +438,15 @@ are removed after 24 hours. You can force an immediate pull with
 ## Development
 
 ```bash
-npm test        # node --test unit tests (relay client, poller, config)
+npm test        # node --test unit tests (relay client, poller, config); runs the version check first
 npx tsc --noEmit -p tsconfig.json   # type-check against pi types
+npm run check:version -- --base origin/master   # package.json/lockfile agreement (required by the gate)
 ```
+
+`npm test` runs `check:version` first (via `pretest`), so a tree whose
+`package.json` and `package-lock.json` disagree — or whose version has moved below
+`origin/master` — fails the gate instead of shipping. The base ref is required and
+an unresolvable one fails closed.
 
 `npm ci` (or `npm install`) must run before the `npx tsc` check, which needs the
 `typescript` devDependency — without it `npx` instead runs the unrelated

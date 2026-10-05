@@ -24,6 +24,8 @@
     "email"
   ],
   "scripts": {
+    "check:version": "node scripts/check-version-consistency.mjs",
+    "pretest": "node scripts/check-version-consistency.mjs --base origin/master",
     "test": "node --test"
   },
   "files": [

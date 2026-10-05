@@ -38,6 +38,13 @@ npm test             # node --test over test/*.test.ts
 
 Both must be green. Add or update tests for behavior changes.
 
+`npm test` also enforces version consistency: its `pretest` step runs
+`scripts/check-version-consistency.mjs`, which requires `package.json`, the
+top-level `version` in `package-lock.json` and `package-lock.json`'s
+`packages[""].version` to agree, and the version not to move below `origin/master`.
+Run it directly with `npm run check:version -- --base <ref>`; the base ref is
+required, and an unresolvable ref fails closed rather than skipping the check.
+
 ## Keep docs in sync — in the SAME commit
 
 A user-facing change is not done until the docs match it. Update whichever of
