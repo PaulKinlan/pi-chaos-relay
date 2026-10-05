@@ -46,7 +46,8 @@ delete process.env.CHAOS_RELAY_API_KEY;
 process.env.CHAOS_RELAY_URL = OFFLINE_RELAY_URL;
 
 const config = await import("../config.ts");
-const { default: chaosRelayExtension } = await import("../index.ts");
+const { default: chaosRelayExtension, claimProfileLock, ApprovalQueue } =
+  await import("../index.ts");
 
 type ExtensionApi = Parameters<typeof chaosRelayExtension>[0];
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -126,6 +127,16 @@ async function callHandler(
   const list = handlers.get(name) ?? [];
   assert.ok(list.length > 0, `extension registers a ${name} handler`);
   for (const handler of list) await handler(event, ctx);
+}
+
+/** Is `pid` a live process? (Matches index.ts's isProcessAlive.) */
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Lock path index.ts uses: ~/.pi/chaos-relay-<profile>.lock (homedir() at call time). */
@@ -837,4 +848,201 @@ test("auto-provision trims surrounding whitespace from CHAOS_RELAY_URL", async (
     apiKey?: string;
   };
   assert.equal(persisted.relayUrl, trimmedUrl, "persisted the TRIMMED relay URL (no surrounding spaces)");
+});
+
+// ── pi-chaos-relay-bxa: the profile lock is claimed atomically, pre-connect ──
+//
+// The old flow read the lock, awaited connectAsProfile() (which can register a
+// live relay session), and only then wrote the lock with a plain writeFileSync.
+// Two processes starting together could both observe "unlocked", both connect,
+// and both write. The claim is now an exclusive create (flag "wx") made BEFORE
+// any connect, so a race has exactly one winner and a live holder is never
+// overwritten.
+
+test("claimProfileLock refuses a live holder without touching its file", () => {
+  resetState();
+  const lock = lockPath("race-held");
+  // A pid that is alive and is not us: this test process's own parent chain is
+  // fine, but the simplest always-alive foreign pid is 1 (init).
+  writeFileSync(lock, "1");
+  const before = readFileSync(lock, "utf-8");
+
+  const result = claimProfileLock("race-held");
+
+  assert.equal(result.claimed, false, "must not claim a profile a live process holds");
+  assert.equal(result.pid, 1, "reports the live holder's pid for the refusal message");
+  assert.equal(readFileSync(lock, "utf-8"), before, "the holder's lock file is untouched");
+  assert.equal(result.path, lock, "names the lock file");
+});
+
+test("claimProfileLock cleans a stale holder and claims the profile", () => {
+  resetState();
+  const lock = lockPath("race-stale");
+  // A pid that no longer exists (spawned and reaped), so the lock is genuinely
+  // stale rather than "unparseable by accident".
+  assert.equal(existsSync(lock), false);
+  writeFileSync(lock, "2147483646"); // beyond any real pid: not alive
+  assert.equal(isAlive(2147483646), false, "test premise: the recorded pid is dead");
+
+  const result = claimProfileLock("race-stale");
+
+  assert.equal(result.claimed, true, "a dead holder's lock is stale and reclaimable");
+  assert.equal(readFileSync(lock, "utf-8"), String(process.pid), "the lock now names this process");
+});
+
+test("claimProfileLock: two processes racing the same profile — exactly one wins", async (t) => {
+  resetState();
+  const profile = "race-atomic";
+  const lock = lockPath(profile);
+  const extUrl = new URL("../index.ts", import.meta.url).href;
+  const HOLD_MS = 4_000;
+  // All children attempt at the same wall-clock instant so the exclusive
+  // creates genuinely overlap. Crucially, the winner HOLDS the lock (sleeps)
+  // while the losers attempt: a winner that exited instantly would leave a
+  // genuinely stale lock, and then a second claim is CORRECT, not a race
+  // failure. So the results are read while every child is still alive.
+  const startAt = Date.now() + 700;
+  const child = `
+    const { claimProfileLock } = await import(${JSON.stringify(extUrl)});
+    while (Date.now() < Number(process.env.START_AT)) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const result = claimProfileLock(process.env.LOCK_PROFILE);
+    // console.log appends the newline the parent's line reader needs.
+    console.log(JSON.stringify({ pid: process.pid, claimed: result.claimed, holder: result.pid }));
+    // Stay alive so the losers must see a LIVE holder (not a stale file).
+    await new Promise((r) => setTimeout(r, ${HOLD_MS}));
+  `;
+
+  /** Resolve with the child's first stdout line (its claim result). */
+  function startRacer(): { firstLine: Promise<string>; exited: Promise<void> } {
+    const p = spawn(process.execPath, ["--input-type=module", "-e", child], {
+      env: { ...process.env, START_AT: String(startAt), LOCK_PROFILE: profile },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let buffer = "";
+    let err = "";
+    let resolveFirst!: (line: string) => void;
+    const firstLine = new Promise<string>((resolve) => (resolveFirst = resolve));
+    p.stdout.on("data", (c) => {
+      buffer += String(c);
+      const nl = buffer.indexOf("\n");
+      if (nl >= 0) resolveFirst(buffer.slice(0, nl));
+    });
+    p.stderr.on("data", (c) => (err += String(c)));
+    const exited = new Promise<void>((resolve, reject) =>
+      p.on("close", (code) =>
+        code === 0 ? resolve() : reject(new Error(`racer exited ${code}: ${err}`)),
+      ),
+    );
+    return { firstLine, exited };
+  }
+
+  const racers = [startRacer(), startRacer(), startRacer()];
+  const results = (await Promise.all(racers.map((r) => r.firstLine))).map(
+    (line) => JSON.parse(line) as { pid: number; claimed: boolean; holder: number | null },
+  );
+  const winners = results.filter((r) => r.claimed);
+  assert.equal(
+    winners.length,
+    1,
+    `exactly one process may claim the profile while the others are live: ${JSON.stringify(results)}`,
+  );
+  // Every loser saw the live winner (not a stale file it was entitled to clean).
+  for (const loser of results.filter((r) => !r.claimed)) {
+    assert.equal(loser.holder, winners[0].pid, "a loser must report the live holder's pid");
+  }
+  assert.equal(
+    readFileSync(lock, "utf-8"),
+    String(winners[0].pid),
+    "the lock names the single winner, not the last writer",
+  );
+
+  // While the winner is still alive, a further claim is refused and cannot
+  // overwrite it.
+  const after = claimProfileLock(profile);
+  assert.equal(after.claimed, false, "a live holder is never reclaimed");
+  assert.equal(after.pid, winners[0].pid, "refusal names the live winner");
+  assert.equal(readFileSync(lock, "utf-8"), String(winners[0].pid), "still the winner's pid");
+
+  await Promise.all(racers.map((r) => r.exited));
+  t.diagnostic(`race result: ${JSON.stringify(results)}`);
+});
+
+// ── pi-chaos-relay-abl: concurrent approvals each get their own decision ─────
+
+test("two concurrent approval requests resolve separately (no cross-resolve, no loss)", async () => {
+  const logs: string[] = [];
+  const q = new ApprovalQueue(60_000, (m) => logs.push(m));
+  const first = q.add({ channelId: "c1", toolName: "bash" });
+  const second = q.add({ channelId: "c1", toolName: "edit" });
+  assert.equal(q.size, 2, "both requests are outstanding");
+  assert.notEqual(first.ref, second.ref, "each request has its own reference");
+
+  // Unaddressed reply → the OLDEST outstanding request on that channel.
+  assert.equal(q.settle({ channelId: "c1", content: "yes" }), true, "message consumed");
+  assert.equal(await first.promise, true, "the first call got the approval");
+  assert.equal(q.size, 1, "only the answered request was settled");
+
+  // Addressed reply → the request it names, even though it is not the oldest.
+  assert.equal(q.settle({ channelId: "c1", content: `#${second.ref} no` }), true);
+  assert.equal(await second.promise, false, "the second call got its own (denied) decision");
+  assert.equal(q.size, 0, "no request left behind");
+});
+
+test("each approval request times out independently", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const logs: string[] = [];
+  const q = new ApprovalQueue(60_000, (m) => logs.push(m));
+  const first = q.add({ channelId: "c1", toolName: "bash" });
+  t.mock.timers.tick(30_000);
+  const second = q.add({ channelId: "c1", toolName: "edit" });
+
+  t.mock.timers.tick(30_000); // first reaches 60s; second is only 30s old
+  assert.equal(await first.promise, false, "the older request auto-denied on its own timeout");
+  assert.equal(q.size, 1, "the younger request was NOT wiped by the older one's timeout");
+
+  // …and the younger one is still answerable afterwards.
+  assert.equal(q.settle({ channelId: "c1", content: "yes" }), true);
+  assert.equal(await second.promise, true, "the surviving request still gets its answer");
+  assert.equal(q.size, 0);
+});
+
+test("approval replies are routed by channel and by reference", async () => {
+  const q = new ApprovalQueue(60_000);
+  const a = q.add({ channelId: "c1", toolName: "bash" });
+  const b = q.add({ channelId: "c2", toolName: "bash" });
+
+  // Another channel's message answers nothing here and must be forwarded.
+  assert.equal(q.settle({ channelId: "c3", content: "yes" }), false, "not consumed");
+  assert.equal(q.size, 2, "no request resolved by an unrelated channel");
+
+  // An explicit reference resolves that request, not the oldest.
+  assert.equal(q.settle({ channelId: "c2", content: `#${b.ref} yes` }), true);
+  assert.equal(await b.promise, true);
+  assert.equal(q.size, 1, "the c1 request is still waiting");
+
+  // A reference to nothing pending is consumed but resolves nothing.
+  assert.equal(q.settle({ channelId: "c1", content: "#999 yes" }), true, "consumed");
+  assert.equal(q.size, 1, "an unknown reference must not settle a real request");
+  assert.equal(q.settle({ channelId: "c1", content: "yes" }), true);
+  assert.equal(await a.promise, true, "the real request still settles normally");
+});
+
+test("cancel() drops a request that never reached the user", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const q = new ApprovalQueue(60_000);
+  const dropped = q.add({ channelId: "c1", toolName: "bash" });
+  dropped.cancel();
+  assert.equal(q.size, 0, "the entry is gone");
+  assert.equal(
+    q.settle({ channelId: "c1", content: "yes" }),
+    false,
+    "a message no longer answers a cancelled request (it is forwarded to the agent)",
+  );
+  // Its timer cannot fire later and deny a different request.
+  const live = q.add({ channelId: "c1", toolName: "edit" });
+  t.mock.timers.tick(120_000);
+  assert.equal(q.size, 0);
+  assert.equal(await live.promise, false, "the live request timed out on its own timer");
 });
