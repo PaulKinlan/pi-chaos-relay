@@ -350,21 +350,60 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   }
 
   /**
+   * The loud warning emitted when auto-provisioning is about to mint an identity
+   * against a URL the operator never configured (no CHAOS_RELAY_URL, no
+   * persisted relayUrl → the production default). This is the silent-asymmetric
+   * failure mode the transport path masked: the WebSocket honoured env, so a
+   * self-hoster saw connection errors and assumed their relay was unreachable
+   * while registration quietly minted an identity against chaos-relay.com.
+   */
+  function unconfiguredRelayWarning(relayUrl: string): string {
+    return (
+      `No relay URL configured — auto-provisioning an identity against the ` +
+      `default relay ${relayUrl}. Set CHAOS_RELAY_URL (or run /chaos-relay setup) ` +
+      `to point this instance at your own relay and keep its identity isolated.`
+    );
+  }
+
+  /**
    * Like {@link ensureClient}, but if the relay isn't configured yet it
    * auto-provisions a session (ECDSA keypair at the default relay URL) WITHOUT
    * any interactive setup. This lets the agent fulfil requests like "register my
    * telegram bot 123:ABC" directly — the user never has to run /chaos-relay setup
    * or know what a relay URL is. Returns undefined only if provisioning fails
    * (e.g. the relay is unreachable).
+   *
+   * `notify` (when provided) surfaces {@link unconfiguredRelayWarning} to the
+   * user; the warning is also always written to the durable log.
    */
-  async function ensureConfigured(): Promise<RelayClient | undefined> {
+  async function ensureConfigured(
+    notify?: (message: string) => void,
+  ): Promise<RelayClient | undefined> {
     const existing = ensureClient();
     if (existing) return existing;
 
     const persisted = loadPersisted();
-    const relayUrl = isValidRelayUrl(persisted.relayUrl ?? "")
-      ? persisted.relayUrl!
-      : DEFAULT_RELAY_URL;
+    // Prefer the env-resolved URL (env > persisted > default) so CHAOS_RELAY_URL
+    // governs registration exactly as it governs transport. The old persisted-only
+    // lookup ignored CHAOS_RELAY_URL on this path: a fresh profile would fall
+    // through to DEFAULT_RELAY_URL and mint an identity + apiKey against the
+    // production relay even when the operator had pointed this instance at their
+    // own relay.
+    const relayUrl = resolveConfig(persisted).relayUrl;
+
+    // Loud warning when registration targets a URL the operator never configured
+    // (no CHAOS_RELAY_URL and no persisted relayUrl → the default relay). A fresh
+    // profile would otherwise silently mint an identity + apiKey against
+    // chaos-relay.com.
+    const envUrl = process.env.CHAOS_RELAY_URL?.trim() ?? "";
+    const persistedUrl = isValidRelayUrl(persisted.relayUrl ?? "")
+      ? persisted.relayUrl!.trim()
+      : "";
+    if (!envUrl && !persistedUrl) {
+      const warning = unconfiguredRelayWarning(relayUrl);
+      log(`WARN: ${warning}`);
+      notify?.(warning);
+    }
     try {
       // Reuse any existing keypair so the identity (and its channels) stay stable.
       const reg = await registerSessionWithKey(relayUrl, { keyPair: persisted.keyPair });
@@ -393,7 +432,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
    * bind the current pi session to it (so a resume reconnects the same way).
    * Returns whether the profile was freshly created.
    */
-  async function connectAsProfile(name: string): Promise<{ isNew: boolean; connected: boolean }> {
+  async function connectAsProfile(
+    name: string,
+    notify?: (message: string) => void,
+  ): Promise<{ isNew: boolean; connected: boolean }> {
     stopPolling();
     client = undefined;
     poller = undefined;
@@ -404,7 +446,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     setSessionProfile(currentSessionId, currentProfile);
 
     const isNew = !isConfigured(cfg);
-    const c = await ensureConfigured(); // provisions a fresh identity if new
+    const c = await ensureConfigured(notify); // provisions a fresh identity if new
     if (!c) return { isNew, connected: false };
     startPolling(); // ensure the poller runs for an already-provisioned profile too
     cfg = resolveConfig();
@@ -432,12 +474,15 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
    * User-facing profile switch (command/tool). Connects as the profile and binds
    * it to the current session. Returns a human-readable status line.
    */
-  async function switchProfile(name: string): Promise<string> {
+  async function switchProfile(
+    name: string,
+    notify?: (message: string) => void,
+  ): Promise<string> {
     const slug = profileNameForPath(profilePathForName(name));
     if (profilePathForName(name) === getConfigPath()) {
       return `Already on profile "${slug}".`;
     }
-    const { isNew, connected } = await connectAsProfile(name);
+    const { isNew, connected } = await connectAsProfile(name, notify);
     if (!connected) {
       return `Switched config to profile "${slug}" but couldn't reach the relay to connect — check your network, then /chaos-relay status.`;
     }
@@ -693,7 +738,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     }
     const profile = decision.profile;
 
-    const result = await connectAsProfile(profile);
+    const result = await connectAsProfile(profile, (m) => ctx.ui.notify(m, "warning"));
     if (!result.connected) {
       log(`session ${event.reason}: selected profile "${profile}" but couldn't connect (will retry on next poll)`);
     } else {
@@ -1035,7 +1080,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       );
       return;
     }
-    const c = await ensureConfigured();
+    const c = await ensureConfigured((m) => ctx.ui.notify(m, "warning"));
     if (!c) {
       ctx.ui.notify(
         "Couldn't reach the chaos relay to set up your connection. Check your network and try again.",
@@ -1122,8 +1167,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       "the channelId, bot username, and a pairing code. Send the pairing code to " +
       "the bot in Telegram to finish linking. Requires the relay to be configured.",
     parameters: tgParams,
-    async execute(_id: string, params: Static<typeof tgParams>) {
-      const c = await ensureConfigured();
+    async execute(_id: string, params: Static<typeof tgParams>, _signal, _onUpdate, ctx: ExtensionContext) {
+      const c = await ensureConfigured((m) => ctx.ui.notify(m, "warning"));
       if (!c) {
         return textResult(
           "Couldn't reach the chaos relay to set up your connection. Check your network and try again.",
@@ -1154,8 +1199,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       "must point the bot's interaction endpoint (or a gateway relay) at the " +
       "relay's /discord/<channelId> URL. Requires the relay to be configured.",
     parameters: dcParams,
-    async execute(_id: string, params: Static<typeof dcParams>) {
-      const c = await ensureConfigured();
+    async execute(_id: string, params: Static<typeof dcParams>, _signal, _onUpdate, ctx: ExtensionContext) {
+      const c = await ensureConfigured((m) => ctx.ui.notify(m, "warning"));
       if (!c) {
         return textResult(
           "Couldn't reach the chaos relay to set up your connection. Check your network and try again.",
@@ -1183,8 +1228,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       "inbound address to email. A verification link is sent to your address; click " +
       "it to activate the channel. Requires CHAOS_EMAIL_DOMAIN on the relay server.",
     parameters: emailParams,
-    async execute(_id: string, params: Static<typeof emailParams>) {
-      const c = await ensureConfigured();
+    async execute(_id: string, params: Static<typeof emailParams>, _signal, _onUpdate, ctx: ExtensionContext) {
+      const c = await ensureConfigured((m) => ctx.ui.notify(m, "warning"));
       if (!c) {
         return textResult(
           "Couldn't reach the chaos relay to set up your connection. Check your network and try again.",
@@ -1215,8 +1260,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       "reply (don't call relay_reply for them). Requires the relay to be configured.",
     promptSnippet: "relay_register_webhook: create an inbound webhook URL that delivers messages to the agent",
     parameters: webhookParams,
-    async execute(_id: string, params: Static<typeof webhookParams>, _signal, _onUpdate, _ctx: ExtensionContext) {
-      const c = await ensureConfigured();
+    async execute(_id: string, params: Static<typeof webhookParams>, _signal, _onUpdate, ctx: ExtensionContext) {
+      const c = await ensureConfigured((m) => ctx.ui.notify(m, "warning"));
       if (!c) {
         return textResult(
           "Couldn't reach the chaos relay to set up your connection. Check your network and try again.",
@@ -1233,10 +1278,13 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
   // relay_connect — one-shot: paste a token / email / "webhook" and it does it all.
   /** Provision the relay (if needed) and register whatever the input describes. */
-  async function runConnect(input: string): Promise<string> {
+  async function runConnect(
+    input: string,
+    notify?: (message: string) => void,
+  ): Promise<string> {
     const plan = parseConnectInput(input);
     if (plan.kind === "unknown") return plan.reason;
-    const c = await ensureConfigured();
+    const c = await ensureConfigured(notify);
     if (!c) {
       return "Couldn't reach the chaos relay to set up your connection. Check your network and try again.";
     }
@@ -1266,9 +1314,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     promptSnippet:
       "relay_connect: paste a bot token / email / 'webhook' and it sets up the relay + channel in one step",
     parameters: connectParams,
-    async execute(_id: string, params: Static<typeof connectParams>) {
+    async execute(_id: string, params: Static<typeof connectParams>, _signal, _onUpdate, ctx: ExtensionContext) {
       try {
-        return textResult(await runConnect(params.input));
+        return textResult(await runConnect(params.input, (m) => ctx.ui.notify(m, "warning")));
       } catch (err) {
         throw toFriendly(err);
       }
@@ -1314,9 +1362,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     promptSnippet:
       "relay_switch_profile: switch this pi to a different (or new) relay connection profile",
     parameters: switchParams,
-    async execute(_id: string, params: Static<typeof switchParams>) {
+    async execute(_id: string, params: Static<typeof switchParams>, _signal, _onUpdate, ctx: ExtensionContext) {
       try {
-        return textResult(await switchProfile(params.name));
+        return textResult(await switchProfile(params.name, (m) => ctx.ui.notify(m, "warning")));
       } catch (err) {
         throw toFriendly(err);
       }
@@ -1355,7 +1403,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
               );
               break;
             }
-            ctx.ui.notify(await runConnect(rest), "info");
+            ctx.ui.notify(await runConnect(rest, (m) => ctx.ui.notify(m, "warning")), "info");
             break;
           }
           case "profile": {
@@ -1373,7 +1421,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
               );
               break;
             }
-            ctx.ui.notify(await switchProfile(name), "info");
+            ctx.ui.notify(await switchProfile(name, (m) => ctx.ui.notify(m, "warning")), "info");
             break;
           }
           case "add":

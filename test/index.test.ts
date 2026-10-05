@@ -18,6 +18,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import {
   existsSync,
   mkdirSync,
@@ -349,4 +350,74 @@ test("removeProfileLock refuses a lock owned by another pid and unlinks its own"
   writeFileSync(lock, String(process.pid));
   await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-guard", fake.notifications));
   assert.equal(existsSync(lock), false, "this process's own lock is released");
+});
+
+test("auto-provision registers against CHAOS_RELAY_URL, not the production default", async (t) => {
+  resetState();
+  // Fresh profile: no persisted config at all, so ensureConfigured must decide
+  // the registration URL from env (CHAOS_RELAY_URL) — never the default relay.
+  const configPath = join(PI_DIR, "chaos-relay.json");
+  if (existsSync(configPath)) unlinkSync(configPath);
+
+  // A local stand-in relay records every request path. If registration ever
+  // ignores CHAOS_RELAY_URL and POSTs to the production relay instead, this
+  // server sees nothing and the assertion below fails — deterministically, with
+  // no dependency on (or traffic to) the real relay.
+  const seenPaths: string[] = [];
+  const server = createServer((req, res) => {
+    seenPaths.push(req.url ?? "");
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url === "/auth/register") {
+        res.end(JSON.stringify({ userId: "u_local", apiKey: "ak_local" }));
+      } else if (req.url === "/channels/telegram/register") {
+        res.end(
+          JSON.stringify({ channelId: "ch_local", botUsername: "localbot", pairingCode: "1234" }),
+        );
+      } else {
+        res.end(JSON.stringify({}));
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const port = (server.address() as { port: number }).port;
+  const localUrl = `http://127.0.0.1:${port}`;
+
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  process.env.CHAOS_RELAY_URL = localUrl;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+  });
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  const tg = fake.tools.find((tool) => tool.name === "relay_register_telegram");
+  assert.ok(tg, "extension registers relay_register_telegram");
+  const execute = tg.execute as (
+    id: string,
+    params: { botToken: string },
+    signal: unknown,
+    onUpdate: unknown,
+    ctx: unknown,
+  ) => Promise<unknown>;
+  await execute("t1", { botToken: "123:ABC" }, undefined, undefined, {
+    ui: { notify: () => {} },
+  });
+
+  // The registration POST reached the env-configured relay, not chaos-relay.com.
+  assert.ok(
+    seenPaths.includes("/auth/register"),
+    `registration reached the env-configured relay (saw ${JSON.stringify(seenPaths)})`,
+  );
+  // …and the credentials persisted came from that relay.
+  const persisted = JSON.parse(readFileSync(configPath, "utf-8")) as {
+    relayUrl?: string;
+    apiKey?: string;
+  };
+  assert.equal(persisted.relayUrl, localUrl, "persisted the env-configured relayUrl");
+  assert.equal(persisted.apiKey, "ak_local", "persisted the local relay's apiKey");
 });
