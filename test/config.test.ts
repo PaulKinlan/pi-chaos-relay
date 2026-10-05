@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync, copyFileSync, mkdirSync, rmdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync, copyFileSync, mkdirSync, rmSync, rmdirSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
@@ -21,6 +22,8 @@ import {
   resolveConfig,
   resolveProfileLockCollision,
   savePersisted,
+  loadMessageState,
+  saveMessageState,
 } from "../config.ts";
 
 test("configPathFor: default profile uses chaos-relay.json", () => {
@@ -407,6 +410,14 @@ function withTempConfig(fn: (path: string, warnings: string[]) => void): void {
     console.warn = originalWarn;
     setActiveConfigPath(previous);
     if (existsSync(path)) unlinkSync(path);
+    // Also clean the message-tracking side-car (and any temp residue) these
+    // tests may have created next to the temp config.
+    const statePath = `${path}.state`;
+    for (const f of readdirSync(dirname(path))) {
+      if (f === basename(statePath) || f.startsWith(`${basename(statePath)}.tmp.`)) {
+        try { unlinkSync(join(dirname(path), f)); } catch { /* racing cleanup */ }
+      }
+    }
   }
 }
 
@@ -581,7 +592,9 @@ test("savePersisted writes atomically and leaves no temp files behind", () => {
   withConfigIsolated(() => {
     savePersisted({ relayUrl: "https://x.example.com", apiKey: "k" });
     // The atomic write goes through a `<config>.tmp.*` file then renames it
-    // over the target; none of those temp files must linger.
+    // over the target; none of those temp files must linger. Normal-completion
+    // scope only — a crash between temp-write and rename leaves an inert
+    // orphan while the previous complete file survives (see atomicWriteSync).
     const dir = dirname(getConfigPath());
     const name = basename(getConfigPath());
     const leftovers = readdirSync(dir).filter((f) => f.startsWith(`${name}.tmp.`));
@@ -590,5 +603,237 @@ test("savePersisted writes atomically and leaves no temp files behind", () => {
     // degrades to defaults and warns (see the readPersisted cases above).
     writeFileSync(getConfigPath(), "{ not json");
     assert.deepEqual(loadPersisted(), {});
+  });
+});
+
+// ── Message-tracking side-car state (<config>.state) ────────────────────────
+
+test("the side-car never shows up as a profile in listProfiles()", () => {
+  // REAL behavioral pin (a path-string equality check would be vacuous, and
+  // CONFIG_DIR is fixed at module load so an in-process HOME override can't
+  // reach it): run listProfiles() in a CHILD node process whose HOME is a
+  // fixture dir holding a profile config AND its .state side-car, and assert
+  // it offers exactly the one profile.
+  const home = join(tmpdir(), `chaos-relay-lp-${process.pid}-${tempConfigCounter++}`);
+  mkdirSync(join(home, ".pi"), { recursive: true });
+  writeFileSync(join(home, ".pi", "chaos-relay.json"), "{}");
+  writeFileSync(join(home, ".pi", "chaos-relay.json.state"), '{"seenIds":[]}');
+  try {
+    const child = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `const { listProfiles } = await import(${JSON.stringify(
+          new URL("../config.ts", import.meta.url).href,
+        )});
+         process.stdout.write(JSON.stringify(listProfiles()));`,
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: home,
+          // Neutralise any inherited profile selection (this lane's own env
+          // pins CHAOS_RELAY_PROFILE) so the child resolves the fixture's
+          // default profile.
+          CHAOS_RELAY_PROFILE: undefined,
+          CHAOS_RELAY_CONFIG: undefined,
+        },
+        encoding: "utf-8",
+      },
+    );
+    assert.equal(child.status, 0, `child stderr: ${child.stderr}`);
+    assert.deepEqual(JSON.parse(child.stdout), [{ name: "default", active: true }]);
+  } finally {
+    rmSync(join(home, ".pi"), { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("saveMessageState writes the side-car atomically; loadMessageState round-trips", () => {
+  withTempConfig((path) => {
+    saveMessageState({ cursor: "2026-10-05T00:00:00Z", seenIds: ["a", "b"] });
+    const statePath = `${path}.state`;
+    const raw = readFileSync(statePath, "utf-8");
+    // Same serialized shape + trailing newline as the config writer.
+    assert.ok(raw.endsWith("\n"));
+    const parsed = JSON.parse(raw);
+    assert.equal(parsed.cursor, "2026-10-05T00:00:00Z");
+    assert.deepEqual(parsed.seenIds, ["a", "b"]);
+    // Restart continuity: a fresh load returns exactly what was persisted.
+    assert.deepEqual(loadMessageState(), {
+      cursor: "2026-10-05T00:00:00Z",
+      seenIds: ["a", "b"],
+    });
+    // Atomic write, normal-completion scope: no `<config>.state.tmp.*`
+    // residue after a completed flush. (This is NOT a crash guarantee: a
+    // process death between the temp write and the rename leaves an inert
+    // .tmp.* orphan while the previous complete file survives — see
+    // atomicWriteSync's comment.)
+    const dir = dirname(statePath);
+    const leftovers = readdirSync(dir).filter((f) => f.startsWith(`${basename(statePath)}.tmp.`));
+    assert.deepEqual(leftovers, []);
+    // The steady-state hot path never rewrites the profile config: the only
+    // config write is the ONE-TIME tombstone pass (messageStateMigrated),
+    // which carries no cursor/seen data — and later flushes leave the config
+    // byte-identical.
+    const cfg = JSON.parse(readFileSync(path, "utf-8"));
+    assert.equal(cfg.messageStateMigrated, true);
+    assert.equal("seenMessageIds" in cfg, false);
+    const cfgRawAfterFirst = readFileSync(path, "utf-8");
+    saveMessageState({ cursor: "2026-10-05T00:01:00Z", seenIds: ["a", "b", "c"] });
+    assert.equal(readFileSync(path, "utf-8"), cfgRawAfterFirst); // untouched
+  });
+});
+
+test("saveMessageState tolerates a cursor-less state (key omitted, not null)", () => {
+  withTempConfig((path) => {
+    saveMessageState({ seenIds: ["x"] });
+    const parsed = JSON.parse(readFileSync(`${path}.state`, "utf-8"));
+    assert.equal("cursor" in parsed, false);
+    assert.deepEqual(loadMessageState(), { cursor: undefined, seenIds: ["x"] });
+  });
+});
+
+test("legacy config fields are read as fallback and migrated out on first save", () => {
+  withTempConfig((path, warnings) => {
+    // A pre-0.17.5 profile: cursor + seen log still inside the config file.
+    savePersisted({
+      relayUrl: "https://relay.example.com",
+      apiKey: "k",
+      messagesCursor: "2026-01-01T00:00:00Z",
+      seenMessageIds: ["old1", "old2"],
+    });
+    // No side-car yet → the legacy values keep working across the upgrade.
+    assert.deepEqual(loadMessageState(), {
+      cursor: "2026-01-01T00:00:00Z",
+      seenIds: ["old1", "old2"],
+    });
+    // First flush: state lands in the side-car and the legacy fields are
+    // stripped from the config (one time, off the steady-state hot path).
+    saveMessageState({ cursor: "2026-01-02T00:00:00Z", seenIds: ["new1"] });
+    const cfg = JSON.parse(readFileSync(path, "utf-8"));
+    assert.equal("seenMessageIds" in cfg, false);
+    assert.equal("messagesCursor" in cfg, false);
+    assert.equal(cfg.apiKey, "k"); // the rest of the config survives the strip
+    assert.deepEqual(loadMessageState(), { cursor: "2026-01-02T00:00:00Z", seenIds: ["new1"] });
+    assert.deepEqual(warnings, []); // a clean migration warns nothing
+  });
+});
+
+test("a corrupt side-car degrades to the legacy values without throwing", () => {
+  withTempConfig((path, warnings) => {
+    savePersisted({ seenMessageIds: ["legacy"] });
+    writeFileSync(`${path}.state`, "{ not json");
+    // Corrupt side-car → warn once, fall back, keep pi alive.
+    assert.deepEqual(loadMessageState(), { cursor: undefined, seenIds: ["legacy"] });
+    assert.ok(warnings.some((w) => w.includes("Failed to parse")));
+    // The next save self-heals the file.
+    saveMessageState({ cursor: "c", seenIds: ["s"] });
+    assert.deepEqual(loadMessageState(), { cursor: "c", seenIds: ["s"] });
+  });
+});
+
+test("resetPersisted('all') wipes the side-car along with the config", () => {
+  withTempConfig((path) => {
+    savePersisted({ apiKey: "k" });
+    saveMessageState({ cursor: "c", seenIds: ["a"] });
+    assert.equal(existsSync(`${path}.state`), true);
+    resetPersisted("all");
+    assert.equal(existsSync(path), false);
+    assert.equal(existsSync(`${path}.state`), false);
+    // After a full reset the tracking state is empty, not the old identity's.
+    assert.deepEqual(loadMessageState(), { cursor: undefined, seenIds: [] });
+  });
+});
+
+test("an empty side-car file degrades silently to the legacy values", () => {
+  // An empty/whitespace-only file is a truncation artifact (same policy as the
+  // config reader): recover from the legacy fields with NO warning, and let
+  // the next save rewrite the side-car.
+  withTempConfig((path, warnings) => {
+    savePersisted({ messagesCursor: "2026-01-01T00:00:00Z", seenMessageIds: ["legacy"] });
+    writeFileSync(`${path}.state`, "   \n");
+    assert.deepEqual(loadMessageState(), {
+      cursor: "2026-01-01T00:00:00Z",
+      seenIds: ["legacy"],
+    });
+    assert.deepEqual(warnings, []);
+    saveMessageState({ cursor: "c", seenIds: ["s"] });
+    assert.deepEqual(loadMessageState(), { cursor: "c", seenIds: ["s"] });
+  });
+});
+
+test("resetPersisted('url') keeps the side-car tracking state", () => {
+  withTempConfig((path) => {
+    savePersisted({ relayUrl: "https://bad.example.com", apiKey: "k" });
+    saveMessageState({ cursor: "c", seenIds: ["a"] });
+    resetPersisted("url");
+    // Only the relayUrl was cleared: config survives (minus the URL) and the
+    // cursor + de-dup log stay exactly where they were.
+    assert.deepEqual(loadPersisted().apiKey, "k");
+    assert.equal(loadPersisted().relayUrl, undefined);
+    assert.deepEqual(loadMessageState(), { cursor: "c", seenIds: ["a"] });
+  });
+});
+
+test("reset all re-arms the one-time legacy migration for a restored config", () => {
+  // Reviewer finding: after `reset all`, a legacy config hand-restored to the
+  // same path in the SAME session must still get its legacy fields migrated to
+  // the side-car on the next flush (the migrated-once flag must not survive
+  // the reset).
+  withTempConfig((path) => {
+    savePersisted({ apiKey: "k" });
+    saveMessageState({ cursor: "first", seenIds: ["a"] }); // arms stateMigrated
+    resetPersisted("all");
+    // Simulate restoring a pre-0.17.5 backup over the fresh start.
+    writeFileSync(
+      path,
+      JSON.stringify({ apiKey: "k2", messagesCursor: "old-cursor", seenMessageIds: ["old"] }, null, 2) + "\n",
+    );
+    saveMessageState({ cursor: "new", seenIds: ["n"] });
+    const cfg = JSON.parse(readFileSync(path, "utf-8"));
+    assert.equal("seenMessageIds" in cfg, false); // legacy fields stripped again
+    assert.equal("messagesCursor" in cfg, false);
+    assert.equal(cfg.apiKey, "k2");
+  });
+});
+
+test("a missing side-car after migration warns LOUDLY; a genuine first run stays silent", () => {
+  // Reviewer finding: saveMessageState strips the legacy in-config fields, so
+  // if the side-car is later lost (e.g. a backup that skipped it), the legacy
+  // fallback silently resets de-dup. The messageStateMigrated tombstone makes
+  // that loss loud, while a profile that never tracked messages stays quiet.
+  withTempConfig((path, warnings) => {
+    // Migrate a legacy profile: strip + tombstone.
+    savePersisted({ apiKey: "k", seenMessageIds: ["a"], messagesCursor: "c" });
+    saveMessageState({ cursor: "c", seenIds: ["a"] });
+    assert.equal(warnings.length, 0);
+    // Lose the side-car (backup restored the config without it).
+    unlinkSync(`${path}.state`);
+    assert.deepEqual(loadMessageState(), { cursor: undefined, seenIds: [] });
+    assert.ok(
+      warnings.some((w) => w.includes("missing") && w.includes("migrated") && w.includes("backup")),
+      `expected the loud lost-side-car warning, got: ${JSON.stringify(warnings)}`,
+    );
+  });
+  withTempConfig((_path, warnings) => {
+    // Genuine first run: no side-car, no legacy fields, no tombstone.
+    savePersisted({ apiKey: "k" });
+    assert.deepEqual(loadMessageState(), { cursor: undefined, seenIds: [] });
+    assert.deepEqual(warnings, []);
+  });
+});
+
+test("an old profile migrated before the tombstone gets one on its next flush", () => {
+  // Rollout gap: 0.17.5/0.17.6 stripped the legacy fields without writing a
+  // tombstone. The one-time pass must add it so those profiles' side-car loss
+  // is also loud — at the cost of a single config write, not a hot-path write.
+  withTempConfig((path) => {
+    writeFileSync(path, JSON.stringify({ apiKey: "k" }, null, 2) + "\n");
+    saveMessageState({ cursor: "c", seenIds: ["a"] });
+    const cfg = JSON.parse(readFileSync(path, "utf-8"));
+    assert.equal(cfg.messageStateMigrated, true);
+    assert.equal(cfg.apiKey, "k");
   });
 });

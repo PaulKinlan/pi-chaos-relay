@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { MessagePoller, formatMessagesForAgent } from "../poller.ts";
+import type { PollerPersistState } from "../poller.ts";
 import type { ChannelMessage, GetMessagesResult, RelayClient } from "../relay-client.ts";
 
 function msg(id: string, content = "hi"): ChannelMessage {
@@ -93,10 +94,10 @@ test("reset clears dedup but KEEPS the resume cursor", async () => {
   assert.equal(poller.cursor, "2026-01-01T00:00:00Z"); // cursor survives reset
 });
 
-test("cursor advances from message timestamps and fires onAdvance", async () => {
-  const advances: string[] = [];
+test("cursor advances from message timestamps and persists via onPersist", async () => {
+  const persists: PollerPersistState[] = [];
   const poller = new MessagePoller({} as never, {
-    onAdvance: (s) => advances.push(s),
+    onPersist: (state) => persists.push(state),
   });
   // accept() (the single delivery gate) drives the cursor, incl. WS pushes.
   poller.accept([
@@ -105,7 +106,10 @@ test("cursor advances from message timestamps and fires onAdvance", async () => 
     { ...msg("c"), timestamp: "2026-01-01T00:00:02Z" },
   ]);
   assert.equal(poller.cursor, "2026-01-01T00:00:03Z"); // max timestamp
-  assert.deepEqual(advances, ["2026-01-01T00:00:03Z"]); // latest persisted once
+  // ONE coalesced flush per batch carries the cursor AND the seen log.
+  assert.equal(persists.length, 1);
+  assert.equal(persists[0].since, "2026-01-01T00:00:03Z"); // latest persisted once
+  assert.deepEqual(persists[0].seen, ["a", "b", "c"]);
 });
 
 test("a poller created with a since cursor resumes from it", async () => {
@@ -133,17 +137,38 @@ test("persisted seen log: a restart does NOT re-process replayed messages", () =
   assert.deepEqual(replayed.map((m) => m.id), ["c"]); // only the genuinely-new one
 });
 
-test("accept persists the seen-id log via onSeen when it grows", () => {
-  const writes: string[][] = [];
+test("accept persists cursor + seen log via ONE onPersist per batch", () => {
+  const persists: PollerPersistState[] = [];
   const poller = new MessagePoller({} as never, {
-    onSeen: (ids) => writes.push(ids),
+    onPersist: (state) => persists.push(state),
   });
   poller.accept([msg("a"), msg("b")]);
   poller.accept([msg("b")]); // already seen → no new write
   poller.accept([msg("c")]);
-  assert.equal(writes.length, 2); // only the two batches that added ids
-  assert.deepEqual(writes[0], ["a", "b"]);
-  assert.deepEqual(writes[1], ["a", "b", "c"]);
+  assert.equal(persists.length, 2); // only the two batches that added ids
+  assert.deepEqual(persists[0].seen, ["a", "b"]);
+  assert.deepEqual(persists[1].seen, ["a", "b", "c"]);
+});
+
+test("a batch with no usable timestamp keeps the previous cursor value", () => {
+  // The coalesced flush must not DELETE an existing persisted cursor when a
+  // delivered message carries no timestamp: the flush CARRIES the poller's
+  // current (unchanged) cursor, so what lands on disk cannot regress. The
+  // observable outcome pinned here is the state handed to onPersist.
+  const persisted: PollerPersistState[] = [];
+  const poller = new MessagePoller({} as never, {
+    since: "2026-06-01T00:00:00Z",
+    onPersist: (state) => persisted.push(state),
+  });
+  const fresh = poller.accept([{ ...msg("no-ts"), timestamp: "" }]);
+  assert.deepEqual(fresh.map((m) => m.id), ["no-ts"]); // delivered
+  assert.equal(poller.cursor, "2026-06-01T00:00:00Z"); // cursor untouched
+  // The flush reports the PREVIOUS cursor (not undefined), and the new id
+  // landed in the seen log — so a writer persisting this state keeps the
+  // resume position and the de-dup entry.
+  assert.equal(persisted.length, 1);
+  assert.equal(persisted[0].since, "2026-06-01T00:00:00Z");
+  assert.deepEqual(persisted[0].seen, ["no-ts"]);
 });
 
 test("formatMessagesForAgent handles empty and non-empty", () => {

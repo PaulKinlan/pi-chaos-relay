@@ -49,8 +49,8 @@ import {
   savePersisted,
   setApprovalMode,
   setChannelRecords,
-  setMessagesCursor,
-  setSeenMessageIds,
+  loadMessageState,
+  saveMessageState,
   getConfigPath,
   setActiveConfigPath,
   profilePathForName,
@@ -319,30 +319,29 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // Create a poller that resumes from the persisted cursor and writes the
   // cursor back as it advances, so a restart doesn't re-read the relay backlog.
   function makePoller(c: RelayClient): MessagePoller {
-    const persisted = loadPersisted();
+    // Cursor + de-dup log come from the side-car state file (falling back to
+    // the legacy in-config fields on first run after upgrade), so the delivery
+    // hot path never rewrites the profile config at all.
+    const state = loadMessageState();
     return new MessagePoller(c, {
-      since: persisted.messagesCursor,
-      // Persisting the resume cursor is best-effort and runs on the WebSocket
-      // message-delivery path — never let a disk error here become an
-      // uncaughtException that kills pi. Losing a cursor update at worst
-      // re-reads a little backlog; the de-dup log filters the rest.
-      onAdvance: (s) => {
+      since: state.cursor,
+      // ONE small atomic flush per delivery batch persists the resume cursor
+      // and the de-dup log together to the side-car (previously two whole-file
+      // config rewrites per batch — the dominant per-message CPU cost; see
+      // bead pi-chaos-relay-mlq). Persisting is best-effort and runs on the
+      // WebSocket message-delivery path — never let a disk error here become
+      // an uncaughtException that kills pi. Losing an update at worst re-reads
+      // a little backlog; the de-dup log filters the rest.
+      onPersist: ({ since, seen }) => {
         try {
-          setMessagesCursor(s);
+          saveMessageState({ cursor: since, seenIds: seen });
         } catch (err) {
-          log(`WARN: failed to persist resume cursor: ${err instanceof Error ? err.message : String(err)}`);
+          log(`WARN: failed to persist message cursor/seen log: ${err instanceof Error ? err.message : String(err)}`);
         }
       },
-      // Restore + persist the de-dup log so restarts don't re-process the
+      // Restore the persisted de-dup log so restarts don't re-process the
       // relay's on-connect message replay.
-      seen: persisted.seenMessageIds,
-      onSeen: (ids) => {
-        try {
-          setSeenMessageIds(ids);
-        } catch (err) {
-          log(`WARN: failed to persist seen-message log: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      },
+      seen: state.seenIds,
     });
   }
 

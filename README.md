@@ -268,9 +268,16 @@ configured anywhere, auto-provisioning targets the hosted relay (with a warning)
 and a set-but-invalid `CHAOS_RELAY_URL` with no saved URL is **refused** instead
 of silently registering against the default.
 
-The config file is written atomically (temp file + rename), so a concurrent
-reader — a cursor advance, or a second pi session sharing the same profile —
-never sees a half-written file. A damaged config never crashes the bridge: an
+The config file (and the `<config>.state` side-car holding the message cursor
+and de-dup log) are written atomically (temp file + rename), so a concurrent
+reader — e.g. a second pi session sharing the same profile —
+never sees a half-written file. A crash between the temp write and the rename
+leaves an inert `.tmp.*` orphan beside the file while the previous complete
+file survives. **Backups of a profile must include BOTH the config file and
+its `.state` side-car**: the de-dup log lives only in the side-car, so a
+backup that restores the config without it resets de-dup (recent messages may
+be re-delivered — the extension warns loudly when it detects this).
+A damaged config never crashes the bridge: an
 empty or whitespace-only file self-heals silently, and anything else that
 fails to read or parse (truncated JSON, a hand-edit, non-object content) is
 ignored with one warning naming the file and the error, falling back to
@@ -389,7 +396,8 @@ While a pi session is active, the extension holds a **WebSocket** to the relay
 and receives messages the instant they arrive. A slow background **safety poll**
 (every ~120s) runs only as a backstop in case a push is missed between
 reconnects. New messages are de-duplicated by id — and that de-dup log is
-**persisted** (`seenMessageIds` in the config file), so the relay's on-connect
+**persisted** (in a small side-car `<config>.state` file next to the config,
+written once per delivery batch), so the relay's on-connect
 replay (a 5-minute lookback it sends every time the WebSocket connects) never
 re-processes a message already handled before a restart. Fresh messages are
 injected into the agent as a user message that includes each message's `id`,
