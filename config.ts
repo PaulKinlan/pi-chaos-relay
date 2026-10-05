@@ -298,23 +298,83 @@ export interface ResolvedConfig {
   serverPublicKey?: JsonWebKey;
 }
 
-export function loadPersisted(): PersistedConfig {
-  if (!existsSync(activeConfigPath)) return {};
-  const raw = readFileSync(activeConfigPath, "utf-8");
-  // An empty / whitespace-only file is a truncation artifact — e.g. a legacy
-  // non-atomic write that was interrupted, or a reader that caught a
-  // truncate-then-write mid-flight. There are no credentials to lose, so
-  // recover silently instead of throwing. Throwing here was fatal: this runs on
-  // the WebSocket message path (setMessagesCursor → savePersisted →
-  // loadPersisted), so an "Unexpected end of JSON input" became an
-  // uncaughtException that crashed pi.
-  if (raw.trim() === "") return {};
-  try {
-    return JSON.parse(raw) as PersistedConfig;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`Failed to parse ${activeConfigPath}: ${message}`);
+/**
+ * Result of reading the persisted config file.
+ *
+ * `config` is always usable — `{}` (the same defaults an absent file produces)
+ * whenever the file is missing, empty, or unreadable. `corrupt` is set when the
+ * file exists but could not be read or parsed, so `/chaos-relay doctor` can still
+ * report the file as broken instead of lying that it "parses".
+ */
+export interface PersistedReadResult {
+  config: PersistedConfig;
+  corrupt?: { path: string; reason: string };
+}
+
+/** (path, reason) pairs already warned about, so a hot-path read warns once. */
+const warnedCorruptConfigs = new Set<string>();
+
+function messageOf(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Emit ONE operator-facing warning per corrupt config file and fall back to
+ * defaults. loadPersisted runs on the WebSocket message path
+ * (setMessagesCursor → savePersisted → loadPersisted), so the warning is
+ * deduped per path + reason — an unreadable file must be visible, but it must
+ * not print on every cursor advance.
+ */
+function degradeToDefaults(reason: string): PersistedReadResult {
+  if (!warnedCorruptConfigs.has(reason)) {
+    warnedCorruptConfigs.add(reason);
+    console.warn(
+      `pi-chaos-relay: ${reason} — ignoring it and falling back to defaults. ` +
+        `Fix the file, or run /chaos-relay reset all then /chaos-relay setup.`,
+    );
   }
+  return { config: {}, corrupt: { path: activeConfigPath, reason } };
+}
+
+/**
+ * Read the persisted config, tolerating anything that is not valid persisted
+ * JSON. An empty / whitespace-only file is a truncation artifact — e.g. a legacy
+ * non-atomic write that was interrupted, or a reader that caught a
+ * truncate-then-write mid-flight — so it recovers silently. Everything else
+ * that fails to read or parse degrades to defaults with one warning, because
+ * throwing here was fatal: this runs on the WebSocket message path
+ * (setMessagesCursor → savePersisted → loadPersisted), so an "Unexpected end of
+ * JSON input" became an uncaughtException that crashed pi.
+ */
+export function readPersisted(): PersistedReadResult {
+  let raw: string;
+  try {
+    raw = readFileSync(activeConfigPath, "utf-8");
+  } catch (err) {
+    // Not existing is the normal "nothing persisted yet" case — stay quiet.
+    if ((err as { code?: string }).code === "ENOENT") return { config: {} };
+    return degradeToDefaults(`Failed to read ${activeConfigPath}: ${messageOf(err)}`);
+  }
+  if (raw.trim() === "") return { config: {} };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return degradeToDefaults(`Failed to parse ${activeConfigPath}: ${messageOf(err)}`);
+  }
+  // Valid JSON that is not the expected shape (null, an array, a bare scalar)
+  // has no config fields to read — and `null` would crash resolveConfig.
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    const got = parsed === null ? "null" : Array.isArray(parsed) ? "an array" : typeof parsed;
+    return degradeToDefaults(
+      `Failed to parse ${activeConfigPath}: expected a JSON object, got ${got}`,
+    );
+  }
+  return { config: parsed as PersistedConfig };
+}
+
+export function loadPersisted(): PersistedConfig {
+  return readPersisted().config;
 }
 
 // Monotonic suffix so overlapping writes from one process never collide on the

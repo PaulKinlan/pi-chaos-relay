@@ -256,9 +256,11 @@ to the default rather than breaking every request.
 
 The config file is written atomically (temp file + rename), so a concurrent
 reader — a cursor advance, or a second pi session sharing the same profile —
-never sees a half-written file. An empty/truncated config self-heals on read
-instead of crashing. If a config somehow becomes genuinely corrupt (non-empty
-but unparseable), `/chaos-relay reset` (or `reset all`) clears it.
+never sees a half-written file. A damaged config never crashes the bridge: an
+empty/truncated file self-heals silently, and anything else that fails to read
+or parse (truncated JSON, a hand-edit, non-object content) is ignored with one
+warning naming the file and the error, falling back to defaults. `/chaos-relay
+reset` (or `reset all`) clears a file you don't want to repair by hand.
 
 ### "The reply was accepted" does not mean it was delivered
 
