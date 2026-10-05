@@ -44,12 +44,16 @@ resolve and then runs the strict check in `scripts/check-version-consistency.mjs
 `package.json`, the top-level `version` in `package-lock.json` and
 `package-lock.json`'s `packages[""].version` must agree, and the version must not
 move below that base. The **agreement** half needs no base, so it is enforced on
-every run; the **monotonicity** half is enforced against `origin/master` when that
-ref resolves, and in a shallow, single-branch, offline or remote-less checkout the
-wrapper falls back to `HEAD` and SAYS SO — naming the half it did not enforce and
-how to enforce it. Run the strict check directly with
-`npm run check:version -- --base <ref>`: there the base ref is required and an
-unresolvable ref fails closed rather than skipping the check.
+every run; the **monotonicity** half is enforced against the default branch when
+that ref resolves, and in a shallow, single-branch, offline or remote-less checkout
+the wrapper falls back to `HEAD` and SAYS SO — naming the half it did not enforce and
+how to enforce it. The default base is read through the FULLY QUALIFIED ref
+`refs/remotes/origin/master`, because a local branch named `origin/master` would
+otherwise shadow it (git resolves a bare name by precedence, `refs/heads` first, with
+only a warning). For the same reason the strict checker REFUSES an ambiguous bare
+base name rather than resolving it. Run the strict check directly with
+`npm run check:version -- --base refs/remotes/origin/master`: there the base ref is
+required and an unresolvable ref fails closed rather than skipping the check.
 
 ## Keep docs in sync — in the SAME commit
 

@@ -1,7 +1,7 @@
 {
   "name": "pi-chaos-relay",
-  "version": "0.17.9",
-  "description": "Bridge the pi coding agent to a CHAOS relay server — drive and answer your pi agent over Telegram and email.",
+  "version": "0.17.10",
+  "description": "Bridge the pi coding agent to a CHAOS relay server \u2014 drive and answer your pi agent over Telegram and email.",
   "type": "module",
   "license": "MIT",
   "author": "Paul Kinlan",

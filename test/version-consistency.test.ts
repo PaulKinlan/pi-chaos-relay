@@ -148,3 +148,68 @@ test("version consistency: unreadable metadata is a failure, not a pass", () => 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/** Local fixture helpers for this file (the gate test has its own copies). */
+function writeVersions(dir: string, version: string): void {
+  writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "fixture", version }, null, 2));
+  writeFileSync(
+    join(dir, "package-lock.json"),
+    JSON.stringify(
+      { name: "fixture", version, lockfileVersion: 3, packages: { "": { name: "fixture", version } } },
+      null,
+      2,
+    ),
+  );
+}
+
+function gitEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_AUTHOR_NAME: "t",
+    GIT_AUTHOR_EMAIL: "t@t",
+    GIT_COMMITTER_NAME: "t",
+    GIT_COMMITTER_EMAIL: "t@t",
+  };
+}
+
+/** Make a commit carrying `version` and return its sha, WITHOUT moving HEAD. */
+function sideCommit(dir: string, version: string): string {
+  writeVersions(dir, version);
+  const git = (args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", env: gitEnv() });
+  assert.equal(git(["add", "-A"]).status, 0);
+  const tree = git(["write-tree"]).stdout.trim();
+  const commit = spawnSync("git", ["-C", dir, "commit-tree", tree, "-m", `version ${version}`], {
+    encoding: "utf8",
+    env: gitEnv(),
+  }).stdout.trim();
+  assert.ok(commit, `commit-tree produced a commit for ${version}`);
+  return commit;
+}
+
+test("version consistency: an AMBIGUOUS bare base name fails closed instead of resolving", () => {
+  // A local branch named like a remote shadows refs/remotes/origin/master; git
+  // resolves the bare name by precedence with only a warning, so the check must
+  // refuse rather than compare against whichever ref git happened to prefer.
+  const dir = makeFixture("0.17.7", { pkg: "0.17.7", lockTop: "0.17.7", lockRoot: "0.17.7" });
+  try {
+    const shadow = sideCommit(dir, "0.99.0");
+    const remote = sideCommit(dir, "0.17.7");
+    const git = (args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", env: gitEnv() });
+    // BOTH refs must exist, or there is nothing to be ambiguous about.
+    assert.equal(git(["update-ref", "refs/remotes/origin/master", remote]).status, 0);
+    assert.equal(git(["update-ref", "refs/heads/origin/master", shadow]).status, 0);
+    writeVersions(dir, "0.17.7");
+
+    const bare = run(dir, "origin/master");
+    assert.equal(bare.status, 1, "an ambiguous bare base must not resolve silently");
+    assert.match(bare.stderr, /is AMBIGUOUS/);
+    assert.match(bare.stderr, /refs\/heads\/origin\/master and refs\/remotes\/origin\/master/);
+    assert.match(bare.stderr, /fully-qualified ref/);
+
+    // The qualified form is the documented escape hatch and must work.
+    const qualified = run(dir, "refs/remotes/origin/master");
+    assert.equal(qualified.status, 0, "the fully-qualified ref must resolve");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
