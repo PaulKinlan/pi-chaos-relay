@@ -395,11 +395,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // (no CHAOS_RELAY_URL and no persisted relayUrl → the default relay). A fresh
     // profile would otherwise silently mint an identity + apiKey against
     // chaos-relay.com.
-    const envUrl = process.env.CHAOS_RELAY_URL?.trim() ?? "";
-    const persistedUrl = isValidRelayUrl(persisted.relayUrl ?? "")
-      ? persisted.relayUrl!.trim()
-      : "";
-    if (!envUrl && !persistedUrl) {
+    const envUrl = process.env.CHAOS_RELAY_URL ?? "";
+    const persistedUrl = persisted.relayUrl ?? "";
+    const operatorConfiguredUrl = isValidRelayUrl(envUrl) || isValidRelayUrl(persistedUrl);
+    if (!operatorConfiguredUrl) {
       const warning = unconfiguredRelayWarning(relayUrl);
       log(`WARN: ${warning}`);
       notify?.(warning);
@@ -1586,11 +1585,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
     // The common case needs ZERO config: a user shouldn't have to know what a
     // "relay URL" or an "agent id" is, or choose an auth scheme. Default to the
-    // hosted relay and auto-register an ECDSA session. `--advanced` exposes the
-    // URL / agent-id / paste-key prompts for self-hosters.
-    let relayUrl = isValidRelayUrl(persisted.relayUrl ?? "")
-      ? persisted.relayUrl!
-      : DEFAULT_RELAY_URL;
+    // hosted relay and auto-register an ECDSA session — but honour
+    // CHAOS_RELAY_URL when the operator set it, so registration and transport
+    // never disagree. `--advanced` exposes the URL / agent-id / paste-key
+    // prompts for self-hosters.
+    let relayUrl = resolveConfig(persisted).relayUrl;
     let agentId = persisted.agentId ?? "pi";
     let apiKey = persisted.apiKey;
     let userId = persisted.userId;

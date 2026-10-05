@@ -395,6 +395,9 @@ test("auto-provision registers against CHAOS_RELAY_URL, not the production defau
 
   const fake = makeFakePi();
   chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  // Stop the background poller/WebSocket this auto-provision path starts, so the
+  // test leaves no reconnect timer behind.
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-verify", fake.notifications)));
   const tg = fake.tools.find((tool) => tool.name === "relay_register_telegram");
   assert.ok(tg, "extension registers relay_register_telegram");
   const execute = tg.execute as (
@@ -420,4 +423,42 @@ test("auto-provision registers against CHAOS_RELAY_URL, not the production defau
   };
   assert.equal(persisted.relayUrl, localUrl, "persisted the env-configured relayUrl");
   assert.equal(persisted.apiKey, "ak_local", "persisted the local relay's apiKey");
+});
+
+test("auto-provision warns loudly when no relay URL is configured anywhere", async (t) => {
+  resetState();
+  const configPath = join(PI_DIR, "chaos-relay.json");
+  if (existsSync(configPath)) unlinkSync(configPath);
+
+  // Neither env nor persisted config names a relay, so the effective URL is the
+  // production default. Stub fetch so the registration attempt fails instantly
+  // instead of ever reaching the real relay — this test only asserts the warning
+  // that fires BEFORE registration is attempted.
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = ((_u: unknown, _i?: unknown) =>
+    Promise.reject(new Error("offline"))) as unknown as typeof fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(
+    fake.handlers,
+    "session_start",
+    { reason: "startup" },
+    makeCtx("sess-warn", fake.notifications),
+  );
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-warn", fake.notifications)));
+
+  const warned = fake.notifications.some(
+    (n) => n.level === "warning" && /No relay URL configured/.test(n.message),
+  );
+  assert.ok(warned, `warning surfaced to the user (${JSON.stringify(fake.notifications)})`);
+  // Nothing was registered: the fetch stub threw, so no config file was written.
+  assert.equal(existsSync(configPath), false, "no config/identity was persisted");
 });
