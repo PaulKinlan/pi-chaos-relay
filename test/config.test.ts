@@ -588,7 +588,7 @@ test("savePersisted onto a truncated file still lands the update", () => {
   });
 });
 
-test("savePersisted writes atomically and leaves no temp files behind", () => {
+test("savePersisted writes atomically and leaves no temp files behind on normal completion", () => {
   withConfigIsolated(() => {
     savePersisted({ relayUrl: "https://x.example.com", apiKey: "k" });
     // The atomic write goes through a `<config>.tmp.*` file then renames it
@@ -608,12 +608,17 @@ test("savePersisted writes atomically and leaves no temp files behind", () => {
 
 // ── Message-tracking side-car state (<config>.state) ────────────────────────
 
-test("the side-car never shows up as a profile in listProfiles()", () => {
-  // REAL behavioral pin (a path-string equality check would be vacuous, and
+test("regression guard: the side-car never shows up as a profile in listProfiles()", () => {
+  // Regression guard, NOT a discriminating pin for the side-car introduction:
+  // listProfiles' `chaos-relay*.json` glob ends in `.json$`, so it excluded a
+  // `.state` sibling even before the side-car existed (this test passes on the
+  // pre-fix code too). It guards the NAMING INVARIANT — if the side-car were
+  // ever renamed to a `.json` suffix (e.g. `<config>.state.json`), listProfiles
+  // would start listing it as a profile, and this test catches that. Run it in
+  // a CHILD node process (a path-string equality check would be vacuous, and
   // CONFIG_DIR is fixed at module load so an in-process HOME override can't
-  // reach it): run listProfiles() in a CHILD node process whose HOME is a
-  // fixture dir holding a profile config AND its .state side-car, and assert
-  // it offers exactly the one profile.
+  // reach it): fixture HOME holds a profile config AND its .state side-car, and
+  // the child must offer exactly the one profile.
   const home = join(tmpdir(), `chaos-relay-lp-${process.pid}-${tempConfigCounter++}`);
   mkdirSync(join(home, ".pi"), { recursive: true });
   writeFileSync(join(home, ".pi", "chaos-relay.json"), "{}");
@@ -718,6 +723,30 @@ test("legacy config fields are read as fallback and migrated out on first save",
     assert.equal(cfg.apiKey, "k"); // the rest of the config survives the strip
     assert.deepEqual(loadMessageState(), { cursor: "2026-01-02T00:00:00Z", seenIds: ["new1"] });
     assert.deepEqual(warnings, []); // a clean migration warns nothing
+  });
+});
+
+test("a failed tombstone write is retried on the next flush (flag armed only after success)", () => {
+  withTempConfig((path) => {
+    // Force the CONFIG write to fail while the side-car write succeeds: make
+    // the config path a DIRECTORY, so the sibling `<path>.state` writes fine
+    // but savePersisted's rename over the directory throws. This is the exact
+    // ordering the tombstone exists for — a side-car write that lands followed
+    // by a config write that fails.
+    mkdirSync(path);
+    assert.throws(() => saveMessageState({ cursor: "c1", seenIds: ["a"] }));
+    // The side-car write DID land (it is a sibling of the obstructed path).
+    assert.equal(existsSync(`${path}.state`), true);
+    // Clear the obstruction so the config path is a normal target again.
+    rmdirSync(path);
+    // The failed first attempt must NOT have armed the one-time migration
+    // flag: the second flush retries and writes the tombstone. (A regression
+    // that arms the flag BEFORE the write would skip here and leave
+    // messageStateMigrated unwritten, so a later side-car loss resets de-dup
+    // silently.)
+    saveMessageState({ cursor: "c2", seenIds: ["a", "b"] });
+    const cfg = JSON.parse(readFileSync(path, "utf-8"));
+    assert.equal(cfg.messageStateMigrated, true);
   });
 });
 

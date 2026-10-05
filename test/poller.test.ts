@@ -150,11 +150,13 @@ test("accept persists cursor + seen log via ONE onPersist per batch", () => {
   assert.deepEqual(persists[1].seen, ["a", "b", "c"]);
 });
 
-test("a batch with no usable timestamp keeps the previous cursor value", () => {
-  // The coalesced flush must not DELETE an existing persisted cursor when a
-  // delivered message carries no timestamp: the flush CARRIES the poller's
-  // current (unchanged) cursor, so what lands on disk cannot regress. The
-  // observable outcome pinned here is the state handed to onPersist.
+test("the coalesced flush carries the unchanged cursor AND the new seen id together", () => {
+  // Discriminating pin for the coalesced flush (pre-fix had SEPARATE
+  // onAdvance/onSeen callbacks, and onAdvance only fired when the cursor
+  // ADVANCED — a timestamp-less message advanced nothing, so the old code
+  // never re-persisted the cursor). onPersist must carry BOTH values in one
+  // call, so a writer persisting this state keeps the resume position AND the
+  // de-dup entry without deleting either.
   const persisted: PollerPersistState[] = [];
   const poller = new MessagePoller({} as never, {
     since: "2026-06-01T00:00:00Z",
@@ -163,9 +165,8 @@ test("a batch with no usable timestamp keeps the previous cursor value", () => {
   const fresh = poller.accept([{ ...msg("no-ts"), timestamp: "" }]);
   assert.deepEqual(fresh.map((m) => m.id), ["no-ts"]); // delivered
   assert.equal(poller.cursor, "2026-06-01T00:00:00Z"); // cursor untouched
-  // The flush reports the PREVIOUS cursor (not undefined), and the new id
-  // landed in the seen log — so a writer persisting this state keeps the
-  // resume position and the de-dup entry.
+  // The single flush reports the PREVIOUS cursor (not undefined) together with
+  // the new id in the seen log.
   assert.equal(persisted.length, 1);
   assert.equal(persisted[0].since, "2026-06-01T00:00:00Z");
   assert.deepEqual(persisted[0].seen, ["no-ts"]);
