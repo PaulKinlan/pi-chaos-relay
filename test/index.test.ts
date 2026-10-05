@@ -781,6 +781,132 @@ test("doctor strips credentials from a valid CHAOS_RELAY_URL (origin only)", asy
   }
 });
 
+test("status strips credentials from the relayUrl (origin only)", async () => {
+  resetState();
+  const password = "supersecretpass";
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: `https://user:${password}@example.com` }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  const command = fake.commands.get("chaos-relay");
+  assert.ok(command, "extension registers the /chaos-relay command");
+  await command.handler("status", makeCtx("sess-status-cred", fake.notifications));
+
+  if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+  else process.env.CHAOS_RELAY_URL = prevUrl;
+
+  const status = fake.notifications.map((n) => n.message).join("\n");
+  assert.ok(!status.includes(password), `status must not leak the password: ${status}`);
+  assert.ok(!status.includes("user@example.com"), `status must not leak userinfo: ${status}`);
+  assert.ok(status.includes("https://example.com"), `status shows the redacted origin (${status})`);
+});
+
+test("reset strips credentials from the cleared relayUrl (origin only)", async () => {
+  resetState();
+  const password = "supersecretpass";
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: `https://user:${password}@example.com`, apiKey: "ak" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  const command = fake.commands.get("chaos-relay");
+  assert.ok(command, "extension registers the /chaos-relay command");
+  await command.handler("reset", makeCtx("sess-reset-cred", fake.notifications));
+
+  if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+  else process.env.CHAOS_RELAY_URL = prevUrl;
+
+  const output = fake.notifications.map((n) => n.message).join("\n");
+  assert.ok(!output.includes(password), `reset must not leak the password: ${output}`);
+  assert.ok(!output.includes("user@example.com"), `reset must not leak userinfo: ${output}`);
+});
+
+test("the invalid-env warning and auto-provision log strip credentials from the persisted URL", async (t) => {
+  resetState();
+  const password = "supersecretpass";
+  const seenPaths: string[] = [];
+  const server = createServer((req, res) => {
+    seenPaths.push(req.url ?? "");
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url === "/auth/register") res.end(JSON.stringify({ userId: "u_warn", apiKey: "ak_warn" }));
+      else if (req.url === "/channels/telegram/register") res.end(JSON.stringify({ channelId: "ch_warn", botUsername: "wbot", pairingCode: "3" }));
+      else res.end(JSON.stringify({}));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const port = (server.address() as { port: number }).port;
+  const credUrl = `http://user:${password}@127.0.0.1:${port}`;
+
+  writeFileSync(join(PI_DIR, "chaos-relay.json"), JSON.stringify({ relayUrl: credUrl }) + "\n");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  process.env.CHAOS_RELAY_URL = "not a url"; // malformed → invalidEnvIgnoredWarning
+  const prevFetch = blockNonLoopbackFetch();
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = prevFetch;
+  });
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-warn-cred", fake.notifications)));
+  const tg = fake.tools.find((tool) => tool.name === "relay_register_telegram");
+  assert.ok(tg);
+  const notifications: Notification[] = [];
+  const execute = tg.execute as (...a: unknown[]) => Promise<unknown>;
+  await execute("t1", { botToken: "123:ABC" }, undefined, undefined, {
+    ui: { notify: (m: string, l?: string) => notifications.push({ message: m, level: l }) },
+  });
+
+  const text = notifications.map((n) => n.message).join("\n");
+  assert.ok(!text.includes(password), `warning must not leak the password: ${text}`);
+  assert.ok(!text.includes("user@127.0.0.1"), `warning must not leak userinfo: ${text}`);
+  assert.ok(text.includes(`127.0.0.1:${port}`), `warning shows the redacted origin: ${text}`);
+  // The auto-provision durable-log line is redacted too.
+  const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+  const logRaw = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+  assert.ok(!logRaw.includes(password), `log must not leak the password: ${logRaw}`);
+  assert.ok(!logRaw.includes("user@127.0.0.1"), `log must not leak userinfo: ${logRaw}`);
+});
+
+test("connection log lines strip credentials from the relayUrl", async (t) => {
+  resetState();
+  const password = "supersecretpass";
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: `http://user:${password}@127.0.0.1:9`, apiKey: "ak" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-log-cred", fake.notifications));
+  await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-log-cred", fake.notifications));
+
+  if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+  else process.env.CHAOS_RELAY_URL = prevUrl;
+
+  const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+  const logRaw = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+  assert.ok(logRaw.includes("connecting to relay"), `log has the connect line: ${logRaw}`);
+  assert.ok(!logRaw.includes(password), `log must not leak the password: ${logRaw}`);
+  assert.ok(!logRaw.includes("user@127.0.0.1"), `log must not leak userinfo: ${logRaw}`);
+});
+
 test("auto-provision trims surrounding whitespace from CHAOS_RELAY_URL", async (t) => {
   resetState();
   const configPath = join(PI_DIR, "chaos-relay.json");

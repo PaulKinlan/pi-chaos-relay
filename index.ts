@@ -171,6 +171,16 @@ function safeUrlOrigin(url: unknown): string {
   return parsed.origin === "null" ? "<invalid>" : parsed.origin;
 }
 
+/**
+ * Strip userinfo from any `scheme://user:pass@host` URL embedded in a message,
+ * so an error string that echoes a credential-bearing relay URL (e.g. a fetch
+ * "URL that includes credentials" error) cannot write the credentials to the
+ * durable log or the TUI. No-op when the message carries no such URL.
+ */
+function redactUserinfoFromMessage(message: string): string {
+  return message.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/gi, "$1");
+}
+
 export default function chaosRelayExtension(pi: ExtensionAPI): void {
   let client: RelayClient | undefined;
   let poller: MessagePoller | undefined;
@@ -233,7 +243,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       }
       return reg.apiKey;
     } catch (err) {
-      log(`auth recovery failed: ${err instanceof Error ? err.message : String(err)}`);
+      log(`auth recovery failed: ${redactUserinfoFromMessage(err instanceof Error ? err.message : String(err))}`);
       return null;
     }
   }
@@ -355,7 +365,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     if (!client) {
       const identity = cfg.keyPair ? "ECDSA-signed" : "Bearer-only (legacy)";
       log(
-        `connecting to relay ${cfg.relayUrl} as agentId="${cfg.agentId}" (${identity})`,
+        `connecting to relay ${safeUrlOrigin(cfg.relayUrl)} as agentId="${cfg.agentId}" (${identity})`,
       );
       client = new RelayClient({
         relayUrl: cfg.relayUrl,
@@ -378,20 +388,21 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   function unconfiguredRelayWarning(relayUrl: string): string {
     return (
       `No relay URL configured — auto-provisioning an identity against the ` +
-      `default relay ${relayUrl}. Set CHAOS_RELAY_URL (or run /chaos-relay setup) ` +
+      `default relay ${safeUrlOrigin(relayUrl)}. Set CHAOS_RELAY_URL (or run /chaos-relay setup) ` +
       `to point this instance at your own relay and keep its identity isolated.`
     );
   }
 
   /** Warning when CHAOS_RELAY_URL is set but malformed and a valid persisted URL
    *  exists — resolveConfig uses the persisted URL, but the operator should know
-   *  their env value is being ignored. Deliberately does NOT echo the env value:
-   *  a malformed URL can be a pasted secret/command, and this text reaches both
+   *  their env value is being ignored. Echoes NEITHER the env value NOR the
+   *  persisted URL verbatim: both are shown origin-only (safeUrlOrigin), since
+   *  either can carry a pasted secret or userinfo, and this text reaches both
    *  the durable log and the TUI. */
   function invalidEnvIgnoredWarning(used: string): string {
     return (
       `CHAOS_RELAY_URL is set but is not an absolute http(s):// URL — ignoring it ` +
-      `and using the persisted relay ${used}. Fix CHAOS_RELAY_URL to make it take effect.`
+      `and using the persisted relay ${safeUrlOrigin(used)}. Fix CHAOS_RELAY_URL to make it take effect.`
     );
   }
 
@@ -473,10 +484,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       cfg = resolveConfig();
       client = undefined;
       startPolling();
-      log(`auto-provisioned relay session userId=${reg.userId} at ${relayUrl}`);
+      log(`auto-provisioned relay session userId=${reg.userId} at ${safeUrlOrigin(relayUrl)}`);
       return ensureClient();
     } catch (err) {
-      log(`auto-provision failed: ${err instanceof Error ? err.message : String(err)}`);
+      log(`auto-provision failed: ${redactUserinfoFromMessage(err instanceof Error ? err.message : String(err))}`);
       return undefined;
     }
   }
@@ -672,7 +683,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         await c.reply({ channelType: ch.channelType, channelId: ch.channelId, content: question });
       }
     } catch (err) {
-      log(`approval: failed to send request, allowing by default: ${err instanceof Error ? err.message : String(err)}`);
+      log(`approval: failed to send request, allowing by default: ${redactUserinfoFromMessage(err instanceof Error ? err.message : String(err))}`);
       return true;
     }
     log(`approval: requested for ${toolName} via ${ch.channelType}; waiting for reply`);
@@ -719,7 +730,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       log(`delivering ${messages.length} new message(s) to the agent`);
       await queueDelivery(messages);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = redactUserinfoFromMessage(err instanceof Error ? err.message : String(err));
       log(`poll failed: ${msg}`);
     }
   }
@@ -732,7 +743,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     }
     // Primary transport: WebSocket push. The relay sends inbound messages the
     // instant they arrive (no 15s lag), and we reply over the same socket.
-    log(`connecting relay WebSocket to ${cfg.relayUrl}`);
+    log(`connecting relay WebSocket to ${safeUrlOrigin(cfg.relayUrl)}`);
     ws = new RelayWebSocket({
       relayUrl: cfg.relayUrl,
       apiKey: cfg.apiKey!,
@@ -998,7 +1009,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
             res,
           );
         } catch (err) {
-          log(`relay_reply: WS reply failed, falling back to HTTP: ${err instanceof Error ? err.message : String(err)}`);
+          log(`relay_reply: WS reply failed, falling back to HTTP: ${redactUserinfoFromMessage(err instanceof Error ? err.message : String(err))}`);
         }
       }
       try {
@@ -1028,7 +1039,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
             { ok: false, error: err.message },
           );
         }
-        log(`relay_reply: HTTP reply failed: ${err instanceof Error ? err.message : String(err)}`);
+        log(`relay_reply: HTTP reply failed: ${redactUserinfoFromMessage(err instanceof Error ? err.message : String(err))}`);
         throw toFriendly(err);
       }
     },
@@ -1202,7 +1213,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       }
     } catch (err) {
       ctx.ui.notify(
-        `Channel registration failed: ${err instanceof Error ? err.message : String(err)}`,
+        `Channel registration failed: ${redactUserinfoFromMessage(err instanceof Error ? err.message : String(err))}`,
         "error",
       );
     }
@@ -1658,7 +1669,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       relayUrl = (await ctx.ui.input("Relay URL", relayUrl)) || relayUrl;
       while (!isValidRelayUrl(relayUrl)) {
         ctx.ui.notify(
-          `"${relayUrl}" is not a valid URL. Include the scheme, e.g. https://chaos-relay.com`,
+          "That is not a valid URL. Include the scheme, e.g. https://chaos-relay.com",
           "warning",
         );
         relayUrl = (await ctx.ui.input(
@@ -1717,7 +1728,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       const h = await verify.health();
       ctx.ui.notify(`Relay reachable (status=${h.status}). Credentials saved.`, "info");
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = redactUserinfoFromMessage(err instanceof Error ? err.message : String(err));
       ctx.ui.notify(`Saved, but health check failed: ${message}`, "warning");
     }
 
@@ -1814,7 +1825,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const lines = [
       `extension:     pi-chaos-relay v${PACKAGE_VERSION}`,
       `config file:   ${getConfigPath()}`,
-      `relayUrl:      ${current.relayUrl}`,
+      `relayUrl:      ${safeUrlOrigin(current.relayUrl)}`,
       `connection:    ${current.agentId} (this session's name)`,
       `identity:      ${current.keyPair ? "ECDSA P-256 keypair (durable identity)" : "Bearer-only (legacy, no keypair)"}`,
       `apiKey:        ${
@@ -1890,7 +1901,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         before.channels?.length ? `${before.channels.length} channel(s)` : null,
       ].filter(Boolean).join(", ");
       ctx.ui.notify(
-        `chaos-relay: cleared relayUrl${hadUrl ? ` (was "${before.relayUrl}")` : ""}. ` +
+        `chaos-relay: cleared relayUrl${hadUrl ? ` (was ${safeUrlOrigin(before.relayUrl)})` : ""}. ` +
           `Kept: ${kept || "nothing else was set"}. ` +
           `Run /chaos-relay setup to re-enter the URL, or /chaos-relay doctor to diagnose.`,
         "info",
