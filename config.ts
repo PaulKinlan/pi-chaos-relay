@@ -288,6 +288,17 @@ export interface PersistedConfig {
    */
   seenMessageIds?: string[];
   /**
+   * Tombstone set when the legacy cursor/seen-id fields above were stripped
+   * from this config (their data now lives ONLY in the <config>.state
+   * side-car). Its purpose is diagnostic: if the side-car then goes missing,
+   * loadMessageState can tell a genuine first run (silent) from a LOST
+   * side-car after migration (loud warning — de-dup was reset, so recent
+   * messages may be re-delivered; restore the side-car from backup).
+   * Backups of a profile must therefore include BOTH the config file and its
+   * .state side-car.
+   */
+  messageStateMigrated?: boolean;
+  /**
    * ECDSA P-256 keypair (JWK) bound to this session at registration. The
    * private key is SECRET — it is the client's identity and is never sent to
    * the relay or committed. Stored only in this 0600 file under ~/.pi.
@@ -424,6 +435,14 @@ let tmpCounter = 0;
  * concurrent reader always sees either the complete old file or the complete
  * new one — never a half-written/truncated file. Shared by the config writer
  * and the message-state side-car writer so BOTH get the same guarantee.
+ *
+ * Crash residual, stated rather than glossed: this is atomic-replace, not
+ * crash-without-trace. If the process dies between the temp write and the
+ * rename, an inert `<target>.tmp.<pid>.<n>` orphan is left beside the target
+ * and the PREVIOUS complete file survives at the target (a later batch may
+ * therefore replay after restart — the de-dup log's job). The chmod to 0600
+ * is best-effort: on filesystems that reject it the file keeps the temp
+ * file's default mode. Neither residual affects a concurrent reader.
  */
 function atomicWriteSync(path: string, contents: string): void {
   // Ensure the target's directory exists (the config may live outside ~/.pi
@@ -556,6 +575,23 @@ export function loadMessageState(): MessageTrackingState {
   }
   // Legacy fallback (pre-side-car profiles) — also the seed for migration.
   const persisted = loadPersisted();
+  // A profile that already migrated carries no legacy fields, so a missing
+  // side-car would otherwise silently reset de-dup. The tombstone makes the
+  // loss LOUD: warn once that recent messages may be re-delivered and that the
+  // side-car should be restored from backup (a genuine first run has no
+  // tombstone and stays silent).
+  if (persisted.messageStateMigrated) {
+    const reason = `message-state side-car ${messageStatePath()} is missing, but this profile already migrated to it`;
+    if (!warnedCorruptStates.has(reason)) {
+      warnedCorruptStates.add(reason);
+      console.warn(
+        `pi-chaos-relay: ${reason}. The de-dup log has been reset, so the ` +
+          `relay's on-connect replay may re-deliver recent messages. Restore ` +
+          `${messageStatePath()} from backup (backups must include BOTH the ` +
+          `config file and its .state side-car).`,
+      );
+    }
+  }
   return {
     cursor: persisted.messagesCursor,
     seenIds: persisted.seenMessageIds ?? [],
@@ -580,8 +616,20 @@ export function saveMessageState(state: MessageTrackingState): void {
   if (stateMigrated) return;
   stateMigrated = true;
   const persisted = loadPersisted();
-  if (persisted.seenMessageIds !== undefined || persisted.messagesCursor !== undefined) {
-    savePersisted({ seenMessageIds: undefined, messagesCursor: undefined });
+  // One-time pass per process/profile: strip any legacy in-config fields, and
+  // make sure the tombstone exists even for profiles that migrated before the
+  // tombstone was introduced (otherwise their side-car loss would stay
+  // silent). Costs a single config write at the first delivered batch.
+  if (
+    persisted.seenMessageIds !== undefined ||
+    persisted.messagesCursor !== undefined ||
+    persisted.messageStateMigrated !== true
+  ) {
+    savePersisted({
+      seenMessageIds: undefined,
+      messagesCursor: undefined,
+      messageStateMigrated: true,
+    });
   }
 }
 

@@ -152,16 +152,23 @@ test("accept persists cursor + seen log via ONE onPersist per batch", () => {
 
 test("a batch with no usable timestamp keeps the previous cursor value", () => {
   // The coalesced flush must not DELETE an existing persisted cursor when a
-  // delivered message carries no timestamp: the poller reports its current
-  // cursor (unchanged), and setMessageTrackingState leaves the stored value
-  // alone when handed undefined — so a restart still resumes correctly.
+  // delivered message carries no timestamp: the flush CARRIES the poller's
+  // current (unchanged) cursor, so what lands on disk cannot regress. The
+  // observable outcome pinned here is the state handed to onPersist.
+  const persisted: PollerPersistState[] = [];
   const poller = new MessagePoller({} as never, {
     since: "2026-06-01T00:00:00Z",
-    onPersist: () => {},
+    onPersist: (state) => persisted.push(state),
   });
   const fresh = poller.accept([{ ...msg("no-ts"), timestamp: "" }]);
   assert.deepEqual(fresh.map((m) => m.id), ["no-ts"]); // delivered
   assert.equal(poller.cursor, "2026-06-01T00:00:00Z"); // cursor untouched
+  // The flush reports the PREVIOUS cursor (not undefined), and the new id
+  // landed in the seen log — so a writer persisting this state keeps the
+  // resume position and the de-dup entry.
+  assert.equal(persisted.length, 1);
+  assert.equal(persisted[0].since, "2026-06-01T00:00:00Z");
+  assert.deepEqual(persisted[0].seen, ["no-ts"]);
 });
 
 test("formatMessagesForAgent handles empty and non-empty", () => {
