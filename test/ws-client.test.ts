@@ -711,7 +711,7 @@ test("backoff is capped at maxBackoffMs", (t) => {
   t.mock.timers.reset();
 });
 
-test("a successful open resets the backoff", (t) => {
+test("a socket that opens and immediately dies keeps the exponential backoff", (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const h = harness();
   h.ws.start();
@@ -719,16 +719,39 @@ test("a successful open resets the backoff", (t) => {
   h.last().drop(1006); // attempt 1: 2000ms
   t.mock.timers.tick(2_000);
   assert.equal(h.sockets.length, 2);
-  h.last().drop(1006); // attempt 2: 4000ms
-  t.mock.timers.tick(4_000);
+
+  h.last().open(); // opens…
+  h.last().drop(1006); // …and dies immediately (inside the stability window)
+  // attempt 2 is scheduled at 4000ms — the open-then-die did NOT reset the
+  // backoff. Probe INSIDE (2000ms, 4000ms): the pre-fix code reconnected at
+  // 2000ms, so ticking only to 1999ms/4000ms would let this test pass against
+  // the unfixed code (review finding: the assertion interval must exclude the
+  // reset-at-open delay).
+  t.mock.timers.tick(3_999);
+  assert.equal(h.sockets.length, 2, "reconnected before the doubled backoff elapsed");
+  t.mock.timers.tick(1);
   assert.equal(h.sockets.length, 3);
 
-  h.last().open(); // the handshake succeeded — attempts resets
+  h.ws.stop();
+  t.mock.timers.reset();
+});
+
+test("a socket that stays up long enough resets the backoff", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const h = harness();
+  h.ws.start();
+
+  h.last().drop(1006); // attempt 1: 2000ms
+  t.mock.timers.tick(2_000);
+  assert.equal(h.sockets.length, 2);
+
+  h.last().open(); // handshake succeeds
+  t.mock.timers.tick(30_000); // survives the stability window → backoff resets
   h.last().drop(1006);
   t.mock.timers.tick(1_999);
-  assert.equal(h.sockets.length, 3, "backed off more than the first-attempt delay");
+  assert.equal(h.sockets.length, 2, "backed off more than the first-attempt delay");
   t.mock.timers.tick(1);
-  assert.equal(h.sockets.length, 4);
+  assert.equal(h.sockets.length, 3);
 
   h.ws.stop();
   t.mock.timers.reset();
