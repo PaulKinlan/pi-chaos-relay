@@ -143,7 +143,7 @@ You get that as a `ctx.ui.notify` at `session_start` and in
 profile it was already using, or with the relay idle if it had none — so the
 collision is obvious instead of quietly becoming someone else.
 
-**Why not auto-create.** Until v0.17.2 the extension dodged the collision by
+**Why not auto-create.** Until v0.17.3 the extension dodged the collision by
 minting a new profile named `hostname-pid` (a base36 process id). The name
 looked random (`omarchy-2if`) but was derived from the pid, and every collision
 minted a new identity — a config file, an ECDSA keypair, a relay session. One
@@ -216,7 +216,7 @@ done
 **Do not sweep the profile that owns your channels.** That file *is* the
 identity the channels are bound to: deleting it loses the keypair, and with it
 the relay session that receives your Telegram/email. Legacy auto-created names
-(`omarchy-…`, minted before v0.17.2) and per-shell `no-relay-…` names are the
+(`omarchy-…`, minted before v0.17.3) and per-shell `no-relay-…` names are the
 ones that can go; a profile you named yourself — or that reports channels above
 — deserves a look first.
 
@@ -267,10 +267,11 @@ to the default rather than breaking every request.
 The config file is written atomically (temp file + rename), so a concurrent
 reader — a cursor advance, or a second pi session sharing the same profile —
 never sees a half-written file. A damaged config never crashes the bridge: an
-empty/truncated file self-heals silently, and anything else that fails to read
-or parse (truncated JSON, a hand-edit, non-object content) is ignored with one
-warning naming the file and the error, falling back to defaults. `/chaos-relay
-reset` (or `reset all`) clears a file you don't want to repair by hand.
+empty or whitespace-only file self-heals silently, and anything else that
+fails to read or parse (truncated JSON, a hand-edit, non-object content) is
+ignored with one warning naming the file and the error, falling back to
+defaults. `/chaos-relay reset` (or `reset all`) clears a file you don't want
+to repair by hand.
 
 ### "The reply was accepted" does not mean it was delivered
 
