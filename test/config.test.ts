@@ -675,3 +675,55 @@ test("resetPersisted('all') wipes the side-car along with the config", () => {
     assert.deepEqual(loadMessageState(), { cursor: undefined, seenIds: [] });
   });
 });
+
+test("an empty side-car file degrades silently to the legacy values", () => {
+  // An empty/whitespace-only file is a truncation artifact (same policy as the
+  // config reader): recover from the legacy fields with NO warning, and let
+  // the next save rewrite the side-car.
+  withTempConfig((path, warnings) => {
+    savePersisted({ messagesCursor: "2026-01-01T00:00:00Z", seenMessageIds: ["legacy"] });
+    writeFileSync(`${path}.state`, "   \n");
+    assert.deepEqual(loadMessageState(), {
+      cursor: "2026-01-01T00:00:00Z",
+      seenIds: ["legacy"],
+    });
+    assert.deepEqual(warnings, []);
+    saveMessageState({ cursor: "c", seenIds: ["s"] });
+    assert.deepEqual(loadMessageState(), { cursor: "c", seenIds: ["s"] });
+  });
+});
+
+test("resetPersisted('url') keeps the side-car tracking state", () => {
+  withTempConfig((path) => {
+    savePersisted({ relayUrl: "https://bad.example.com", apiKey: "k" });
+    saveMessageState({ cursor: "c", seenIds: ["a"] });
+    resetPersisted("url");
+    // Only the relayUrl was cleared: config survives (minus the URL) and the
+    // cursor + de-dup log stay exactly where they were.
+    assert.deepEqual(loadPersisted().apiKey, "k");
+    assert.equal(loadPersisted().relayUrl, undefined);
+    assert.deepEqual(loadMessageState(), { cursor: "c", seenIds: ["a"] });
+  });
+});
+
+test("reset all re-arms the one-time legacy migration for a restored config", () => {
+  // Reviewer finding: after `reset all`, a legacy config hand-restored to the
+  // same path in the SAME session must still get its legacy fields migrated to
+  // the side-car on the next flush (the migrated-once flag must not survive
+  // the reset).
+  withTempConfig((path) => {
+    savePersisted({ apiKey: "k" });
+    saveMessageState({ cursor: "first", seenIds: ["a"] }); // arms stateMigrated
+    resetPersisted("all");
+    // Simulate restoring a pre-0.17.5 backup over the fresh start.
+    writeFileSync(
+      path,
+      JSON.stringify({ apiKey: "k2", messagesCursor: "old-cursor", seenMessageIds: ["old"] }, null, 2) + "\n",
+    );
+    saveMessageState({ cursor: "new", seenIds: ["n"] });
+    const cfg = JSON.parse(readFileSync(path, "utf-8"));
+    assert.equal("seenMessageIds" in cfg, false); // legacy fields stripped again
+    assert.equal("messagesCursor" in cfg, false);
+    assert.equal(cfg.apiKey, "k2");
+  });
+});

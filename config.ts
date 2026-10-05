@@ -357,10 +357,10 @@ function messageOf(err: unknown): string {
 
 /**
  * Emit ONE operator-facing warning per corrupt config file and fall back to
- * defaults. loadPersisted runs on the WebSocket message path
- * (setMessagesCursor → savePersisted → loadPersisted), so the warning is
- * deduped per path + reason — an unreadable file must be visible, but it must
- * not print on every cursor advance.
+ * defaults. loadPersisted runs on the message-delivery path
+ * (deliverToAgent → ensureClient → resolveConfig → loadPersisted), so the
+ * warning is deduped per path + reason — an unreadable file must be visible,
+ * but it must not print on every delivered batch.
  */
 function degradeToDefaults(reason: string): PersistedReadResult {
   if (!warnedCorruptConfigs.has(reason)) {
@@ -379,9 +379,9 @@ function degradeToDefaults(reason: string): PersistedReadResult {
  * non-atomic write that was interrupted, or a reader that caught a
  * truncate-then-write mid-flight — so it recovers silently. Everything else
  * that fails to read or parse degrades to defaults with one warning, because
- * throwing here was fatal: this runs on the WebSocket message path
- * (setMessagesCursor → savePersisted → loadPersisted), so an "Unexpected end of
- * JSON input" became an uncaughtException that crashed pi.
+ * throwing here was fatal: this runs on the message-delivery path
+ * (deliverToAgent → ensureClient → resolveConfig → loadPersisted), so an
+ * "Unexpected end of JSON input" became an uncaughtException that crashed pi.
  */
 export function readPersisted(): PersistedReadResult {
   let raw: string;
@@ -611,6 +611,11 @@ export function resetPersisted(scope: "url" | "all"): void {
     if (existsSync(messageStatePath())) {
       unlinkSync(messageStatePath());
     }
+    // Whatever lands at this path next (a re-run setup, or a legacy config
+    // restored by hand) must get its own migration pass — the flag keeping the
+    // one-time legacy strip from re-running per flush is no longer valid for
+    // the file we just deleted.
+    stateMigrated = false;
     return;
   }
   // "url": clear just the relayUrl field. savePersisted merges, and

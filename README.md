@@ -264,8 +264,9 @@ older configs or a bad `CHAOS_RELAY_URL` / `--advanced` entry. Invalid URLs are
 rejected (must be absolute `http(s)://…`) and an invalid saved/env URL falls back
 to the default rather than breaking every request.
 
-The config file is written atomically (temp file + rename), so a concurrent
-reader — a cursor advance, or a second pi session sharing the same profile —
+The config file (and the `<config>.state` side-car holding the message cursor
+and de-dup log) are written atomically (temp file + rename), so a concurrent
+reader — e.g. a second pi session sharing the same profile —
 never sees a half-written file. A damaged config never crashes the bridge: an
 empty or whitespace-only file self-heals silently, and anything else that
 fails to read or parse (truncated JSON, a hand-edit, non-object content) is
