@@ -465,14 +465,26 @@ export function setChannelRecords(channels: RegisteredChannelRecord[]): void {
   savePersisted({ channels });
 }
 
-/** Persist the inbound-message resume cursor (ISO timestamp). */
-export function setMessagesCursor(cursor: string): void {
-  savePersisted({ messagesCursor: cursor });
-}
-
-/** Persist the de-dup log of already-delivered message ids (capped list). */
-export function setSeenMessageIds(ids: string[]): void {
-  savePersisted({ seenMessageIds: ids });
+/**
+ * Persist the inbound-message resume cursor AND the de-dup seen-id log in ONE
+ * atomic write. Coalesced because both advance on every delivered batch, and
+ * two separate whole-file rewrites per batch were measured at ~79% of
+ * per-message CPU (bead pi-chaos-relay-mlq): every savePersisted re-reads,
+ * re-parses and re-serializes the entire profile config (keypair, channels,
+ * seen ids, …), so paying it twice per message doubled the hot path's disk
+ * work for no durability gain — one flush carries both values consistently.
+ *
+ * A batch can deliver a message without a usable timestamp (no cursor value);
+ * in that case the previously persisted cursor is left untouched rather than
+ * deleted, so a restart still resumes from the last known position.
+ */
+export function setMessageTrackingState(
+  cursor: string | undefined,
+  seenIds: string[],
+): void {
+  const updates: Partial<PersistedConfig> = { seenMessageIds: seenIds };
+  if (cursor !== undefined) updates.messagesCursor = cursor;
+  savePersisted(updates);
 }
 
 /** Persist the tool-approval policy. */

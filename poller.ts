@@ -12,32 +12,42 @@ import type { ChannelMessage, RelayClient } from "./relay-client.ts";
 const SEEN_MAX = 1000; // hard cap before trimming
 const SEEN_KEEP = 500; // how many to retain when trimming
 
+/** What a delivery batch changed on disk: the resume cursor and the de-dup log. */
+export interface PollerPersistState {
+  since: string | undefined;
+  seen: string[];
+}
+
 export class MessagePoller {
   private since: string | undefined;
   private seen: Set<string>;
   private readonly client: RelayClient;
-  private readonly onAdvance?: (since: string) => void;
-  private readonly onSeen?: (ids: string[]) => void;
+  private readonly onPersist?: (state: PollerPersistState) => void;
 
   constructor(
     client: RelayClient,
     opts: {
       since?: string;
-      onAdvance?: (since: string) => void;
+      /**
+       * Persist the resume cursor + de-dup log TOGETHER, once per delivery
+       * batch that surfaced anything. Coalesced deliberately: both advance on
+       * every delivered batch, and two separate whole-file config writes per
+       * batch were measured at ~79% of per-message CPU (bead
+       * pi-chaos-relay-mlq) — one flush carries both values consistently for
+       * half the disk work.
+       */
+      onPersist?: (state: PollerPersistState) => void;
       /** Previously-seen message ids, persisted so dedup survives a restart. */
       seen?: string[];
-      /** Persist the (capped) seen-id list whenever it grows. */
-      onSeen?: (ids: string[]) => void;
     } = {},
   ) {
     this.client = client;
     // Resume from a persisted cursor so a restart doesn't re-read the backlog.
     this.since = opts.since;
-    this.onAdvance = opts.onAdvance;
+    this.onPersist = opts.onPersist;
     // Restore the persisted de-dup log so the relay's on-connect replay and any
     // catch-up poll don't re-process messages already delivered before restart.
     this.seen = new Set(opts.seen ?? []);
-    this.onSeen = opts.onSeen;
   }
 
   /** The current resume cursor (ISO timestamp), or undefined if none yet. */
@@ -86,7 +96,6 @@ export class MessagePoller {
    */
   accept(messages: ChannelMessage[]): ChannelMessage[] {
     const fresh: ChannelMessage[] = [];
-    let advanced = false;
     for (const msg of messages) {
       if (!msg?.id || this.seen.has(msg.id)) continue;
       this.seen.add(msg.id);
@@ -95,7 +104,6 @@ export class MessagePoller {
       // strings compare chronologically, so a string compare is sufficient.
       if (msg.timestamp && (!this.since || msg.timestamp > this.since)) {
         this.since = msg.timestamp;
-        advanced = true;
       }
     }
     // Keep the dedup set from growing without bound.
@@ -103,10 +111,15 @@ export class MessagePoller {
       const keep = Array.from(this.seen).slice(-SEEN_KEEP);
       this.seen = new Set(keep);
     }
-    if (advanced && this.since) this.onAdvance?.(this.since);
-    // Persist the de-dup log when it changed, so a restart won't re-process
-    // anything the relay replays on the next WebSocket connect.
-    if (fresh.length > 0) this.onSeen?.(Array.from(this.seen));
+    // Persist the cursor + de-dup log in ONE write per batch (when the batch
+    // delivered anything), so a restart resumes after these messages and never
+    // re-processes what the relay replays on the next WebSocket connect. A
+    // batch that advanced the cursor always delivered a fresh message, so
+    // `fresh.length > 0` subsumes both persist triggers the old separate
+    // callbacks (cursor-advanced, seen-grew) covered.
+    if (fresh.length > 0) {
+      this.onPersist?.({ since: this.since, seen: Array.from(this.seen) });
+    }
     return fresh;
   }
 }
