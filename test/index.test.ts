@@ -18,6 +18,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import {
   existsSync,
   mkdirSync,
@@ -53,6 +54,32 @@ type Handler = (event: unknown, ctx: unknown) => unknown;
 interface Notification {
   message: string;
   level?: string;
+}
+
+/**
+ * Stub global fetch so any non-loopback request throws instead of reaching a
+ * real host. The registration tests point CHAOS_RELAY_URL at a local loopback
+ * relay, so a regression that ever ignores the configured URL and POSTs to the
+ * production relay fails fast here instead of making a real network call first.
+ * Returns the previous fetch for restoration in the test's `after`.
+ */
+function blockNonLoopbackFetch(): typeof fetch {
+  const prev = globalThis.fetch;
+  globalThis.fetch = (async (input: unknown, init?: unknown) => {
+    const href =
+      typeof input === "string" ? input : input instanceof URL ? input.href : String(input);
+    let host = "unparseable";
+    try {
+      host = new URL(href).hostname;
+    } catch {
+      /* leave unparseable → blocked below */
+    }
+    if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1") {
+      throw new Error(`blocked non-loopback fetch: ${href}`);
+    }
+    return (prev as unknown as (i: string, o?: unknown) => Promise<Response>)(href, init);
+  }) as unknown as typeof fetch;
+  return prev;
 }
 
 function makeFakePi() {
@@ -349,4 +376,465 @@ test("removeProfileLock refuses a lock owned by another pid and unlinks its own"
   writeFileSync(lock, String(process.pid));
   await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-guard", fake.notifications));
   assert.equal(existsSync(lock), false, "this process's own lock is released");
+});
+
+test("auto-provision registers against CHAOS_RELAY_URL, not the production default", async (t) => {
+  // Baseline: env-governs-registration for a clean value (not a pin for the trim/secret-echo fixes).
+  resetState();
+  // Fresh profile: no persisted config at all, so ensureConfigured must decide
+  // the registration URL from env (CHAOS_RELAY_URL) — never the default relay.
+  const configPath = join(PI_DIR, "chaos-relay.json");
+  if (existsSync(configPath)) unlinkSync(configPath);
+
+  // A local stand-in relay records every request path. If registration ever
+  // ignores CHAOS_RELAY_URL and POSTs to the production relay instead, this
+  // server sees nothing and the assertion below fails — deterministically, with
+  // no dependency on (or traffic to) the real relay.
+  const seenPaths: string[] = [];
+  const server = createServer((req, res) => {
+    seenPaths.push(req.url ?? "");
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url === "/auth/register") {
+        res.end(JSON.stringify({ userId: "u_local", apiKey: "ak_local" }));
+      } else if (req.url === "/channels/telegram/register") {
+        res.end(
+          JSON.stringify({ channelId: "ch_local", botUsername: "localbot", pairingCode: "1234" }),
+        );
+      } else {
+        res.end(JSON.stringify({}));
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const port = (server.address() as { port: number }).port;
+  const localUrl = `http://127.0.0.1:${port}`;
+
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  process.env.CHAOS_RELAY_URL = localUrl;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+  });
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  // Stop the background poller/WebSocket this auto-provision path starts, so the
+  // test leaves no reconnect timer behind.
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-verify", fake.notifications)));
+  // Fail fast if registration ever targets a non-loopback (production) host.
+  const prevFetch = blockNonLoopbackFetch();
+  t.after(() => {
+    globalThis.fetch = prevFetch;
+  });
+  const tg = fake.tools.find((tool) => tool.name === "relay_register_telegram");
+  assert.ok(tg, "extension registers relay_register_telegram");
+  const execute = tg.execute as (
+    id: string,
+    params: { botToken: string },
+    signal: unknown,
+    onUpdate: unknown,
+    ctx: unknown,
+  ) => Promise<unknown>;
+  await execute("t1", { botToken: "123:ABC" }, undefined, undefined, {
+    ui: { notify: () => {} },
+  });
+
+  // The registration POST reached the env-configured relay, not chaos-relay.com.
+  assert.ok(
+    seenPaths.includes("/auth/register"),
+    `registration reached the env-configured relay (saw ${JSON.stringify(seenPaths)})`,
+  );
+  // …and the credentials persisted came from that relay.
+  const persisted = JSON.parse(readFileSync(configPath, "utf-8")) as {
+    relayUrl?: string;
+    apiKey?: string;
+  };
+  assert.equal(persisted.relayUrl, localUrl, "persisted the env-configured relayUrl");
+  assert.equal(persisted.apiKey, "ak_local", "persisted the local relay's apiKey");
+});
+
+test("auto-provision falls through to persisted relayUrl when CHAOS_RELAY_URL is invalid", async (t) => {
+  resetState();
+  const seenPaths: string[] = [];
+  const server = createServer((req, res) => {
+    seenPaths.push(req.url ?? "");
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url === "/auth/register") {
+        res.end(JSON.stringify({ userId: "u_persisted", apiKey: "ak_persisted" }));
+      } else if (req.url === "/channels/telegram/register") {
+        res.end(JSON.stringify({ channelId: "ch_persisted", botUsername: "pbot", pairingCode: "9" }));
+      } else {
+        res.end(JSON.stringify({}));
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const port = (server.address() as { port: number }).port;
+  const localUrl = `http://127.0.0.1:${port}`;
+
+  // A valid persisted self-hosted URL with NO apiKey yet, plus a malformed env.
+  const configPath = join(PI_DIR, "chaos-relay.json");
+  writeFileSync(configPath, JSON.stringify({ relayUrl: localUrl }) + "\n");
+
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  process.env.CHAOS_RELAY_URL = "not a url";
+  const prevFetch = blockNonLoopbackFetch();
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = prevFetch;
+  });
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-invalid-env", fake.notifications)));
+  const tg = fake.tools.find((tool) => tool.name === "relay_register_telegram");
+  assert.ok(tg, "extension registers relay_register_telegram");
+  const notifications: Notification[] = [];
+  const execute = tg.execute as (
+    id: string,
+    params: { botToken: string },
+    signal: unknown,
+    onUpdate: unknown,
+    ctx: unknown,
+  ) => Promise<unknown>;
+  await execute("t1", { botToken: "123:ABC" }, undefined, undefined, {
+    ui: {
+      notify: (message: string, level?: string) => notifications.push({ message, level }),
+    },
+  });
+
+  // Registration reached the persisted relay — never the production default.
+  assert.ok(
+    seenPaths.includes("/auth/register"),
+    `registered against the persisted relay (saw ${JSON.stringify(seenPaths)})`,
+  );
+  // The persisted relayUrl is UNCHANGED (still the operator's self-hosted URL).
+  const persisted = JSON.parse(readFileSync(configPath, "utf-8")) as {
+    relayUrl?: string;
+    apiKey?: string;
+  };
+  assert.equal(persisted.relayUrl, localUrl, "persisted relayUrl unchanged");
+  assert.equal(persisted.apiKey, "ak_persisted", "persisted the local relay's apiKey");
+  // The invalid-env state is called out (reason + persisted fallback), without
+  // echoing the malformed value itself.
+  const warned = notifications.some(
+    (n) =>
+      n.level === "warning" &&
+      /not an absolute http\(s\):\/\/ URL/.test(n.message) &&
+      n.message.includes("persisted relay"),
+  );
+  assert.ok(warned, `warning named the invalid-env state (${JSON.stringify(notifications)})`);
+  assert.ok(
+    !notifications.some((n) => n.message.includes("not a url")),
+    `the malformed value was not echoed (${JSON.stringify(notifications)})`,
+  );
+});
+
+test("a configured profile never re-registers (no POST /auth/register)", async (t) => {
+  // Baseline: identity-safety invariant (does not exercise the trim/secret-echo fixes).
+  resetState();
+  const seenPaths: string[] = [];
+  const server = createServer((req, res) => {
+    seenPaths.push(req.url ?? "");
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url === "/auth/register") {
+        res.end(JSON.stringify({ userId: "u_new", apiKey: "ak_new" }));
+      } else if (req.url === "/channels/telegram/register") {
+        res.end(JSON.stringify({ channelId: "ch_existing", botUsername: "bot", pairingCode: "1" }));
+      } else {
+        res.end(JSON.stringify({}));
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const port = (server.address() as { port: number }).port;
+  const localUrl = `http://127.0.0.1:${port}`;
+
+  // Already-provisioned profile: relayUrl + apiKey present.
+  const configPath = join(PI_DIR, "chaos-relay.json");
+  writeFileSync(configPath, JSON.stringify({ relayUrl: localUrl, apiKey: "ak_existing" }) + "\n");
+
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  process.env.CHAOS_RELAY_URL = localUrl;
+  const prevFetch = blockNonLoopbackFetch();
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = prevFetch;
+  });
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-identity", fake.notifications)));
+  const tg = fake.tools.find((tool) => tool.name === "relay_register_telegram");
+  assert.ok(tg, "extension registers relay_register_telegram");
+  const execute = tg.execute as (
+    id: string,
+    params: { botToken: string },
+    signal: unknown,
+    onUpdate: unknown,
+    ctx: unknown,
+  ) => Promise<unknown>;
+  await execute("t1", { botToken: "123:ABC" }, undefined, undefined, {
+    ui: { notify: () => {} },
+  });
+
+  // The profile already has an apiKey, so ensureConfigured returned early and
+  // never POSTed /auth/register. Channel registration may still run.
+  assert.ok(
+    !seenPaths.includes("/auth/register"),
+    `no registration POST for an already-configured profile (saw ${JSON.stringify(seenPaths)})`,
+  );
+  assert.ok(
+    seenPaths.includes("/channels/telegram/register"),
+    `channel registration still ran against the configured relay (saw ${JSON.stringify(seenPaths)})`,
+  );
+});
+
+test("status reports the persisted relay URL when CHAOS_RELAY_URL is invalid", async () => {
+  // Baseline: first-valid-candidate resolution via the shared status consumer.
+  resetState();
+  // Valid persisted URL, no apiKey (so status skips the live reachability calls).
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9999" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  process.env.CHAOS_RELAY_URL = "not a url";
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  const command = fake.commands.get("chaos-relay");
+  assert.ok(command, "extension registers the /chaos-relay command");
+  await command.handler("status", makeCtx("sess-status", fake.notifications));
+
+  if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+  else process.env.CHAOS_RELAY_URL = prevUrl;
+
+  // The shared resolveConfig path (used by status/transport/doctor) now yields
+  // to the valid persisted URL when the env value is malformed — it must not
+  // silently fall back to the production default.
+  const status = fake.notifications.map((n) => n.message).join("\n");
+  assert.ok(status.includes("http://127.0.0.1:9999"), `status reports the persisted URL (${status})`);
+  assert.ok(!status.includes("chaos-relay.com"), `status does not fall back to production (${status})`);
+});
+
+test("auto-provision warns loudly when no relay URL is configured anywhere", async (t) => {
+  resetState();
+  const configPath = join(PI_DIR, "chaos-relay.json");
+  if (existsSync(configPath)) unlinkSync(configPath);
+
+  // Neither env nor persisted config names a relay, so the effective URL is the
+  // production default. Stub fetch so the registration attempt fails instantly
+  // instead of ever reaching the real relay — this test only asserts the warning
+  // that fires BEFORE registration is attempted.
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = ((_u: unknown, _i?: unknown) =>
+    Promise.reject(new Error("offline"))) as unknown as typeof fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(
+    fake.handlers,
+    "session_start",
+    { reason: "startup" },
+    makeCtx("sess-warn", fake.notifications),
+  );
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-warn", fake.notifications)));
+
+  const warned = fake.notifications.some(
+    (n) => n.level === "warning" && /No relay URL configured/.test(n.message),
+  );
+  assert.ok(warned, `warning surfaced to the user (${JSON.stringify(fake.notifications)})`);
+  // Nothing was registered: the fetch stub threw, so no config file was written.
+  assert.equal(existsSync(configPath), false, "no config/identity was persisted");
+});
+
+test("a malformed CHAOS_RELAY_URL is never echoed and refuses without a fetch", async (t) => {
+  resetState();
+  const configPath = join(PI_DIR, "chaos-relay.json");
+  if (existsSync(configPath)) unlinkSync(configPath);
+
+  // A secret-shaped, malformed value: the warning must name the VARIABLE and
+  // the reason, never the value — it reaches both the TUI and the durable log.
+  const secret = "sk-secret-pasted-token-1234567890";
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  process.env.CHAOS_RELAY_URL = secret;
+  let fetchCalls = 0;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = ((..._a: unknown[]) => {
+    fetchCalls++;
+    return Promise.reject(new Error("should not be called"));
+  }) as unknown as typeof fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(
+    fake.handlers,
+    "session_start",
+    { reason: "startup" },
+    makeCtx("sess-secret", fake.notifications),
+  );
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-secret", fake.notifications)));
+
+  const warned = fake.notifications.some(
+    (n) => n.level === "warning" && /not an absolute http\(s\):\/\/ URL/.test(n.message),
+  );
+  assert.ok(warned, `warning fired (${JSON.stringify(fake.notifications)})`);
+  // The malformed value never appears in any notification…
+  for (const n of fake.notifications) {
+    assert.ok(!n.message.includes(secret), `notification must not echo the env value: ${n.message}`);
+  }
+  // …nor in the durable log file.
+  const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+  const logRaw = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+  assert.ok(!logRaw.includes(secret), "log file must not echo the env value");
+  // The refusal returns before any registration, so fetch was never called.
+  assert.equal(fetchCalls, 0, "no fetch attempt on the refusal path");
+  assert.equal(existsSync(configPath), false, "no config/identity was persisted");
+});
+
+test("doctor never echoes a secret-shaped CHAOS_RELAY_URL", async () => {
+  resetState();
+  // Valid persisted loopback URL so the doctor's reachability probe stays local.
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9" }) + "\n",
+  );
+  const secret = "sk-doctor-secret-token-9876543210";
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  process.env.CHAOS_RELAY_URL = secret;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = ((..._a: unknown[]) =>
+    Promise.reject(new Error("offline"))) as unknown as typeof fetch;
+  try {
+    const fake = makeFakePi();
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    const command = fake.commands.get("chaos-relay");
+    assert.ok(command, "extension registers the /chaos-relay command");
+    await command.handler("doctor", makeCtx("sess-doctor-secret", fake.notifications));
+
+    const output = fake.notifications.map((n) => n.message).join("\n");
+    assert.ok(
+      !output.includes(secret),
+      `doctor output must not echo the env value: ${output}`,
+    );
+    // The interesting fact survives: env is set but not a valid URL.
+    assert.ok(output.includes("env=<invalid>"), `doctor reports the invalid env state (${output})`);
+  } finally {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("doctor strips credentials from a valid CHAOS_RELAY_URL (origin only)", async () => {
+  resetState();
+  const password = "supersecretpass";
+  const credUrl = `https://user:${password}@example.com`;
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  process.env.CHAOS_RELAY_URL = credUrl;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = ((..._a: unknown[]) =>
+    Promise.reject(new Error("offline"))) as unknown as typeof fetch;
+  try {
+    const fake = makeFakePi();
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    const command = fake.commands.get("chaos-relay");
+    assert.ok(command, "extension registers the /chaos-relay command");
+    await command.handler("doctor", makeCtx("sess-doctor-cred", fake.notifications));
+
+    const output = fake.notifications.map((n) => n.message).join("\n");
+    assert.ok(!output.includes(password), `doctor output must not leak the password: ${output}`);
+    assert.ok(!output.includes("user@example.com"), `doctor output must not leak userinfo: ${output}`);
+    // The origin is still shown so the operator can see which host is in effect.
+    assert.ok(output.includes("https://example.com"), `doctor shows the redacted origin (${output})`);
+  } finally {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("auto-provision trims surrounding whitespace from CHAOS_RELAY_URL", async (t) => {
+  resetState();
+  const configPath = join(PI_DIR, "chaos-relay.json");
+  if (existsSync(configPath)) unlinkSync(configPath);
+
+  const seenPaths: string[] = [];
+  const server = createServer((req, res) => {
+    seenPaths.push(req.url ?? "");
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url === "/auth/register") res.end(JSON.stringify({ userId: "u_ws", apiKey: "ak_ws" }));
+      else if (req.url === "/channels/telegram/register") res.end(JSON.stringify({ channelId: "ch_ws", botUsername: "wsbot", pairingCode: "7" }));
+      else res.end(JSON.stringify({}));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const port = (server.address() as { port: number }).port;
+  const trimmedUrl = `http://127.0.0.1:${port}`;
+
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  process.env.CHAOS_RELAY_URL = `  ${trimmedUrl}  `; // surrounding whitespace
+  const prevFetch = blockNonLoopbackFetch();
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = prevFetch;
+  });
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-ws", fake.notifications)));
+  const tg = fake.tools.find((tool) => tool.name === "relay_register_telegram");
+  assert.ok(tg, "extension registers relay_register_telegram");
+  const execute = tg.execute as (
+    id: string,
+    params: { botToken: string },
+    signal: unknown,
+    onUpdate: unknown,
+    ctx: unknown,
+  ) => Promise<unknown>;
+  await execute("t1", { botToken: "123:ABC" }, undefined, undefined, {
+    ui: { notify: () => {} },
+  });
+
+  assert.ok(
+    seenPaths.includes("/auth/register"),
+    `registration reached the trimmed relay URL (saw ${JSON.stringify(seenPaths)})`,
+  );
+  const persisted = JSON.parse(readFileSync(configPath, "utf-8")) as {
+    relayUrl?: string;
+    apiKey?: string;
+  };
+  assert.equal(persisted.relayUrl, trimmedUrl, "persisted the TRIMMED relay URL (no surrounding spaces)");
 });

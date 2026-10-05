@@ -260,9 +260,13 @@ a command was accidentally pasted into the URL field. Two ways to recover:
   the URL. Use **`/chaos-relay reset all`** for a full wipe.
 
 Default setup is zero-config and never asks for a URL, so this only affects
-older configs or a bad `CHAOS_RELAY_URL` / `--advanced` entry. Invalid URLs are
-rejected (must be absolute `http(s)://…`) and an invalid saved/env URL falls back
-to the default rather than breaking every request.
+older configs or a bad `CHAOS_RELAY_URL` / `--advanced` entry. A URL must be an
+absolute `http(s)://…`; the effective URL is the **first valid** value in
+precedence order (env → saved file → default), so a malformed value is skipped
+rather than silently discarding a valid lower-precedence one. If no URL is
+configured anywhere, auto-provisioning targets the hosted relay (with a warning),
+and a set-but-invalid `CHAOS_RELAY_URL` with no saved URL is **refused** instead
+of silently registering against the default.
 
 The config file is written atomically (temp file + rename), so a concurrent
 reader — a cursor advance, or a second pi session sharing the same profile —

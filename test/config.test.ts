@@ -317,12 +317,24 @@ test("resolveConfig falls back to default when persisted relayUrl is invalid", (
   );
 });
 
-test("resolveConfig falls back to default when env CHAOS_RELAY_URL is invalid", () => {
+test("resolveConfig: an INVALID env URL falls through to a valid persisted URL", () => {
+  // Baseline: first-valid-candidate resolution (not a pin for the trim fix).
   withEnv(
     { CHAOS_RELAY_URL: "not a url", CHAOS_RELAY_API_KEY: undefined },
     () => {
+      // A set-but-invalid env value must not win the precedence chain and then
+      // fall back to the default — it yields to the next valid candidate.
       const cfg = resolveConfig({ relayUrl: "https://persisted.example.com" });
-      // Env wins when valid, but an INVALID env must not win — fall back.
+      assert.equal(cfg.relayUrl, "https://persisted.example.com");
+    },
+  );
+});
+
+test("resolveConfig: an INVALID env URL with nothing valid persisted falls to default", () => {
+  withEnv(
+    { CHAOS_RELAY_URL: "not a url", CHAOS_RELAY_API_KEY: undefined },
+    () => {
+      const cfg = resolveConfig({ relayUrl: "/chaos-relay approvals writes" });
       assert.equal(cfg.relayUrl, DEFAULT_RELAY_URL);
     },
   );
@@ -332,6 +344,24 @@ test("resolveConfig keeps a valid persisted relayUrl when env is unset", () => {
   withEnv({ CHAOS_RELAY_URL: undefined }, () => {
     const cfg = resolveConfig({ relayUrl: "https://my-relay.example.com" });
     assert.equal(cfg.relayUrl, "https://my-relay.example.com");
+  });
+});
+
+test("resolveConfig trims surrounding whitespace from the selected URL", () => {
+  // isValidRelayUrl validates url.trim(), so a value with surrounding
+  // whitespace passes validation — the SELECTED value must then be returned
+  // trimmed, or fetch/WebSocket get a URL with a trailing space baked in.
+  withEnv(
+    { CHAOS_RELAY_URL: "  http://127.0.0.1:8787  ", CHAOS_RELAY_API_KEY: undefined },
+    () => {
+      assert.equal(resolveConfig({}).relayUrl, "http://127.0.0.1:8787");
+    },
+  );
+  withEnv({ CHAOS_RELAY_URL: undefined }, () => {
+    assert.equal(
+      resolveConfig({ relayUrl: "  https://persisted.example.com  " }).relayUrl,
+      "https://persisted.example.com",
+    );
   });
 });
 
