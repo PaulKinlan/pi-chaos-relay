@@ -49,6 +49,8 @@ these the change touches, in the same commit as the code:
   table, channel + profile flows.
 - **`skills/chaos-relay-troubleshoot/SKILL.md`** — the `doctor` checklist and the
   symptom → fix steps.
+- **`AGENTS.md` / `CLAUDE.md`** — `CLAUDE.md` mirrors the load-bearing rules from
+  this file; a rule change must update both together.
 
 Whenever you add / rename / remove a **command** (`/chaos-relay …`), a **tool**
 (`relay_*`), an **env var** (`CHAOS_RELAY_*`), or change the `doctor` checks:

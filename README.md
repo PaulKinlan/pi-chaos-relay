@@ -416,6 +416,11 @@ npm test        # node --test unit tests (relay client, poller, config)
 npx tsc --noEmit -p tsconfig.json   # type-check against pi types
 ```
 
+`npm ci` (or `npm install`) must run before the `npx tsc` check, which needs the
+`typescript` devDependency — without it `npx` instead runs the unrelated
+`tsc@2.0.4` package and reports "This is not the tsc command you are looking
+for"; `npm test` needs no install.
+
 Integration testing against a local relay: run the CHAOS relay server
 (`deno task start` in `packages/server` with `--unstable-kv`) and point
 `CHAOS_RELAY_URL=http://localhost:8787`.
