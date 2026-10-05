@@ -104,6 +104,13 @@ new profile called staging") or use the command:
 /chaos-relay profile work      # switch to "work" (creates + provisions it if new)
 ```
 
+Creating a profile writes a new `~/.pi/chaos-relay.<name>.json` (a fresh
+identity + keypair). To keep that bounded, the extension caps on-disk profile
+files at **100**; a switch that would create a new one beyond that is **refused
+with a clear message and nothing is written**. Reuse an existing profile
+(`/chaos-relay profile <name>`) or remove unused `chaos-relay*.json` files to
+create another.
+
 Switching re-points **this** pi instance at that profile's identity (one active
 connection at a time). To have **two connections live simultaneously**, launch
 two instances with `CHAOS_RELAY_PROFILE=<name>` as above.

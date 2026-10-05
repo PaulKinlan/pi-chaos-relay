@@ -57,6 +57,8 @@ import {
   profileNameForPath,
   activeProfileName,
   listProfiles,
+  countProfileConfigs,
+  resolveProfileCreate,
   envProfileName,
   getSessionProfile,
   setSessionProfile,
@@ -491,10 +493,27 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     name: string,
     notify?: (message: string) => void,
   ): Promise<{ isNew: boolean; connected: boolean }> {
+    const profilePath = profilePathForName(name);
+    const existedBefore = existsSync(profilePath);
+    // Enforce the profile cap at the single creation chokepoint. This covers
+    // both relay_switch_profile and a session_start that lands on a brand-new
+    // (env-pinned) name — an existing-but-unconfigured profile is a switch, not
+    // a creation, so only a NEW file beyond the cap is refused.
+    const creation = resolveProfileCreate({
+      profile: profileNameForPath(profilePath),
+      exists: existedBefore,
+      existingCount: countProfileConfigs(),
+    });
+    if (creation.action === "refuse") {
+      log(`WARN: ${creation.message}`);
+      notify?.(creation.message);
+      return { isNew: false, connected: false };
+    }
+
     stopPolling();
     client = undefined;
     poller = undefined;
-    setActiveConfigPath(profilePathForName(name));
+    setActiveConfigPath(profilePath);
     cfg = resolveConfig();
     currentProfile = activeProfileName();
     // Bind the active session → this profile so resume/reload restore it.
@@ -505,6 +524,14 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     if (!c) return { isNew, connected: false };
     startPolling(); // ensure the poller runs for an already-provisioned profile too
     cfg = resolveConfig();
+    if (!existedBefore) {
+      // A brand-new profile config was just written: make the creation loud in
+      // the durable log and to the user, and record the resulting file count.
+      log(
+        `created relay profile "${currentProfile}" (new identity; ${countProfileConfigs()} profile file(s) on disk)`,
+      );
+      notify?.(`Created relay profile "${currentProfile}" (fresh identity).`);
+    }
     return { isNew, connected: true };
   }
 
@@ -536,6 +563,19 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const slug = profileNameForPath(profilePathForName(name));
     if (profilePathForName(name) === getConfigPath()) {
       return `Already on profile "${slug}".`;
+    }
+    // Surface the cap refusal as the tool/command result (connectAsProfile also
+    // guards this, for the session_start path — but here we need the clear
+    // message returned directly rather than the generic could-not-connect line).
+    const creation = resolveProfileCreate({
+      profile: slug,
+      exists: existsSync(profilePathForName(name)),
+      existingCount: countProfileConfigs(),
+    });
+    if (creation.action === "refuse") {
+      log(`WARN: ${creation.message}`);
+      notify?.(creation.message);
+      return creation.message;
     }
     const { isNew, connected } = await connectAsProfile(name, notify);
     if (!connected) {
