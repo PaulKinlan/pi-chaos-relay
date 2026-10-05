@@ -379,6 +379,7 @@ test("removeProfileLock refuses a lock owned by another pid and unlinks its own"
 });
 
 test("auto-provision registers against CHAOS_RELAY_URL, not the production default", async (t) => {
+  // Baseline: env-governs-registration for a clean value (not a pin for the trim/secret-echo fixes).
   resetState();
   // Fresh profile: no persisted config at all, so ensureConfigured must decide
   // the registration URL from env (CHAOS_RELAY_URL) — never the default relay.
@@ -539,6 +540,7 @@ test("auto-provision falls through to persisted relayUrl when CHAOS_RELAY_URL is
 });
 
 test("a configured profile never re-registers (no POST /auth/register)", async (t) => {
+  // Baseline: identity-safety invariant (does not exercise the trim/secret-echo fixes).
   resetState();
   const seenPaths: string[] = [];
   const server = createServer((req, res) => {
@@ -603,6 +605,7 @@ test("a configured profile never re-registers (no POST /auth/register)", async (
 });
 
 test("status reports the persisted relay URL when CHAOS_RELAY_URL is invalid", async () => {
+  // Baseline: first-valid-candidate resolution via the shared status consumer.
   resetState();
   // Valid persisted URL, no apiKey (so status skips the live reachability calls).
   writeFileSync(
@@ -714,6 +717,68 @@ test("a malformed CHAOS_RELAY_URL is never echoed and refuses without a fetch", 
   // The refusal returns before any registration, so fetch was never called.
   assert.equal(fetchCalls, 0, "no fetch attempt on the refusal path");
   assert.equal(existsSync(configPath), false, "no config/identity was persisted");
+});
+
+test("doctor never echoes a secret-shaped CHAOS_RELAY_URL", async () => {
+  resetState();
+  // Valid persisted loopback URL so the doctor's reachability probe stays local.
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9" }) + "\n",
+  );
+  const secret = "sk-doctor-secret-token-9876543210";
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  process.env.CHAOS_RELAY_URL = secret;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = ((..._a: unknown[]) =>
+    Promise.reject(new Error("offline"))) as unknown as typeof fetch;
+  try {
+    const fake = makeFakePi();
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    const command = fake.commands.get("chaos-relay");
+    assert.ok(command, "extension registers the /chaos-relay command");
+    await command.handler("doctor", makeCtx("sess-doctor-secret", fake.notifications));
+
+    const output = fake.notifications.map((n) => n.message).join("\n");
+    assert.ok(
+      !output.includes(secret),
+      `doctor output must not echo the env value: ${output}`,
+    );
+    // The interesting fact survives: env is set but not a valid URL.
+    assert.ok(output.includes("env=<invalid>"), `doctor reports the invalid env state (${output})`);
+  } finally {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("doctor strips credentials from a valid CHAOS_RELAY_URL (origin only)", async () => {
+  resetState();
+  const password = "supersecretpass";
+  const credUrl = `https://user:${password}@example.com`;
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  process.env.CHAOS_RELAY_URL = credUrl;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = ((..._a: unknown[]) =>
+    Promise.reject(new Error("offline"))) as unknown as typeof fetch;
+  try {
+    const fake = makeFakePi();
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    const command = fake.commands.get("chaos-relay");
+    assert.ok(command, "extension registers the /chaos-relay command");
+    await command.handler("doctor", makeCtx("sess-doctor-cred", fake.notifications));
+
+    const output = fake.notifications.map((n) => n.message).join("\n");
+    assert.ok(!output.includes(password), `doctor output must not leak the password: ${output}`);
+    assert.ok(!output.includes("user@example.com"), `doctor output must not leak userinfo: ${output}`);
+    // The origin is still shown so the operator can see which host is in effect.
+    assert.ok(output.includes("https://example.com"), `doctor shows the redacted origin (${output})`);
+  } finally {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  }
 });
 
 test("auto-provision trims surrounding whitespace from CHAOS_RELAY_URL", async (t) => {

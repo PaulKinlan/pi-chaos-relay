@@ -152,6 +152,25 @@ function textResult(text: string, details: unknown = {}) {
   return { content: [{ type: "text" as const, text }], details };
 }
 
+/**
+ * Render a relay URL for DISPLAY without leaking credentials: origin only
+ * (scheme+host+port), never userinfo, path, query or fragment. A URL can be a
+ * pasted secret or carry credentials in userinfo (https://user:pass@host), so
+ * the raw string must never reach the TUI or the durable log. Returns
+ * "<invalid>" for a value that does not parse as an http(s) URL.
+ */
+function safeUrlOrigin(url: unknown): string {
+  if (typeof url !== "string" || url.trim() === "") return "<unset>";
+  let parsed: URL;
+  try {
+    parsed = new URL(url.trim());
+  } catch {
+    return "<invalid>";
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "<invalid>";
+  return parsed.origin === "null" ? "<invalid>" : parsed.origin;
+}
+
 export default function chaosRelayExtension(pi: ExtensionAPI): void {
   let client: RelayClient | undefined;
   let poller: MessagePoller | undefined;
@@ -1947,10 +1966,13 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const effectiveUrl = resolveConfig().relayUrl;
     const urlOk = isValidRelayUrl(effectiveUrl);
     const persistedUrl = persisted.relayUrl;
+    // Origin-only display: the raw URL values can carry credentials in userinfo
+    // or be a pasted secret, so never echo them (safeUrlOrigin strips userinfo
+    // and path/query, and renders a malformed value as "<invalid>").
     const urlDetail = [
-      `effective=${effectiveUrl}`,
-      envUrl ? `env=\"${envUrl}\"` : null,
-      persistedUrl ? `file=\"${persistedUrl}\"` : null,
+      `effective=${safeUrlOrigin(effectiveUrl)}`,
+      envUrl ? `env=${safeUrlOrigin(envUrl)}` : null,
+      persistedUrl ? `file=${safeUrlOrigin(persistedUrl)}` : null,
     ].filter(Boolean).join(", ");
     checks.push({
       ok: urlOk,

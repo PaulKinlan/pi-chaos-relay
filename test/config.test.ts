@@ -318,6 +318,7 @@ test("resolveConfig falls back to default when persisted relayUrl is invalid", (
 });
 
 test("resolveConfig: an INVALID env URL falls through to a valid persisted URL", () => {
+  // Baseline: first-valid-candidate resolution (not a pin for the trim fix).
   withEnv(
     { CHAOS_RELAY_URL: "not a url", CHAOS_RELAY_API_KEY: undefined },
     () => {
