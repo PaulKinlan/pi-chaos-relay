@@ -385,7 +385,8 @@ While a pi session is active, the extension holds a **WebSocket** to the relay
 and receives messages the instant they arrive. A slow background **safety poll**
 (every ~120s) runs only as a backstop in case a push is missed between
 reconnects. New messages are de-duplicated by id — and that de-dup log is
-**persisted** (`seenMessageIds` in the config file), so the relay's on-connect
+**persisted** (in a small side-car `<config>.state` file next to the config,
+written once per delivery batch), so the relay's on-connect
 replay (a 5-minute lookback it sends every time the WebSocket connects) never
 re-processes a message already handled before a restart. Fresh messages are
 injected into the agent as a user message that includes each message's `id`,

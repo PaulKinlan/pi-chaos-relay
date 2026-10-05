@@ -183,6 +183,9 @@ export function getConfigPath(): string {
 /** Point the extension at a different config file (used when switching profiles). */
 export function setActiveConfigPath(path: string): void {
   activeConfigPath = path;
+  // The new profile's config may still carry legacy in-config tracking fields,
+  // so its one-time migration to the side-car must run again.
+  stateMigrated = false;
 }
 
 /** Absolute path for a named profile ("default" → chaos-relay.json). */
@@ -270,8 +273,8 @@ export interface PersistedConfig {
   approvalMode?: ApprovalMode;
   /**
    * Cursor (ISO timestamp) of the most recent message delivered to the agent.
-   * Persisted so a restart resumes AFTER it instead of re-reading the relay's
-   * whole 24h backlog. Advanced from delivered message timestamps.
+   * LEGACY pre-0.17.5 location: still READ for one-time migration, but new
+   * writes go to the side-car state file (see loadMessageState).
    */
   messagesCursor?: string;
   /**
@@ -280,6 +283,8 @@ export interface PersistedConfig {
    * replay (a 5-minute WebSocket lookback) and any catch-up poll never
    * re-process a message we've already handled. The timestamp cursor only bounds
    * the fetch window; this is what prevents re-delivery.
+   * LEGACY pre-0.17.5 location: still READ for one-time migration, but new
+   * writes go to the side-car state file (see loadMessageState).
    */
   seenMessageIds?: string[];
   /**
@@ -324,8 +329,6 @@ export interface ResolvedConfig {
   channels: RegisteredChannelRecord[];
   /** Tool-approval policy for channel-driven turns. */
   approvalMode: ApprovalMode;
-  /** Resume cursor (ISO timestamp) for inbound message polling. File-only. */
-  messagesCursor?: string;
   /** ECDSA keypair for request signing. File-only (never from env). */
   keyPair?: KeyPairJwk;
   /** Pinned server public key (TOFU). File-only. */
@@ -415,34 +418,33 @@ export function loadPersisted(): PersistedConfig {
 // temp path (pid disambiguates across processes sharing a profile file).
 let tmpCounter = 0;
 
-export function savePersisted(updates: Partial<PersistedConfig>): PersistedConfig {
-  const current = existsSync(activeConfigPath) ? loadPersisted() : {};
-  const merged: PersistedConfig = { ...current, ...updates };
-  // Ensure the config file's own directory exists (it may be outside ~/.pi when
-  // CHAOS_RELAY_CONFIG points elsewhere).
-  const dir = dirname(activeConfigPath);
+/**
+ * Atomic file replace: serialize to a unique temp file in the same directory,
+ * then rename(2) over the target. The rename is atomic on POSIX, so a
+ * concurrent reader always sees either the complete old file or the complete
+ * new one — never a half-written/truncated file. Shared by the config writer
+ * and the message-state side-car writer so BOTH get the same guarantee.
+ */
+function atomicWriteSync(path: string, contents: string): void {
+  // Ensure the target's directory exists (the config may live outside ~/.pi
+  // when CHAOS_RELAY_CONFIG points elsewhere; the side-car sits beside it).
+  const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  // Atomic write: serialize to a unique temp file in the same directory, then
-  // rename(2) over the target. The rename is atomic on POSIX, so a concurrent
-  // reader (a cursor advance, or another pi session sharing this profile)
-  // always sees either the complete old file or the complete new one — never a
-  // half-written/truncated file. The previous plain writeFileSync truncated the
-  // target first, which is exactly what let loadPersisted read an empty file
-  // mid-write and crash pi.
-  const tmp = `${activeConfigPath}.tmp.${process.pid}.${tmpCounter++}`;
-  writeFileSync(tmp, JSON.stringify(merged, null, 2) + "\n");
-  // Best effort: tighten permissions since this file holds the API key. Do it
-  // on the temp file so the tightened mode is what lands at the target.
+  const tmp = `${path}.tmp.${process.pid}.${tmpCounter++}`;
+  writeFileSync(tmp, contents);
+  // Best effort: tighten permissions (the config holds the API key; the
+  // side-car is not secret but stays 0600 for consistency). Done on the temp
+  // file so the tightened mode is what lands at the target.
   try {
     chmodSync(tmp, 0o600);
   } catch {
     /* non-POSIX filesystems may not support chmod */
   }
   try {
-    renameSync(tmp, activeConfigPath);
+    renameSync(tmp, path);
   } catch (err) {
     // Clean up the temp file so a failed rename doesn't leak turds next to the
-    // config; re-throw so the caller still learns the write failed.
+    // target; re-throw so the caller still learns the write failed.
     try {
       unlinkSync(tmp);
     } catch {
@@ -450,6 +452,12 @@ export function savePersisted(updates: Partial<PersistedConfig>): PersistedConfi
     }
     throw err;
   }
+}
+
+export function savePersisted(updates: Partial<PersistedConfig>): PersistedConfig {
+  const current = existsSync(activeConfigPath) ? loadPersisted() : {};
+  const merged: PersistedConfig = { ...current, ...updates };
+  atomicWriteSync(activeConfigPath, JSON.stringify(merged, null, 2) + "\n");
   return merged;
 }
 
@@ -466,25 +474,115 @@ export function setChannelRecords(channels: RegisteredChannelRecord[]): void {
 }
 
 /**
- * Persist the inbound-message resume cursor AND the de-dup seen-id log in ONE
- * atomic write. Coalesced because both advance on every delivered batch, and
- * two separate whole-file rewrites per batch were measured at ~79% of
- * per-message CPU (bead pi-chaos-relay-mlq): every savePersisted re-reads,
- * re-parses and re-serializes the entire profile config (keypair, channels,
- * seen ids, …), so paying it twice per message doubled the hot path's disk
- * work for no durability gain — one flush carries both values consistently.
+ * Inbound-message tracking state (resume cursor + de-dup log) that lives in a
+ * small SIDE-CAR file next to the profile config, not in the config itself.
  *
- * A batch can deliver a message without a usable timestamp (no cursor value);
- * in that case the previously persisted cursor is left untouched rather than
- * deleted, so a restart still resumes from the last known position.
+ * Why a side-car: the poller flushes this state once per delivered batch, and
+ * the de-dup log can hold up to 1000 message ids (~tens of KB). When it lived
+ * inside the config, every flush re-read, re-parsed and re-serialized the
+ * whole profile config (keypair, channel records, the id log itself) — measured
+ * as the dominant per-message CPU cost of the extension (bead
+ * pi-chaos-relay-mlq). With the side-car, the delivery hot path never touches
+ * the config at all, and both files keep the same atomic write guarantee
+ * (unique temp file + rename, see atomicWriteSync).
  */
-export function setMessageTrackingState(
-  cursor: string | undefined,
-  seenIds: string[],
-): void {
-  const updates: Partial<PersistedConfig> = { seenMessageIds: seenIds };
-  if (cursor !== undefined) updates.messagesCursor = cursor;
-  savePersisted(updates);
+export interface MessageTrackingState {
+  /** Resume cursor (ISO timestamp) of the most recent delivered message. */
+  cursor?: string;
+  /** Ids of already-delivered messages (capped, most-recent last). */
+  seenIds: string[];
+}
+
+/** The side-car path for the active profile's message-tracking state. */
+export function messageStatePath(): string {
+  // `<config>.state` deliberately does NOT end in `.json` so listProfiles'
+  // chaos-relay*.json glob can never mistake it for a profile config.
+  return `${activeConfigPath}.state`;
+}
+
+/** (path, reason) pairs already warned about, for the side-car's hot-path reads. */
+const warnedCorruptStates = new Set<string>();
+
+/**
+ * Read the message-tracking state. Precedence:
+ *  1. the side-car file (`<config>.state`), when present and parseable;
+ *  2. the legacy in-config fields (`messagesCursor` / `seenMessageIds`), so a
+ *     profile written by an older version keeps its cursor + de-dup log
+ *     across the upgrade (the first save migrates them to the side-car).
+ *
+ * Tolerant by design: a missing side-car is the normal not-yet-migrated case,
+ * and a corrupt one degrades to the legacy values with ONE warning instead of
+ * throwing — this runs on the message-delivery path, where an uncaught throw
+ * would kill pi. A corrupt side-car self-heals on the next save.
+ */
+export function loadMessageState(): MessageTrackingState {
+  let raw: string | undefined;
+  try {
+    raw = readFileSync(messageStatePath(), "utf-8");
+  } catch (err) {
+    if ((err as { code?: string }).code !== "ENOENT") {
+      const reason = `Failed to read ${messageStatePath()}: ${messageOf(err)}`;
+      if (!warnedCorruptStates.has(reason)) {
+        warnedCorruptStates.add(reason);
+        console.warn(`pi-chaos-relay: ${reason} — ignoring the side-car state file.`);
+      }
+    }
+  }
+  if (raw !== undefined && raw.trim() !== "") {
+    try {
+      const parsed = JSON.parse(raw) as {
+        cursor?: unknown;
+        seenIds?: unknown;
+      };
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return {
+          cursor: typeof parsed.cursor === "string" ? parsed.cursor : undefined,
+          seenIds: Array.isArray(parsed.seenIds)
+            ? parsed.seenIds.filter((id): id is string => typeof id === "string")
+            : [],
+        };
+      }
+    } catch {
+      /* fall through to the legacy fields; warn-once below */
+    }
+    const reason = `Failed to parse ${messageStatePath()}`;
+    if (!warnedCorruptStates.has(reason)) {
+      warnedCorruptStates.add(reason);
+      console.warn(
+        `pi-chaos-relay: ${reason} — ignoring the side-car state file ` +
+          `(it will be rewritten on the next delivered message).`,
+      );
+    }
+  }
+  // Legacy fallback (pre-side-car profiles) — also the seed for migration.
+  const persisted = loadPersisted();
+  return {
+    cursor: persisted.messagesCursor,
+    seenIds: persisted.seenMessageIds ?? [],
+  };
+}
+
+/** Whether the one-time legacy→side-car migration already ran (per profile). */
+let stateMigrated = false;
+
+/**
+ * Persist the message-tracking state with ONE small atomic write to the
+ * side-car. Also migrates a legacy profile once: strips `messagesCursor` /
+ * `seenMessageIds` out of the config so later config writes stop re-serializing
+ * the (potentially 1000-id) de-dup log. The migration flag resets on profile
+ * switches so each active config gets its own one-time pass.
+ */
+export function saveMessageState(state: MessageTrackingState): void {
+  atomicWriteSync(
+    messageStatePath(),
+    JSON.stringify({ cursor: state.cursor, seenIds: state.seenIds }, null, 2) + "\n",
+  );
+  if (stateMigrated) return;
+  stateMigrated = true;
+  const persisted = loadPersisted();
+  if (persisted.seenMessageIds !== undefined || persisted.messagesCursor !== undefined) {
+    savePersisted({ seenMessageIds: undefined, messagesCursor: undefined });
+  }
 }
 
 /** Persist the tool-approval policy. */
@@ -506,6 +604,12 @@ export function resetPersisted(scope: "url" | "all"): void {
   if (scope === "all") {
     if (existsSync(activeConfigPath)) {
       unlinkSync(activeConfigPath);
+    }
+    // "all" is a full fresh start: drop the message-tracking side-car too, so
+    // a stale cursor / seen-id log from the previous identity can never
+    // suppress delivery of a replayed message on the new one.
+    if (existsSync(messageStatePath())) {
+      unlinkSync(messageStatePath());
     }
     return;
   }
@@ -562,7 +666,9 @@ export function resolveConfig(persisted = loadPersisted()): ResolvedConfig {
     approvalMode: normalizeApprovalMode(
       process.env.CHAOS_RELAY_APPROVAL_MODE ?? persisted.approvalMode,
     ),
-    messagesCursor: persisted.messagesCursor,
+    // The inbound-message resume cursor + de-dup log now live in the side-car
+    // state file (loadMessageState); they are no longer part of the resolved
+    // config. The poller is their only consumer.
     // The keypair is the client's identity and is intentionally NOT
     // overridable via env — it lives only in the 0600 config file.
     keyPair: persisted.keyPair,
