@@ -135,6 +135,20 @@ function resetState(): void {
 }
 
 /**
+ * Write an already-provisioned config file for a profile. Only the persistence
+ * shape matters here (an apiKey makes the profile "configured" so no session is
+ * ever registered against a relay); the tests never speak to a server.
+ */
+function writeProfileConfig(profile: string, apiKey: string): string {
+  const path =
+    profile === "default"
+      ? join(PI_DIR, "chaos-relay.json")
+      : join(PI_DIR, `chaos-relay.${profile}.json`);
+  writeFileSync(path, JSON.stringify({ relayUrl: OFFLINE_RELAY_URL, apiKey }) + "\n");
+  return path;
+}
+
+/**
  * A real, live process standing in for another pi session holding a profile
  * lock (checkProfileLock ignores a pid that is dead, so the holder must be
  * alive). Killed when the test ends.
@@ -158,14 +172,26 @@ function startOtherLiveSession(t: TestContext): number {
 
 test("session_start refuses a held profile lock: no connect, no lock write, warning raised, prior binding kept", async (t) => {
   resetState();
+  // Both profiles are already provisioned: if the refusal ever stops returning,
+  // the fall-through connect stays on the refused loopback URL instead of
+  // registering a session against the real relay.
+  const defaultFile = writeProfileConfig("default", "ak_default_offline");
+  const workFile = writeProfileConfig("work", "ak_work_offline");
+  const defaultConfigBefore = readFileSync(defaultFile, "utf-8");
   // Pin the chosen profile so the refusal is a no-op for the *previous* binding:
   // the process starts on the default config and must stay there.
   process.env.CHAOS_RELAY_PROFILE = "work";
   const otherPid = startOtherLiveSession(t);
   const lock = lockPath("work");
   writeFileSync(lock, String(otherPid));
+  // The refusing session stays on the default profile, so shutdown releases the
+  // *default* lock: hold that one too, so "never unlock someone else" is
+  // actually exercised rather than trivially true for an absent file.
+  const previousLock = lockPath("default");
+  writeFileSync(previousLock, String(otherPid));
   const boundBefore = config.getConfigPath();
-  assert.equal(boundBefore, join(PI_DIR, "chaos-relay.json"));
+  assert.equal(boundBefore, defaultFile);
+  assert.equal(config.activeProfileName(), "default", "bound to the default profile before the refusal");
   const filesBefore = relayStateFiles();
 
   const fake = makeFakePi();
@@ -192,8 +218,13 @@ test("session_start refuses a held profile lock: no connect, no lock write, warn
   assert.equal(config.getConfigPath(), boundBefore, "stays on the previous config");
   assert.notEqual(
     config.getConfigPath(),
-    join(PI_DIR, "chaos-relay.work.json"),
+    workFile,
     "did not switch identity to the locked profile",
+  );
+  assert.equal(
+    readFileSync(defaultFile, "utf-8"),
+    defaultConfigBefore,
+    "the previous profile's config was not rewritten",
   );
 
   // (b) no lock file written: the holder's pid is untouched.
@@ -203,22 +234,25 @@ test("session_start refuses a held profile lock: no connect, no lock write, warn
   assert.equal(readSessionMap()[sid], undefined, "session was not bound to a profile");
   assert.deepEqual(relayStateFiles(), filesBefore, "no new config/identity files");
 
-  // Shutdown must not release a lock this process never owned.
+  // Shutdown must not release a lock this process never owned — neither the
+  // chosen profile's (it never connected) nor the previous profile's.
   await callHandler(fake.handlers, "session_shutdown", {}, makeCtx(sid, fake.notifications));
   assert.equal(
     readFileSync(lock, "utf-8"),
     String(otherPid),
-    "refusing session leaves the holder's lock alone on shutdown",
+    "refusing session leaves the held profile's lock alone on shutdown",
+  );
+  assert.equal(
+    readFileSync(previousLock, "utf-8"),
+    String(otherPid),
+    "refusing session does not release the previous profile's lock either",
   );
 });
 
 test("session_start connects as the session's recorded profile when its lock is free (negative control)", async () => {
   resetState();
-  const profileFile = join(PI_DIR, "chaos-relay.work.json");
-  writeFileSync(
-    profileFile,
-    JSON.stringify({ relayUrl: OFFLINE_RELAY_URL, apiKey: "ak_negative_control" }) + "\n",
-  );
+  writeProfileConfig("default", "ak_default_offline");
+  const profileFile = writeProfileConfig("work", "ak_negative_control");
   const sid = "sess-connect-free-lock";
   writeFileSync(SESSIONS_PATH, JSON.stringify({ [sid]: "work" }) + "\n");
   const boundBefore = config.getConfigPath();
@@ -246,6 +280,8 @@ test("session_start connects as the session's recorded profile when its lock is 
 
 test("session_start refusal leaves an unbound session unbound and mints no identity", async (t) => {
   resetState();
+  const defaultFile = writeProfileConfig("default", "ak_default_offline");
+  const defaultConfigBefore = readFileSync(defaultFile, "utf-8");
   const sid = "sess-unbound";
   const otherPid = startOtherLiveSession(t);
   const lock = lockPath("default");
@@ -264,6 +300,11 @@ test("session_start refusal leaves an unbound session unbound and mints no ident
   assert.equal(fake.notifications.length, 1);
   assert.match(fake.notifications[0].message, /Relay profile "default" is already held/);
   assert.equal(readFileSync(lock, "utf-8"), String(otherPid), "holder's lock intact");
+  assert.equal(
+    readFileSync(defaultFile, "utf-8"),
+    defaultConfigBefore,
+    "no keypair/identity was minted into the config",
+  );
   assert.deepEqual(relayStateFiles(), filesBefore, "no config/keypair minted for the refusal");
   assert.equal(existsSync(SESSIONS_PATH), false, "no new session→profile binding");
 });
