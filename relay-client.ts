@@ -26,6 +26,14 @@ import { buildSignatureHeaders, generateKeyPair, type KeyPairJwk } from "./crypt
  */
 export const DEFAULT_TIMEOUT_MS = 15000;
 
+/**
+ * Hard cap on control-plane HTTP response bodies (auth, messages, channels,
+ * replies, health). These are small JSON; a hostile relay returning an
+ * oversized body must be rejected before it is buffered, so peak memory stays
+ * bounded. Attachment downloads use the same cap via readBoundedBytes.
+ */
+const MAX_CONTROL_PLANE_BYTES = 5 * 1024 * 1024; // 5 MB
+
 /** True for an AbortError raised by our timeout signal. */
 function isTimeoutError(err: unknown): boolean {
   return err instanceof DOMException && err.name === "TimeoutError" ||
@@ -38,7 +46,11 @@ function isTimeoutError(err: unknown): boolean {
  * settles, so it never lingers (which would trip Deno's test timer sanitizer
  * and needlessly keep the event loop alive).
  */
-async function readBoundedBytes(response: Response, maxBytes: number): Promise<Uint8Array> {
+async function readBoundedBytes(
+  response: Response,
+  maxBytes: number,
+  tooLargeMessage: string,
+): Promise<Uint8Array> {
   if (!response.body) return new Uint8Array();
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -49,8 +61,8 @@ async function readBoundedBytes(response: Response, maxBytes: number): Promise<U
       if (done) break;
       total += value.byteLength;
       if (total > maxBytes) {
-        await reader.cancel("attachment too large");
-        throw new RelayError("Attachment exceeds 5MB limit", 413);
+        await reader.cancel("response too large");
+        throw new RelayError(tooLargeMessage, 413);
       }
       chunks.push(value);
     }
@@ -204,12 +216,30 @@ export async function registerSession(
   fetchImpl: typeof fetch = fetch,
 ): Promise<RegisterSessionResult> {
   const base = normalizeRelayUrl(relayUrl);
-  const res = await fetchImpl(`${base}/auth/register`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({}),
-  });
-  const body = await readBody(res);
+  const ms = DEFAULT_TIMEOUT_MS;
+  const t = timeoutSignal(ms);
+  let res: Response;
+  let body: unknown;
+  try {
+    res = await fetchImpl(`${base}/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+      signal: t.signal,
+    });
+    body = await readBody(res);
+  } catch (err) {
+    if (isTimeoutError(err)) {
+      throw new RelayError(
+        `Relay did not respond within ${ms}ms (POST ${base}/auth/register) — ` +
+          `check the relay URL is correct and reachable.`,
+        0,
+      );
+    }
+    throw err;
+  } finally {
+    t.clear();
+  }
   if (!res.ok) {
     throw new RelayError(
       `Failed to register relay session: ${describeError(body, res.status)}`,
@@ -240,6 +270,7 @@ export async function registerSessionWithKey(
   const ms = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const t = timeoutSignal(ms);
   let res: Response;
+  let body: unknown;
   try {
     res = await fetchImpl(`${base}/auth/register`, {
       method: "POST",
@@ -247,6 +278,7 @@ export async function registerSessionWithKey(
       body: JSON.stringify({ publicKey: keyPair.publicKey }),
       signal: t.signal,
     });
+    body = await readBody(res);
   } catch (err) {
     if (isTimeoutError(err)) {
       throw new RelayError(
@@ -259,7 +291,6 @@ export async function registerSessionWithKey(
   } finally {
     t.clear();
   }
-  const body = await readBody(res);
   if (!res.ok) {
     throw new RelayError(
       `Failed to register relay session: ${describeError(body, res.status)}`,
@@ -335,8 +366,10 @@ export class RelayClient {
     const init: RequestInit = { method, headers, signal: t.signal };
     if (body !== undefined) init.body = bodyText;
     let res: Response;
+    let parsed: unknown;
     try {
       res = await this.fetchImpl(`${this.base}${path}`, init);
+      parsed = await readBody(res);
     } catch (err) {
       if (isTimeoutError(err)) {
         throw new RelayError(
@@ -349,7 +382,6 @@ export class RelayClient {
     } finally {
       t.clear();
     }
-    const parsed = await readBody(res);
     if (!res.ok) {
       throw new RelayError(
         `Relay request failed (${method} ${path}): ${describeError(parsed, res.status)}`,
@@ -364,8 +396,10 @@ export class RelayClient {
   async health(): Promise<{ status: string; version?: string }> {
     const t = timeoutSignal(this.timeoutMs);
     let res: Response;
+    let body: unknown;
     try {
       res = await this.fetchImpl(`${this.base}/health`, { signal: t.signal });
+      body = await readBody(res);
     } catch (err) {
       if (isTimeoutError(err)) {
         throw new RelayError(
@@ -378,7 +412,6 @@ export class RelayClient {
     } finally {
       t.clear();
     }
-    const body = await readBody(res);
     if (!res.ok) {
       throw new RelayError(`Relay health check failed`, res.status, body);
     }
@@ -422,7 +455,7 @@ export class RelayClient {
         await res.body?.cancel();
         throw new RelayError("Attachment exceeds 5MB limit", 413);
       }
-      const bytes = await readBoundedBytes(res, 5 * 1024 * 1024);
+      const bytes = await readBoundedBytes(res, 5 * 1024 * 1024, "Attachment exceeds 5MB limit");
       return {
         bytes,
         filename: attachment.filename,
@@ -559,7 +592,12 @@ export class RelayClient {
 }
 
 async function readBody(res: Response): Promise<unknown> {
-  const text = await res.text();
+  const bytes = await readBoundedBytes(
+    res,
+    MAX_CONTROL_PLANE_BYTES,
+    `Relay response body exceeds ${MAX_CONTROL_PLANE_BYTES / (1024 * 1024)}MB limit`,
+  );
+  const text = new TextDecoder().decode(bytes);
   if (!text) return {};
   try {
     return JSON.parse(text);

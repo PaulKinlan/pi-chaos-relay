@@ -389,3 +389,33 @@ test("downloadAttachment rejects declared responses over 5MB before buffering", 
   );
   assert.equal(cancelled, true);
 });
+
+test("control-plane responses are size-capped (oversized body is rejected)", async () => {
+  // Stream the oversized body instead of pre-allocating it, and spy on cancel
+  // so a regression back to buffering-then-checking cannot silently pass.
+  let cancelled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(3 * 1024 * 1024));
+      controller.enqueue(new Uint8Array(3 * 1024 * 1024));
+    },
+    cancel() { cancelled = true; },
+  });
+  const fn = (async () => new Response(stream, { status: 200 })) as unknown as typeof fetch;
+  const client = new RelayClient({ relayUrl: "http://relay", apiKey: "k", fetchImpl: fn });
+  await assert.rejects(
+    client.getMessages(),
+    (err: unknown) =>
+      err instanceof RelayError &&
+      err.status === 413 &&
+      /exceeds 5MB limit/.test(err.message),
+  );
+  assert.equal(cancelled, true);
+});
+
+test("control-plane responses within the cap still round-trip", async () => {
+  const { fn } = mockFetch(() => ({ body: { messages: [], since: "2026-01-01T00:00:00Z" } }));
+  const client = new RelayClient({ relayUrl: "http://relay", apiKey: "k", fetchImpl: fn });
+  const res = await client.getMessages("2025-12-31T00:00:00Z");
+  assert.deepEqual(res.messages, []);
+});
