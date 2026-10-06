@@ -17,6 +17,7 @@ import type {
   RelayClient,
 } from "./relay-client.ts";
 import { base64FromBytes } from "./relay-client.ts";
+import { redactUrlSecretsFromMessage } from "./url-redact.ts";
 
 const MAX_ATTACHMENT_AGE_MS = 24 * 60 * 60 * 1000;
 const MAX_ATTACHMENTS_PER_MESSAGE = 3;
@@ -191,9 +192,11 @@ export async function materializeInboundAttachments(
           `Attachment: ${attachment.filename} (${attachment.mimeType}, ${attachment.size || "unknown"} bytes) saved to ${settled.value.path}`,
         );
       } else {
-        const reason = settled.reason instanceof Error
-          ? settled.reason.message
-          : String(settled.reason);
+        const reason = redactUrlSecretsFromMessage(
+          settled.reason instanceof Error
+            ? settled.reason.message
+            : String(settled.reason),
+        );
         annotations.push(`Attachment unavailable: ${attachment.filename} — ${reason}`);
       }
     }

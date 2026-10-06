@@ -34,6 +34,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { generateKeyPair } from "../crypto.ts";
+import { RelayError } from "../relay-client.ts";
 
 const OFFLINE_RELAY_URL = "http://127.0.0.1:9"; // refused instantly; keeps every connect local
 
@@ -50,7 +52,7 @@ delete process.env.CHAOS_RELAY_API_KEY;
 process.env.CHAOS_RELAY_URL = OFFLINE_RELAY_URL;
 
 const config = await import("../config.ts");
-const { default: chaosRelayExtension, claimProfileLock, ApprovalQueue, log, rebindLogSummary } =
+const { default: chaosRelayExtension, toFriendly, claimProfileLock, ApprovalQueue, log, rebindLogSummary } =
   await import("../index.ts");
 
 type ExtensionApi = Parameters<typeof chaosRelayExtension>[0];
@@ -143,9 +145,63 @@ function isAlive(pid: number): boolean {
   }
 }
 
+
 /** Lock path index.ts uses: ~/.pi/chaos-relay-<profile>.lock (homedir() at call time). */
 function lockPath(profile: string): string {
   return join(PI_DIR, `chaos-relay-${profile}.lock`);
+}
+
+/** A stand-in WebSocket that can be forced to fail its handshake, so the
+ * auth-recovery path (and the channel re-bind it triggers) can be driven. */
+class FailingWebSocket {
+  static instances: FailingWebSocket[] = [];
+  /** The URL this socket was constructed for — lets a test pick ITS OWN
+   * instance out of the shared static registry by apiKey, instead of assuming
+   * `instances[0]` belongs to it (stale clients from earlier tests can still
+   * construct into the registry while this test is running). */
+  readonly url: string;
+  readyState = 0;
+  onopen: ((event: unknown) => void) | null = null;
+  onmessage: ((event: unknown) => void) | null = null;
+  onerror: ((event: unknown) => void) | null = null;
+  onclose: ((event: { code: number }) => void) | null = null;
+  constructor(url: string) {
+    this.url = url;
+    FailingWebSocket.instances.push(this);
+  }
+  send(): void {}
+  close(): void {}
+  failHandshake(code = 1006): void {
+    this.readyState = 3;
+    this.onclose?.({ code });
+  }
+}
+
+/** A stand-in WebSocket that captures instances so a test can drive an inbound
+ * push frame through the WS transport without a real socket. */
+class PushWebSocket {
+  static instances: PushWebSocket[] = [];
+  readyState = 0;
+  onopen: ((event: unknown) => void) | null = null;
+  onmessage: ((event: unknown) => void) | null = null;
+  onerror: ((event: unknown) => void) | null = null;
+  onclose: ((event: { code: number }) => void) | null = null;
+  constructor(_url: string) {
+    PushWebSocket.instances.push(this);
+  }
+  send(): void {}
+  close(): void {}
+  pushFrame(data: string): void {
+    this.onmessage?.({ data } as unknown as MessageEvent);
+  }
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 const SESSIONS_PATH = join(PI_DIR, "chaos-relay-sessions.json");
@@ -771,7 +827,8 @@ test("doctor never echoes a secret-shaped CHAOS_RELAY_URL", async () => {
 test("doctor strips credentials from a valid CHAOS_RELAY_URL (origin only)", async () => {
   resetState();
   const password = "supersecretpass";
-  const credUrl = `https://user:${password}@example.com`;
+  const querySecret = "doctor-origin-query-secret";
+  const credUrl = `https://user:${password}@example.com/health?token=${querySecret}#part2`;
   const prevUrl = process.env.CHAOS_RELAY_URL;
   process.env.CHAOS_RELAY_URL = credUrl;
   const origFetch = globalThis.fetch;
@@ -787,6 +844,10 @@ test("doctor strips credentials from a valid CHAOS_RELAY_URL (origin only)", asy
     const output = fake.notifications.map((n) => n.message).join("\n");
     assert.ok(!output.includes(password), `doctor output must not leak the password: ${output}`);
     assert.ok(!output.includes("user@example.com"), `doctor output must not leak userinfo: ${output}`);
+    assert.ok(!output.includes(querySecret), `doctor output must not leak the query token: ${output}`);
+    assert.ok(!output.includes("token="), `doctor output must not leak the query string: ${output}`);
+    assert.ok(!output.includes("/health"), `doctor output must not leak the path: ${output}`);
+    assert.ok(!output.includes("part2"), `doctor output must not leak the fragment: ${output}`);
     // The origin is still shown so the operator can see which host is in effect.
     assert.ok(output.includes("https://example.com"), `doctor shows the redacted origin (${output})`);
   } finally {
@@ -794,6 +855,183 @@ test("doctor strips credentials from a valid CHAOS_RELAY_URL (origin only)", asy
     else process.env.CHAOS_RELAY_URL = prevUrl;
     globalThis.fetch = origFetch;
   }
+});
+
+test("status strips credentials from the relayUrl (origin only)", async () => {
+  resetState();
+  const password = "supersecretpass";
+  const querySecret = "status-origin-query-secret";
+  // An apiKey makes the profile "configured", so status runs the live health
+  // probe. The probe is stubbed to time out, exercising the health() error path
+  // (which would otherwise leak `this.base` raw on the pre-fix build).
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: `https://user:${password}@example.com/health?token=${querySecret}#part2`, apiKey: "ak" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = ((_u: unknown, _i?: unknown) =>
+    Promise.reject(new DOMException("Timed out", "TimeoutError"))) as unknown as typeof fetch;
+
+  try {
+    const fake = makeFakePi();
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    const command = fake.commands.get("chaos-relay");
+    assert.ok(command, "extension registers the /chaos-relay command");
+    await command.handler("status", makeCtx("sess-status-cred", fake.notifications));
+
+    const status = fake.notifications.map((n) => n.message).join("\n");
+    assert.ok(!status.includes(password), `status must not leak the password: ${status}`);
+    assert.ok(!status.includes("user@example.com"), `status must not leak userinfo: ${status}`);
+    assert.ok(!status.includes(querySecret), `status must not leak the query token: ${status}`);
+    assert.ok(!status.includes("token="), `status must not leak the query string: ${status}`);
+    assert.ok(!status.includes("/health"), `status must not leak the path: ${status}`);
+    assert.ok(!status.includes("part2"), `status must not leak the fragment: ${status}`);
+    assert.ok(status.includes("https://example.com"), `status shows the redacted origin (${status})`);
+  } finally {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("status redacts query/fragment URL secrets from the health error", async () => {
+  resetState();
+  const secret = "status-query-secret";
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = ((_u: unknown, _i?: unknown) =>
+    Promise.reject(new Error(`fetch failed: https://example.com/health?token=${secret}#frag`))) as unknown as typeof fetch;
+
+  try {
+    const fake = makeFakePi();
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    const command = fake.commands.get("chaos-relay");
+    assert.ok(command, "extension registers the /chaos-relay command");
+    await command.handler("status", makeCtx("sess-status-query", fake.notifications));
+
+    const status = fake.notifications.map((n) => n.message).join("\n");
+    assert.ok(!status.includes(secret), `status must not leak the query token: ${status}`);
+    assert.ok(!status.includes("token="), `status must not leak the query string: ${status}`);
+    assert.ok(!status.includes("/health"), `status must not leak the path: ${status}`);
+    assert.ok(status.includes("https://example.com"), `status keeps the origin: ${status}`);
+  } finally {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("reset strips credentials from the cleared relayUrl (origin only)", async () => {
+  resetState();
+  const password = "supersecretpass";
+  const querySecret = "reset-origin-query-secret";
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: `https://user:${password}@example.com/health?token=${querySecret}#part2`, apiKey: "ak" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  const command = fake.commands.get("chaos-relay");
+  assert.ok(command, "extension registers the /chaos-relay command");
+  await command.handler("reset", makeCtx("sess-reset-cred", fake.notifications));
+
+  if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+  else process.env.CHAOS_RELAY_URL = prevUrl;
+
+  const output = fake.notifications.map((n) => n.message).join("\n");
+  assert.ok(!output.includes(password), `reset must not leak the password: ${output}`);
+  assert.ok(!output.includes("user@example.com"), `reset must not leak userinfo: ${output}`);
+  assert.ok(!output.includes(querySecret), `reset must not leak the query token: ${output}`);
+  assert.ok(!output.includes("token="), `reset must not leak the query string: ${output}`);
+  assert.ok(!output.includes("/health"), `reset must not leak the path: ${output}`);
+  assert.ok(!output.includes("part2"), `reset must not leak the fragment: ${output}`);
+});
+
+test("the invalid-env warning and auto-provision log strip credentials from the persisted URL", async (t) => {
+  resetState();
+  const password = "supersecretpass";
+  const seenPaths: string[] = [];
+  const server = createServer((req, res) => {
+    seenPaths.push(req.url ?? "");
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url === "/auth/register") res.end(JSON.stringify({ userId: "u_warn", apiKey: "ak_warn" }));
+      else if (req.url === "/channels/telegram/register") res.end(JSON.stringify({ channelId: "ch_warn", botUsername: "wbot", pairingCode: "3" }));
+      else res.end(JSON.stringify({}));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const port = (server.address() as { port: number }).port;
+  const credUrl = `http://user:${password}@127.0.0.1:${port}`;
+
+  writeFileSync(join(PI_DIR, "chaos-relay.json"), JSON.stringify({ relayUrl: credUrl }) + "\n");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  process.env.CHAOS_RELAY_URL = "not a url"; // malformed → invalidEnvIgnoredWarning
+  const prevFetch = blockNonLoopbackFetch();
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = prevFetch;
+  });
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-warn-cred", fake.notifications)));
+  const tg = fake.tools.find((tool) => tool.name === "relay_register_telegram");
+  assert.ok(tg);
+  const notifications: Notification[] = [];
+  const execute = tg.execute as (...a: unknown[]) => Promise<unknown>;
+  await execute("t1", { botToken: "123:ABC" }, undefined, undefined, {
+    ui: { notify: (m: string, l?: string) => notifications.push({ message: m, level: l }) },
+  });
+
+  const text = notifications.map((n) => n.message).join("\n");
+  assert.ok(!text.includes(password), `warning must not leak the password: ${text}`);
+  assert.ok(!text.includes("user@127.0.0.1"), `warning must not leak userinfo: ${text}`);
+  assert.ok(text.includes(`127.0.0.1:${port}`), `warning shows the redacted origin: ${text}`);
+  // The auto-provision durable-log line is redacted too.
+  const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+  const logRaw = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+  assert.ok(!logRaw.includes(password), `log must not leak the password: ${logRaw}`);
+  assert.ok(!logRaw.includes("user@127.0.0.1"), `log must not leak userinfo: ${logRaw}`);
+});
+
+test("connection log lines strip credentials from the relayUrl", async (t) => {
+  resetState();
+  const password = "supersecretpass";
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: `http://user:${password}@127.0.0.1:9`, apiKey: "ak" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-log-cred", fake.notifications));
+  await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-log-cred", fake.notifications));
+
+  if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+  else process.env.CHAOS_RELAY_URL = prevUrl;
+
+  const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+  const logRaw = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+  assert.ok(logRaw.includes("connecting to relay"), `log has the connect line: ${logRaw}`);
+  assert.ok(!logRaw.includes(password), `log must not leak the password: ${logRaw}`);
+  assert.ok(!logRaw.includes("user@127.0.0.1"), `log must not leak userinfo: ${logRaw}`);
 });
 
 test("auto-provision trims surrounding whitespace from CHAOS_RELAY_URL", async (t) => {
@@ -853,6 +1091,241 @@ test("auto-provision trims surrounding whitespace from CHAOS_RELAY_URL", async (
   };
   assert.equal(persisted.relayUrl, trimmedUrl, "persisted the TRIMMED relay URL (no surrounding spaces)");
 });
+
+test("doctor redacts query/fragment URL secrets from the reachability error", async () => {
+  resetState();
+  const secret = "doctor-reach-secret";
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = ((_u: unknown, _i?: unknown) =>
+    Promise.reject(new Error(`fetch failed: https://example.com/health?token=${secret}#frag`))) as unknown as typeof fetch;
+
+  try {
+    const fake = makeFakePi();
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    const command = fake.commands.get("chaos-relay");
+    assert.ok(command, "extension registers the /chaos-relay command");
+    await command.handler("doctor", makeCtx("sess-doctor-reach", fake.notifications));
+
+    const output = fake.notifications.map((n) => n.message).join("\n");
+    assert.ok(!output.includes(secret), `doctor must not leak the query token: ${output}`);
+    assert.ok(!output.includes("token="), `doctor must not leak the query string: ${output}`);
+    assert.ok(!output.includes("/health"), `doctor must not leak the path: ${output}`);
+    assert.ok(output.includes("relay reachable"), `doctor reports the reachability check: ${output}`);
+  } finally {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("the top-level command catch redacts URL secrets from bubble-up errors", async () => {
+  resetState();
+  const secret = "setup-timeout-secret";
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: `https://user:${secret}@example.com` }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = ((_u: unknown, _i?: unknown) =>
+    Promise.reject(new DOMException("Timed out", "TimeoutError"))) as unknown as typeof fetch;
+
+  try {
+    const fake = makeFakePi();
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    const command = fake.commands.get("chaos-relay");
+    assert.ok(command, "extension registers the /chaos-relay command");
+    const notifications: Notification[] = [];
+    const ctx = {
+      hasUI: true,
+      model: { input: ["text"] },
+      sessionManager: { getSessionId: () => "sess-catch" },
+      ui: { notify: (m: string, l?: string) => notifications.push({ message: m, level: l }) },
+    };
+    await command.handler("setup", ctx);
+
+    const output = notifications.map((n) => n.message).join("\n");
+    assert.ok(output.includes("chaos-relay error:"), `bubbles to the command catch: ${output}`);
+    assert.ok(!output.includes(secret), `must not leak the URL secret: ${output}`);
+    assert.ok(!output.includes("user@example.com"), `must not leak userinfo: ${output}`);
+    assert.ok(output.includes("https://example.com"), `keeps the origin: ${output}`);
+  } finally {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("toFriendly redacts URL secrets from RelayError and generic Error messages", () => {
+  const secret = "friendly-query-secret";
+  const relayErr = new RelayError(
+    `fetch failed: https://user:pw@example.com/health?token=${secret}#part2`,
+    0,
+  );
+  const friendlyRelay = toFriendly(relayErr);
+  assert.ok(friendlyRelay instanceof Error, "returns an Error for a RelayError");
+  assert.ok(!friendlyRelay.message.includes(secret), `must not leak the query token: ${friendlyRelay.message}`);
+  assert.ok(!friendlyRelay.message.includes("token="), `must not leak the query string: ${friendlyRelay.message}`);
+  assert.ok(!friendlyRelay.message.includes("/health"), `must not leak the path: ${friendlyRelay.message}`);
+  assert.ok(!friendlyRelay.message.includes("part2"), `must not leak the fragment: ${friendlyRelay.message}`);
+  assert.ok(friendlyRelay.message.includes("https://example.com"), `keeps the origin: ${friendlyRelay.message}`);
+
+  const genericErr = new Error(`fetch failed: https://example.com/health?token=${secret}#part2`);
+  const friendlyGeneric = toFriendly(genericErr);
+  assert.ok(friendlyGeneric instanceof Error, "returns an Error for a generic Error");
+  assert.ok(friendlyGeneric !== genericErr, "returns a NEW Error, not the original");
+  assert.ok(!friendlyGeneric.message.includes(secret), `must not leak the query token: ${friendlyGeneric.message}`);
+  assert.ok(!friendlyGeneric.message.includes("token="), `must not leak the query string: ${friendlyGeneric.message}`);
+  assert.ok(!friendlyGeneric.message.includes("/health"), `must not leak the path: ${friendlyGeneric.message}`);
+  assert.ok(!friendlyGeneric.message.includes("part2"), `must not leak the fragment: ${friendlyGeneric.message}`);
+  assert.ok(friendlyGeneric.message.includes("https://example.com"), `keeps the origin: ${friendlyGeneric.message}`);
+});
+
+test("auth recovery re-bind logs the webhook origin, not the secret URL", async () => {
+  resetState();
+  const keyPair = await generateKeyPair();
+  const webhookSecret = "wh-secret-token-123";
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({
+      relayUrl: "http://127.0.0.1:9",
+      apiKey: "old-key",
+      userId: "old-user",
+      keyPair,
+      channels: [{
+        channelId: "wh-1",
+        type: "webhook",
+        label: "my-webhook",
+        createdAt: new Date().toISOString(),
+        webhookSecret,
+        channelName: "my-webhook",
+      }],
+    }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  const origWs = globalThis.WebSocket;
+  FailingWebSocket.instances = [];
+  const ownSockets = () =>
+    FailingWebSocket.instances.filter((ws) =>
+      ws.url.includes(`token=${encodeURIComponent("old-key")}`),
+    );
+  globalThis.fetch = (async (input: unknown, _init?: unknown) => {
+    const href = typeof input === "string" ? input : String(input);
+    if (href.endsWith("/auth/register")) {
+      return new Response(JSON.stringify({ userId: "recovered-user", apiKey: "new-key" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (href.endsWith("/channels")) {
+      return new Response(JSON.stringify({
+        channel: { id: "wh-1", metadata: {} },
+        webhookUrl: `https://webhooks.example.com/webhook/wh-1?token=${webhookSecret}`,
+      }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+  globalThis.WebSocket = FailingWebSocket as unknown as typeof WebSocket;
+
+  try {
+    const fake = makeFakePi();
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-rebind", fake.notifications));
+
+    assert.ok(ownSockets().length >= 1, "this test's WS was constructed (token=old-key)");
+    const first = ownSockets()[0];
+    first.failHandshake(1006);
+    await waitFor(() => ownSockets().length >= 2);
+    const second = ownSockets().find((ws) => ws !== first);
+    assert.ok(second, "the client under test reconnected with its own apiKey");
+    second.failHandshake(1006);
+
+    const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+    await waitFor(() => {
+      const raw = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+      return raw.includes("URL unchanged");
+    });
+
+    await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-rebind", fake.notifications));
+
+    const logRaw = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+    assert.ok(!logRaw.includes(webhookSecret), `durable log must not leak the webhook secret: ${logRaw}`);
+    assert.ok(logRaw.includes("https://webhooks.example.com"), `log keeps the webhook origin: ${logRaw}`);
+  } finally {
+    globalThis.fetch = origFetch;
+    globalThis.WebSocket = origWs;
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+  }
+});
+
+test("attachment-delivery failure log redacts URL secrets from the injected message error", async () => {
+  resetState();
+  writeProfileConfig("default", "ak_attach");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origWs = globalThis.WebSocket;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+
+  try {
+    const fake = makeFakePi();
+    // Simulate the real failure this catch guards: the agent refuses the
+    // delivered message (e.g. mid-turn) with a URL-shaped secret in the error.
+    const secret = "att-deliv-secret";
+    fake.pi.sendUserMessage = () => {
+      throw new Error(`Agent is already processing https://user:${secret}@example.com/inbox?token=leakme#frag`);
+    };
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-attach-deliv", fake.notifications));
+
+    assert.ok(PushWebSocket.instances.length >= 1, "WS constructed");
+    PushWebSocket.instances[0].pushFrame(JSON.stringify({
+      type: "message",
+      message: {
+        id: "m-attach-deliv",
+        channelType: "telegram",
+        channelId: "ch-attach",
+        from: "someone",
+        content: "hello with an attachment",
+        timestamp: new Date().toISOString(),
+      },
+    }));
+
+    const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+    await waitFor(() => {
+      const raw = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+      return raw.includes("attachment delivery failed");
+    });
+
+    await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-attach-deliv", fake.notifications));
+
+    const logRaw = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+    assert.ok(!logRaw.includes(secret), `log must not leak the password: ${logRaw}`);
+    assert.ok(!logRaw.includes("user@example.com"), `log must not leak userinfo: ${logRaw}`);
+    assert.ok(!logRaw.includes("/inbox"), `log must not leak the path: ${logRaw}`);
+    assert.ok(!logRaw.includes("token=leakme"), `log must not leak the query string: ${logRaw}`);
+    assert.ok(!logRaw.includes("#frag"), `log must not leak the fragment: ${logRaw}`);
+    assert.ok(logRaw.includes("https://example.com"), `log keeps the redacted origin: ${logRaw}`);
+  } finally {
+    globalThis.WebSocket = origWs;
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+  }
+});
+
 
 // ── pi-chaos-relay-bxa: the profile lock is claimed atomically, pre-connect ──
 //
