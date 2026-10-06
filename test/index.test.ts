@@ -974,7 +974,10 @@ test("claimProfileLock: two processes racing the same profile — exactly one wi
 test("an approval is answered only by its nonce from the originating sender", async () => {
   const q = new ApprovalQueue(60_000);
   const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
-  // The correct answer echoes the unguessable nonce from the same sender/channel.
+  // The request issues a real, unguessable token (a regression that dropped the
+  // nonce would leave every answer unmatched and forwarded).
+  assert.match(req.nonce, /^[0-9a-f]{12}$/, "an unguessable nonce is issued");
+  // The correct answer echoes the nonce from the same sender/channel.
   assert.equal(
     q.settle({ channelId: "c1", from: "alice", content: `yes ${req.nonce}` }),
     true,
@@ -982,6 +985,15 @@ test("an approval is answered only by its nonce from the originating sender", as
   );
   assert.equal(await req.promise, true);
   assert.equal(q.size, 0);
+});
+
+test("an answer with trailing punctuation is still accepted", async () => {
+  const q = new ApprovalQueue(60_000);
+  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  // Phone keyboards append "." or "!"; that must not turn a valid answer into
+  // a non-answer.
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `yes ${req.nonce}.` }), true);
+  assert.equal(await req.promise, true);
 });
 
 test("an approval answer from a different sender is not consumed (forwarded)", async () => {
@@ -1046,6 +1058,8 @@ test("each approval request times out independently", async (t) => {
   const first = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
   t.mock.timers.tick(30_000);
   const second = q.add({ channelId: "c1", from: "alice", toolName: "edit" });
+  assert.match(second.nonce, /^[0-9a-f]{12}$/, "the nonce is issued (regression pin)");
+  assert.notEqual(first.nonce, second.nonce, "distinct nonces");
 
   t.mock.timers.tick(30_000); // first reaches 60s; second is only 30s old
   assert.equal(await first.promise, false, "the older request auto-denied on its own timeout");
@@ -1060,6 +1074,7 @@ test("cancel() drops a request that never reached the user", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const q = new ApprovalQueue(60_000);
   const dropped = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  assert.match(dropped.nonce, /^[0-9a-f]{12}$/, "the nonce is issued (regression pin)");
   dropped.cancel();
   assert.equal(q.size, 0, "the entry is gone");
   assert.equal(
@@ -1074,3 +1089,81 @@ test("cancel() drops a request that never reached the user", async (t) => {
   assert.equal(await live.promise, false, "the live request timed out on its own timer");
 });
 
+
+test("a mid-turn message from another channel does not re-point the approval", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak", approvalMode: "all" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+
+  let messagesServed = 0;
+  const replyDests: string[] = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown, init?: unknown) => {
+    const u = String(url);
+    if (u.includes("/messages")) {
+      messagesServed++;
+      const msg =
+        messagesServed === 1
+          ? { id: "m1", channelType: "telegram", channelId: "chanA", from: "alice", content: "hello A", timestamp: "2026-01-01T00:00:01Z" }
+          : { id: "m2", channelType: "telegram", channelId: "chanB", from: "bob", content: "hello B", timestamp: "2026-01-01T00:00:02Z" };
+      return new Response(JSON.stringify({ messages: [msg], since: "2026-01-01T00:00:02Z" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (u.includes("/reply")) {
+      const body = JSON.parse(String((init as { body?: string })?.body ?? "{}"));
+      replyDests.push(body.channelId);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+
+  // setImmediate is not mocked, so it drains the async message-delivery chain
+  // (fetch → poll → deliver) after each mocked timer tick.
+  const flushAsync = async () => {
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+  };
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-turn", fake.notifications));
+
+  // Channel A's message arrives via the safety poll.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+  // The turn begins: snapshot the origin (channel A).
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-turn", fake.notifications));
+  // Mid-turn: channel B's message arrives, re-pointing the live lastChannel.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+  // The agent calls a gated tool. Fire it without awaiting: the send happens
+  // before the wait, and the wait is resolved below by the approval timeout.
+  const toolHandlers = fake.handlers.get("tool_call");
+  assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
+  const toolCall = toolHandlers![0](
+    { toolName: "bash", input: { command: "x" } },
+    makeCtx("sess-turn", fake.notifications),
+  );
+  await flushAsync();
+  // Resolve the pending approval via its own 5-minute timeout.
+  t.mock.timers.tick(300_000);
+  await toolCall;
+
+  await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-turn", fake.notifications));
+  t.mock.timers.reset();
+  if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+  else process.env.CHAOS_RELAY_URL = prevUrl;
+  globalThis.fetch = origFetch;
+
+  assert.deepEqual(
+    replyDests,
+    ["chanA"],
+    "the approval was asked over the originating channel, not the mid-turn message's channel",
+  );
+});

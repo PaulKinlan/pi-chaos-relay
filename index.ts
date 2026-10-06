@@ -320,7 +320,7 @@ export class ApprovalQueue {
    */
   settle(message: { channelId: string; from: string; content: string }): boolean {
     if (this.pending.size === 0) return false;
-    const answer = /^\s*(yes|no)\s+([0-9a-f]+)\s*$/i.exec(message.content);
+    const answer = /^\s*(yes|no)\s+([0-9a-f]+)[.!]?\s*$/i.exec(message.content);
     if (!answer) return false; // not a well-formed answer — forward it untouched
     const nonce = answer[2].toLowerCase();
     for (const [key, held] of this.pending) {
@@ -388,6 +388,13 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // message from it, not on terminal-driven turns).
   let typingTimer: ReturnType<typeof setInterval> | undefined;
   let lastChannel:
+    | { channelType: ChannelMessage["channelType"]; channelId: string; from: string }
+    | undefined;
+  /** The turn's ORIGINATING channel+sender, snapshotted at turn start. Unlike
+   *  `lastChannel` (overwritten by every inbound delivery, including a mid-turn
+   *  followUp from another channel), this is fixed for the whole turn so a
+   *  gated tool call asks — and is answered by — the right channel. */
+  let activeTurn:
     | { channelType: ChannelMessage["channelType"]; channelId: string; from: string }
     | undefined;
   let relayInputSinceIdle = false;
@@ -1034,10 +1041,17 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
   // Show a "typing" indicator in the active channel while the agent works on a
   // relay-delivered message, and clear it when the run finishes.
-  pi.on("agent_start", () => startTyping());
+  pi.on("agent_start", () => {
+    startTyping();
+    // Snapshot the turn's origin: lastChannel is overwritten by every inbound
+    // delivery (including a followUp from another channel mid-turn), so the
+    // approval must bind to this snapshot, not the live value.
+    activeTurn = relayInputSinceIdle ? lastChannel : undefined;
+  });
   pi.on("agent_end", () => {
     stopTyping();
     relayInputSinceIdle = false;
+    activeTurn = undefined;
   });
 
   // Tool approval: when enabled and the turn came from a channel, pause risky
@@ -1045,19 +1059,19 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   pi.on("tool_call", async (event) => {
     if (!approvalNeeded(event.toolName)) return; // allow
     // Only gate turns driven from a channel — terminal/local use is unaffected.
-    if (!relayInputSinceIdle || !lastChannel) return;
+    if (!activeTurn) return;
     // Pause the typing indicator while we wait on the human.
     stopTyping();
     const approved = await requestApproval(
       event.toolName,
       event.input as Record<string, unknown>,
-      lastChannel,
+      activeTurn,
     );
     if (!approved) {
       return {
         block: true,
         reason:
-          `The user denied this ${event.toolName} call over ${lastChannel.channelType}. ` +
+          `The user denied this ${event.toolName} call over ${activeTurn.channelType}. ` +
           `Do not retry it; ask them what to do instead.`,
       };
     }
