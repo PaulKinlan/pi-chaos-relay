@@ -389,3 +389,25 @@ test("downloadAttachment rejects declared responses over 5MB before buffering", 
   );
   assert.equal(cancelled, true);
 });
+
+test("control-plane responses are size-capped (oversized body is rejected)", async () => {
+  // 6 MB > the 5 MB control-plane cap. A hostile relay returning this must be
+  // rejected with a clear bounded error, not buffered in full.
+  const big = "x".repeat(6 * 1024 * 1024);
+  const fn = (async () => new Response(big, { status: 200 })) as unknown as typeof fetch;
+  const client = new RelayClient({ relayUrl: "http://relay", apiKey: "k", fetchImpl: fn });
+  await assert.rejects(
+    client.getMessages(),
+    (err: unknown) =>
+      err instanceof RelayError &&
+      err.status === 413 &&
+      /exceeds 5MB limit/.test(err.message),
+  );
+});
+
+test("control-plane responses within the cap still round-trip", async () => {
+  const { fn } = mockFetch(() => ({ body: { messages: [], since: "2026-01-01T00:00:00Z" } }));
+  const client = new RelayClient({ relayUrl: "http://relay", apiKey: "k", fetchImpl: fn });
+  const res = await client.getMessages("2025-12-31T00:00:00Z");
+  assert.deepEqual(res.messages, []);
+});

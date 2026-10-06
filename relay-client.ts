@@ -26,6 +26,14 @@ import { buildSignatureHeaders, generateKeyPair, type KeyPairJwk } from "./crypt
  */
 export const DEFAULT_TIMEOUT_MS = 15000;
 
+/**
+ * Hard cap on control-plane HTTP response bodies (auth, messages, channels,
+ * replies, health). These are small JSON; a hostile relay returning an
+ * oversized body must be rejected before it is buffered, so peak memory stays
+ * bounded. Attachment downloads use the same cap via readBoundedBytes.
+ */
+const MAX_CONTROL_PLANE_BYTES = 5 * 1024 * 1024; // 5 MB
+
 /** True for an AbortError raised by our timeout signal. */
 function isTimeoutError(err: unknown): boolean {
   return err instanceof DOMException && err.name === "TimeoutError" ||
@@ -38,7 +46,11 @@ function isTimeoutError(err: unknown): boolean {
  * settles, so it never lingers (which would trip Deno's test timer sanitizer
  * and needlessly keep the event loop alive).
  */
-async function readBoundedBytes(response: Response, maxBytes: number): Promise<Uint8Array> {
+async function readBoundedBytes(
+  response: Response,
+  maxBytes: number,
+  tooLargeMessage: string,
+): Promise<Uint8Array> {
   if (!response.body) return new Uint8Array();
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -49,8 +61,8 @@ async function readBoundedBytes(response: Response, maxBytes: number): Promise<U
       if (done) break;
       total += value.byteLength;
       if (total > maxBytes) {
-        await reader.cancel("attachment too large");
-        throw new RelayError("Attachment exceeds 5MB limit", 413);
+        await reader.cancel("response too large");
+        throw new RelayError(tooLargeMessage, 413);
       }
       chunks.push(value);
     }
@@ -422,7 +434,7 @@ export class RelayClient {
         await res.body?.cancel();
         throw new RelayError("Attachment exceeds 5MB limit", 413);
       }
-      const bytes = await readBoundedBytes(res, 5 * 1024 * 1024);
+      const bytes = await readBoundedBytes(res, 5 * 1024 * 1024, "Attachment exceeds 5MB limit");
       return {
         bytes,
         filename: attachment.filename,
@@ -559,7 +571,12 @@ export class RelayClient {
 }
 
 async function readBody(res: Response): Promise<unknown> {
-  const text = await res.text();
+  const bytes = await readBoundedBytes(
+    res,
+    MAX_CONTROL_PLANE_BYTES,
+    `Relay response body exceeds ${MAX_CONTROL_PLANE_BYTES / (1024 * 1024)}MB limit`,
+  );
+  const text = new TextDecoder().decode(bytes);
   if (!text) return {};
   try {
     return JSON.parse(text);
