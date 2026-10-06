@@ -1005,10 +1005,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         // statuses (401/429/5xx) stay thrown so auth/transport problems
         // surface as errors.
         if (err instanceof RelayError && err.status === 400) {
-          log(`relay_reply: HTTP refused: ${err.message}`);
+          const refusal = redactUrlSecretsFromMessage(err.message);
+          log(`relay_reply: HTTP refused: ${refusal}`);
           return textResult(
-            `relay_reply: REFUSED by relay — ${err.message}. Nothing was sent.`,
-            { ok: false, error: err.message },
+            `relay_reply: REFUSED by relay — ${refusal}. Nothing was sent.`,
+            { ok: false, error: refusal },
           );
         }
         log(`relay_reply: HTTP reply failed: ${redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err))}`);

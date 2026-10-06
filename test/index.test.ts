@@ -155,6 +155,25 @@ class FailingWebSocket {
   }
 }
 
+/** A stand-in WebSocket that captures instances so a test can drive an inbound
+ * push frame through the WS transport without a real socket. */
+class PushWebSocket {
+  static instances: PushWebSocket[] = [];
+  readyState = 0;
+  onopen: ((event: unknown) => void) | null = null;
+  onmessage: ((event: unknown) => void) | null = null;
+  onerror: ((event: unknown) => void) | null = null;
+  onclose: ((event: { code: number }) => void) | null = null;
+  constructor(_url: string) {
+    PushWebSocket.instances.push(this);
+  }
+  send(): void {}
+  close(): void {}
+  pushFrame(data: string): void {
+    this.onmessage?.({ data } as unknown as MessageEvent);
+  }
+}
+
 async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
   const start = Date.now();
   while (!predicate()) {
@@ -1217,6 +1236,61 @@ test("auth recovery re-bind logs the webhook origin, not the secret URL", async 
     assert.ok(logRaw.includes("https://webhooks.example.com"), `log keeps the webhook origin: ${logRaw}`);
   } finally {
     globalThis.fetch = origFetch;
+    globalThis.WebSocket = origWs;
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+  }
+});
+
+test("attachment-delivery failure log redacts URL secrets from the injected message error", async () => {
+  resetState();
+  writeProfileConfig("default", "ak_attach");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origWs = globalThis.WebSocket;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+
+  try {
+    const fake = makeFakePi();
+    // Simulate the real failure this catch guards: the agent refuses the
+    // delivered message (e.g. mid-turn) with a URL-shaped secret in the error.
+    const secret = "att-deliv-secret";
+    fake.pi.sendUserMessage = () => {
+      throw new Error(`Agent is already processing https://user:${secret}@example.com/inbox?token=leakme#frag`);
+    };
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-attach-deliv", fake.notifications));
+
+    assert.ok(PushWebSocket.instances.length >= 1, "WS constructed");
+    PushWebSocket.instances[0].pushFrame(JSON.stringify({
+      type: "message",
+      message: {
+        id: "m-attach-deliv",
+        channelType: "telegram",
+        channelId: "ch-attach",
+        from: "someone",
+        content: "hello with an attachment",
+        timestamp: new Date().toISOString(),
+      },
+    }));
+
+    const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+    await waitFor(() => {
+      const raw = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+      return raw.includes("attachment delivery failed");
+    });
+
+    await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-attach-deliv", fake.notifications));
+
+    const logRaw = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+    assert.ok(!logRaw.includes(secret), `log must not leak the password: ${logRaw}`);
+    assert.ok(!logRaw.includes("user@example.com"), `log must not leak userinfo: ${logRaw}`);
+    assert.ok(!logRaw.includes("/inbox"), `log must not leak the path: ${logRaw}`);
+    assert.ok(!logRaw.includes("token=leakme"), `log must not leak the query string: ${logRaw}`);
+    assert.ok(!logRaw.includes("#frag"), `log must not leak the fragment: ${logRaw}`);
+    assert.ok(logRaw.includes("https://example.com"), `log keeps the redacted origin: ${logRaw}`);
+  } finally {
     globalThis.WebSocket = origWs;
     if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
     else process.env.CHAOS_RELAY_URL = prevUrl;
