@@ -19,6 +19,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const SCRIPT = new URL("../scripts/check-version-consistency.mjs", import.meta.url);
 
@@ -83,16 +86,19 @@ test("compareVersions sorts a prerelease BELOW its release (semver §11)", () =>
   assert.ok(compareVersions("0.17.13-rc.1", "0.17.14") < 0);
 });
 
-test("compareVersions orders prereleases by identifier", () => {
+test("compareVersions orders prereleases by identifier, including build metadata", () => {
   assert.ok(compareVersions("1.0.0-alpha", "1.0.0-beta") < 0, "alphanumeric identifiers compare lexically");
   assert.ok(compareVersions("1.0.0-1", "1.0.0-alpha") < 0, "numeric identifiers sort before alphanumeric");
   assert.ok(compareVersions("1.0.0-2", "1.0.0-10") < 0, "numeric identifiers compare numerically, not lexically");
+  // Secondary numeric identifiers must compare numerically too, in BOTH
+  // directions — lexically "10" < "2", so this is the case a string compare
+  // gets wrong.
+  assert.ok(compareVersions("1.0.0-alpha.10", "1.0.0-alpha.2") > 0, "alpha.10 is above alpha.2");
+  assert.ok(compareVersions("1.0.0-alpha.2", "1.0.0-alpha.10") < 0, "and the reverse direction agrees");
+  assert.ok(compareVersions("1.0.0-rc.10", "1.0.0-rc.9") > 0, "rc.10 is above rc.9");
   assert.ok(compareVersions("1.0.0-alpha", "1.0.0-alpha.1") < 0, "fewer identifiers sorts lower");
   assert.equal(compareVersions("1.0.0-alpha", "1.0.0-alpha"), 0);
   assert.equal(compareVersions("1.0.0-rc.1", "1.0.0-rc.1+build.9"), 0, "build metadata is ignored");
-});
-
-test("compareVersions ignores build metadata", () => {
   assert.equal(compareVersions("1.0.0+build.5", "1.0.0"), 0);
   assert.equal(compareVersions("1.0.0+build.5", "1.0.0+build.6"), 0);
   assert.ok(compareVersions("1.0.1+build.1", "1.0.0+build.9") > 0, "release segments still decide");
@@ -105,4 +111,51 @@ test("the gate's regression rule now catches a prerelease branch version", () =>
   assert.equal(below, true);
   const above = compareVersions("0.17.15", "0.17.14") < 0;
   assert.equal(above, false, "a strictly greater release is accepted");
+});
+
+test("the entry-point guard survives being invoked through a SYMLINK", () => {
+  // Node resolves import.meta.url through symlinks but leaves process.argv[1] as
+  // the typed path, so comparing them without realpathSync made a symlinked
+  // invocation skip main() and exit 0 — a silent gate bypass that reported
+  // success without checking anything. This drives the script through a symlink
+  // against a fixture whose versions DISAGREE, so a real check must exit 1
+  // (and a bypass would exit 0).
+  const dir = mkdtempSync(join(tmpdir(), "version-gate-symlink-"));
+  try {
+    // A minimal git repo so --base HEAD resolves inside the fixture.
+    const gitEnv = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
+    const run = (args: string[]) =>
+      spawnSync("git", args, { cwd: dir, env: gitEnv, encoding: "utf8" });
+    run(["init", "-q"]);
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "x", version: "1.0.0" }) + "\n");
+    writeFileSync(join(dir, "package-lock.json"), JSON.stringify({ name: "x", version: "1.0.0", packages: { "": { version: "1.0.0" } } }) + "\n");
+    run(["add", "-A"]);
+    run(["commit", "-q", "-m", "fixture"]);
+    // Now make the tree disagree with itself (and with HEAD): the gate must fail.
+    writeFileSync(join(dir, "package-lock.json"), JSON.stringify({ name: "x", version: "0.9.0", packages: { "": { version: "0.9.0" } } }) + "\n");
+
+    const link = join(dir, "gate-link.mjs");
+    symlinkSync(SCRIPT.pathname, link);
+
+    const result = spawnSync(process.execPath, [link, "--base", "HEAD", "--dir", dir], {
+      cwd: dir,
+      encoding: "utf8",
+    });
+    assert.equal(
+      result.status,
+      1,
+      `a symlinked invocation must still CHECK (exit 1 on a disagreement, not a silent 0): ` +
+        `status=${result.status} stdout=${result.stdout} stderr=${result.stderr}`,
+    );
+    assert.match(result.stderr, /!= package-lock\.json/, `it reported the disagreement: ${result.stderr}`);
+
+    // …and the same invocation NOT through a symlink behaves identically.
+    const direct = spawnSync(process.execPath, [SCRIPT.pathname, "--base", "HEAD", "--dir", dir], {
+      cwd: dir,
+      encoding: "utf8",
+    });
+    assert.equal(direct.status, 1, "direct invocation also fails the bad fixture");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -32,7 +32,7 @@
  *     local branch named `origin/master` can silently become the base. Pass a
  *     fully-qualified ref (`refs/remotes/origin/master`) to make it unambiguous.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -265,4 +265,22 @@ function main() {
 
 // Execute the CLI only when this file is the entry point, so the module can be
 // imported (by tests) without running parseArgs and exiting on import.
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
+//
+// process.argv[1] must be CANONICALIZED before comparing: Node resolves
+// import.meta.url through symlinks but leaves argv[1] as the path the caller
+// typed, so invoking this script through a symlink used to compare the
+// symlink's URL against the real module URL, skip main(), and exit 0 — a
+// SILENT gate bypass (a green gate that checked nothing). realpathSync fixes
+// that; if it fails (path deleted mid-run, exotic mount) fall back to the plain
+// comparison rather than skipping the check.
+function isEntryPoint() {
+  const invoked = process.argv[1];
+  if (!invoked) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(invoked)).href;
+  } catch {
+    return import.meta.url === pathToFileURL(invoked).href;
+  }
+}
+
+if (isEntryPoint()) main();
