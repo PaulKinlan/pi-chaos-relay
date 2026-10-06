@@ -786,68 +786,85 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     if (!c) return;
     const records = loadPersisted().channels ?? [];
     if (records.length === 0) return;
-    const updated: RegisteredChannelRecord[] = [];
-    const results: RebindChannelResult[] = [];
-    for (const rec of records) {
-      try {
-        if (rec.type === "telegram" && rec.botToken) {
-          const res = await c.registerTelegram({ botToken: rec.botToken, agentId: cfg.agentId });
-          updated.push({ ...rec, channelId: res.channelId, label: res.botUsername });
-          results.push({
-            type: "telegram",
-            ok: true,
-            pairingCode: res.pairingCode,
-            channelId: res.channelId,
-            botUsername: res.botUsername,
-          });
-        } else if (rec.type === "email" && rec.userEmail) {
-          const res = await c.registerEmail({
-            userEmail: rec.userEmail,
-            agentId: cfg.agentId,
-            channelName: rec.channelName,
-          });
-          updated.push({ ...rec, channelId: res.channelId });
-          results.push({
-            type: "email",
-            ok: true,
-            channelId: res.channelId,
-            inboundAddress: res.inboundAddress,
-            userEmail: rec.userEmail,
-          });
-        } else if (rec.type === "discord" && rec.botToken) {
-          const res = await c.registerDiscord({ botToken: rec.botToken, agentId: cfg.agentId });
-          updated.push({ ...rec, channelId: res.channelId, label: res.botUsername });
-          results.push({
-            type: "discord",
-            ok: true,
-            pairingCode: res.pairingCode,
-            channelId: res.channelId,
-            botUsername: res.botUsername,
-          });
-        } else if (rec.type === "webhook") {
-          // Recreate with the same id + secret so the public URL is unchanged.
-          const res = await c.registerWebhook({
-            id: rec.channelId,
-            webhookSecret: rec.webhookSecret,
-            channelName: rec.channelName,
-          });
-          updated.push({ ...rec, channelId: res.channelId });
-          results.push({
-            type: "webhook",
-            ok: true,
-            channelId: res.channelId,
-            webhookUrl: res.webhookUrl,
-            label: rec.label,
-          });
-        } else {
-          updated.push(rec); // no re-bind material — keep the record, note it
-          results.push({ type: rec.type, ok: false });
+    // The channels re-bind INDEPENDENTLY, so run them concurrently: in a serial
+    // loop the forced-new-session path paid one control-plane round trip per
+    // channel (N × RTT). Each record still catches its own failure, so one bad
+    // channel can never abort the re-bind or drop the others' outcomes — and the
+    // results are reassembled in RECORD ORDER below, so the persisted records and
+    // the log summary stay deterministic regardless of completion order.
+    const outcomes = await Promise.all(
+      records.map(async (rec): Promise<{ record: RegisteredChannelRecord; result: RebindChannelResult }> => {
+        try {
+          if (rec.type === "telegram" && rec.botToken) {
+            const res = await c.registerTelegram({ botToken: rec.botToken, agentId: cfg.agentId });
+            return {
+              record: { ...rec, channelId: res.channelId, label: res.botUsername },
+              result: {
+                type: "telegram",
+                ok: true,
+                pairingCode: res.pairingCode,
+                channelId: res.channelId,
+                botUsername: res.botUsername,
+              },
+            };
+          }
+          if (rec.type === "email" && rec.userEmail) {
+            const res = await c.registerEmail({
+              userEmail: rec.userEmail,
+              agentId: cfg.agentId,
+              channelName: rec.channelName,
+            });
+            return {
+              record: { ...rec, channelId: res.channelId },
+              result: {
+                type: "email",
+                ok: true,
+                channelId: res.channelId,
+                inboundAddress: res.inboundAddress,
+                userEmail: rec.userEmail,
+              },
+            };
+          }
+          if (rec.type === "discord" && rec.botToken) {
+            const res = await c.registerDiscord({ botToken: rec.botToken, agentId: cfg.agentId });
+            return {
+              record: { ...rec, channelId: res.channelId, label: res.botUsername },
+              result: {
+                type: "discord",
+                ok: true,
+                pairingCode: res.pairingCode,
+                channelId: res.channelId,
+                botUsername: res.botUsername,
+              },
+            };
+          }
+          if (rec.type === "webhook") {
+            // Recreate with the same id + secret so the public URL is unchanged.
+            const res = await c.registerWebhook({
+              id: rec.channelId,
+              webhookSecret: rec.webhookSecret,
+              channelName: rec.channelName,
+            });
+            return {
+              record: { ...rec, channelId: res.channelId },
+              result: {
+                type: "webhook",
+                ok: true,
+                channelId: res.channelId,
+                webhookUrl: res.webhookUrl,
+                label: rec.label,
+              },
+            };
+          }
+          // no re-bind material — keep the record, note it
+          return { record: rec, result: { type: rec.type, ok: false } };
+        } catch {
+          return { record: rec, result: { type: rec.type, ok: false } };
         }
-      } catch {
-        updated.push(rec);
-        results.push({ type: rec.type, ok: false });
-      }
-    }
+      }),
+    );
+    const updated = outcomes.map((o) => o.record);
+    const results = outcomes.map((o) => o.result);
     setChannelRecords(updated);
     cfg = resolveConfig();
     if (results.length > 0) {

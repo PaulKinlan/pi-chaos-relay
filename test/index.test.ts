@@ -204,6 +204,31 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void
   }
 }
 
+/**
+ * Concurrency probe for the auth-recovery channel re-bind. `enter()` records
+ * how many registrations are in flight at once and opens a barrier only once
+ * `expected` of them have entered. A SERIAL re-bind never reaches the barrier,
+ * so it times out here and the test fails on `maxInFlight()` instead of hanging.
+ */
+function makeInflightProbe(expected: number, timeoutMs: number) {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let openGate: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    openGate = resolve;
+  });
+  return {
+    maxInFlight: () => maxInFlight,
+    async enter(): Promise<void> {
+      inFlight += 1;
+      if (inFlight > maxInFlight) maxInFlight = inFlight;
+      if (inFlight >= expected) openGate?.();
+      await Promise.race([gate, new Promise((resolve) => setTimeout(resolve, timeoutMs))]);
+      inFlight -= 1;
+    },
+  };
+}
+
 const SESSIONS_PATH = join(PI_DIR, "chaos-relay-sessions.json");
 
 function readSessionMap(): Record<string, string> {
@@ -1263,6 +1288,225 @@ test("auth recovery re-bind logs the webhook origin, not the secret URL", async 
     const logRaw = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
     assert.ok(!logRaw.includes(webhookSecret), `durable log must not leak the webhook secret: ${logRaw}`);
     assert.ok(logRaw.includes("https://webhooks.example.com"), `log keeps the webhook origin: ${logRaw}`);
+  } finally {
+    globalThis.fetch = origFetch;
+    globalThis.WebSocket = origWs;
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+  }
+});
+
+// ── pi-chaos-relay-0yj: the forced-new-session channel re-bind runs its
+//    independent registrations CONCURRENTLY (one round trip, not N) without
+//    losing any record's result.
+
+test("auth recovery re-binds every channel concurrently, in one round-trip window", async () => {
+  resetState();
+  // Start from an empty durable log so the assertions below cannot match a
+  // previous test's re-bind summary.
+  rmSync(join(PI_DIR, "agent", "logs"), { recursive: true, force: true });
+
+  const keyPair = await generateKeyPair();
+  const createdAt = new Date().toISOString();
+  const webhookChannels = ["wh-rebind-a", "wh-rebind-b"];
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({
+      relayUrl: OFFLINE_RELAY_URL,
+      apiKey: "old-key",
+      userId: "old-user",
+      keyPair,
+      channels: webhookChannels.map((channelId) => ({
+        channelId,
+        type: "webhook",
+        label: channelId,
+        createdAt,
+        webhookSecret: `secret-${channelId}`,
+        channelName: channelId,
+      })),
+    }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  const origWs = globalThis.WebSocket;
+  FailingWebSocket.instances = [];
+
+  const BARRIER_TIMEOUT_MS = 1000;
+  const probe = makeInflightProbe(webhookChannels.length, BARRIER_TIMEOUT_MS);
+
+  globalThis.fetch = (async (input: unknown, init?: unknown) => {
+    const href = typeof input === "string" ? input : String(input);
+    const method = (init as { method?: string } | undefined)?.method ?? "GET";
+    if (href.endsWith("/auth/register")) {
+      return new Response(JSON.stringify({ userId: "recovered-user", apiKey: "new-key" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (method === "POST" && href.endsWith("/channels")) {
+      // Hold each registration until EVERY persistent channel is in flight: a
+      // serial re-bind never fills the barrier, so it times out (max 1 in
+      // flight) and fails the assertion rather than the suite hanging.
+      await probe.enter();
+      const body = JSON.parse(String((init as { body?: unknown } | undefined)?.body ?? "{}")) as {
+        id?: string;
+      };
+      return new Response(
+        JSON.stringify({
+          channel: { id: body.id ?? "wh-unknown", metadata: {} },
+          webhookUrl: `https://webhooks.example.com/webhook/${body.id}?token=t`,
+        }),
+        { status: 201, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+  globalThis.WebSocket = FailingWebSocket as unknown as typeof WebSocket;
+
+  try {
+    const fake = makeFakePi();
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-concurrent-rebind", fake.notifications));
+
+    const ownSockets = () =>
+      FailingWebSocket.instances.filter((ws) => ws.url.includes(`token=${encodeURIComponent("old-key")}`));
+    assert.ok(ownSockets().length >= 1, "this test's WS was constructed (token=old-key)");
+    const first = ownSockets()[ownSockets().length - 1];
+    first.failHandshake(1006);
+    await waitFor(() => ownSockets().some((ws) => ws !== first));
+    const second = ownSockets().find((ws) => ws !== first);
+    assert.ok(second, "the client reconnected before the handshake failed twice");
+
+    const started = Date.now();
+    second.failHandshake(1006);
+
+    const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+    await waitFor(() => {
+      const raw = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+      return raw.includes("Channel re-binding status");
+    });
+    const elapsedMs = Date.now() - started;
+
+    assert.equal(
+      probe.maxInFlight(),
+      webhookChannels.length,
+      "all persisted channels are registered at once (a serial loop overlaps zero)",
+    );
+    assert.ok(
+      elapsedMs < BARRIER_TIMEOUT_MS,
+      `re-bind of ${webhookChannels.length} channels finished in ${elapsedMs}ms — under a single barrier wait, so it is one round trip, not N in series`,
+    );
+
+    await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-concurrent-rebind", fake.notifications));
+  } finally {
+    globalThis.fetch = origFetch;
+    globalThis.WebSocket = origWs;
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+  }
+});
+
+test("auth recovery re-bind keeps record order and one failure does not drop the rest", async () => {
+  resetState();
+  rmSync(join(PI_DIR, "agent", "logs"), { recursive: true, force: true });
+
+  const keyPair = await generateKeyPair();
+  const createdAt = new Date().toISOString();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({
+      relayUrl: OFFLINE_RELAY_URL,
+      apiKey: "old-key",
+      userId: "old-user",
+      keyPair,
+      // Record order: a failing telegram, a SLOW succeeding webhook, and a
+      // third record with no re-bind material. Completion order is reversed,
+      // so a result-at-completion-time implementation reorders the summary.
+      channels: [
+        { channelId: "tg-old", type: "telegram", label: "tg", createdAt, botToken: "bot-token" },
+        { channelId: "wh-old", type: "webhook", label: "wh", createdAt, webhookSecret: "wh-secret", channelName: "wh" },
+        { channelId: "sms-1", type: "sms", label: "sms", createdAt },
+      ],
+    }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  const origWs = globalThis.WebSocket;
+  FailingWebSocket.instances = [];
+
+  globalThis.fetch = (async (input: unknown, init?: unknown) => {
+    const href = typeof input === "string" ? input : String(input);
+    const method = (init as { method?: string } | undefined)?.method ?? "GET";
+    if (href.endsWith("/auth/register")) {
+      return new Response(JSON.stringify({ userId: "recovered-user", apiKey: "new-key" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (method === "POST" && href.endsWith("/channels/telegram/register")) {
+      return new Response(JSON.stringify({ error: "telegram rejected" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (method === "POST" && href.endsWith("/channels")) {
+      // Slower than the failing telegram above, so it COMPLETES last even
+      // though it is second in the persisted order.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      return new Response(
+        JSON.stringify({ channel: { id: "wh-new", metadata: {} }, webhookUrl: "https://webhooks.example.com/webhook/wh-new?token=t" }),
+        { status: 201, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+  globalThis.WebSocket = FailingWebSocket as unknown as typeof WebSocket;
+
+  try {
+    const fake = makeFakePi();
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-ordered-rebind", fake.notifications));
+
+    const ownSockets = () =>
+      FailingWebSocket.instances.filter((ws) => ws.url.includes(`token=${encodeURIComponent("old-key")}`));
+    const first = ownSockets()[ownSockets().length - 1];
+    assert.ok(first, "this test's WS was constructed (token=old-key)");
+    first.failHandshake(1006);
+    await waitFor(() => ownSockets().some((ws) => ws !== first));
+    const second = ownSockets().find((ws) => ws !== first);
+    assert.ok(second, "the client reconnected before the handshake failed twice");
+    second.failHandshake(1006);
+
+    const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+    await waitFor(() => {
+      const raw = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+      return raw.includes("Channel re-binding status");
+    });
+    const logRaw = readFileSync(logPath, "utf-8");
+
+    const tgNote = logRaw.indexOf("telegram channel could not auto re-bind");
+    const whNote = logRaw.indexOf("webhook channel re-registered");
+    const smsNote = logRaw.indexOf("sms channel could not auto re-bind");
+    assert.ok(tgNote >= 0, `the failed telegram re-bind is still reported: ${logRaw}`);
+    assert.ok(whNote >= 0, `the webhook re-bind succeeded despite the telegram failure: ${logRaw}`);
+    assert.ok(smsNote >= 0, `the un-rebindable record is still noted: ${logRaw}`);
+    assert.ok(tgNote < whNote, "notes follow persisted record order (telegram before webhook)");
+    assert.ok(whNote < smsNote, "notes follow persisted record order (webhook before sms)");
+
+    // The persisted records keep their original order too (only the webhook's
+    // channelId changed on re-bind).
+    const persisted = JSON.parse(readFileSync(join(PI_DIR, "chaos-relay.json"), "utf-8")) as {
+      channels: Array<{ channelId: string }>;
+    };
+    assert.deepEqual(
+      persisted.channels.map((c) => c.channelId),
+      ["tg-old", "wh-new", "sms-1"],
+      "re-bound records are persisted in record order",
+    );
+
+    await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-ordered-rebind", fake.notifications));
   } finally {
     globalThis.fetch = origFetch;
     globalThis.WebSocket = origWs;

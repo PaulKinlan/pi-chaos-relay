@@ -368,19 +368,24 @@ channel before risky tools run:
 
 | Mode | Behaviour |
 |------|-----------|
-| `writes` *(default)* | Ask before `bash`, `edit`, and `write`; reads/searches run freely. `relay_reply` is gated when it ships a file attachment, **and a text-only `relay_reply` is gated once the session has read a local file (`read`/`grep`)** — this closes the read → text-reply exfiltration path without prompting on every read. The other relay plumbing is ungated. |
+| `writes` *(default)* | Ask before `bash`, `edit`, and `write`; reads/searches run freely. `relay_reply` is gated when it ships a file attachment, **and a text-only `relay_reply` is gated once the session has inspected local content (`read`/`grep`/`bash`)** — this closes the read → text-reply exfiltration path without prompting on every read. The other relay plumbing is ungated. |
 | `all` | Ask before **every** tool except the read-only relay plumbing (`relay_check_messages`, `relay_list_profiles`). |
 | `off` | Fully autonomous — run every tool. Best paired with a sandbox/container. |
 
-The `writes` read guard is **session-scoped**: once any local file content has
-been read in the session (from a channel turn or a terminal/local turn), every
-later channel-driven text-only `relay_reply` requires approval until the session
-ends. The taint is cleared only at session start/shutdown, not per turn — the
-LLM conversation context persists across turns, so a secret read in turn 1
-cannot be text-replied out in turn 2 without approval. It does **not** gate the
-reads themselves. For the strongest posture — where a channel-driven turn cannot
-read local files at all without approval — use `all` (which also gates every
-read/search and every reply).
+The `writes` read guard is **session-scoped**: once the session has inspected
+local content (from a channel turn or a terminal/local turn), every later
+channel-driven text-only `relay_reply` requires approval until the session ends.
+Inspection means any `read` or `grep` of a local file **and any `bash`
+execution** — a shell command can print arbitrary local content (`cat`, `grep`,
+`env`, …), so a successful bash run taints the session exactly like a read does.
+The taint is cleared only at session start/shutdown, not per turn — the LLM
+conversation context persists across turns, so a secret read in turn 1 cannot be
+text-replied out in turn 2 without approval. It does **not** gate the reads or
+the bash execution themselves (in `writes` mode `bash` is gated for being a
+write-class tool, and an approved run taints the session). For the strongest
+posture — where a channel-driven turn cannot inspect local content at all
+without approval — use `all` (which also gates every read/search and every
+reply).
 
 `writes` is the default so a channel-driven session is NOT ungated out of the
 box; choose `off` (or `/chaos-relay approvals off`) for the old fully-autonomous
@@ -389,9 +394,11 @@ posture. Set with `/chaos-relay approvals <off|writes|all>` or the
 When a tool is gated, the agent pauses and sends an approval request to the active
 channel; **reply `yes <code>` to allow or `no <code>` to deny** — the prompt shows a
 short code, and only the originating sender's reply counts (auto-denies after 5 minutes).
-The prompt describes the tool without echoing its payload (a `relay_reply` shows only
-its channel type, a short channel fingerprint, and a character/byte count; `write`/`edit`
-and other tools show field sizes or path fingerprints, never their contents).
+The prompt describes the tool without echoing its payload: a `relay_reply` shows only
+its channel type, a short channel fingerprint, and a character/byte count; a `bash`
+approval shows a **REDACTED command string** (secret-shaped values are masked) so the
+operator can judge benign vs destructive; `write`/`edit` show the **target path and
+size**; and other tools show field sizes or path fingerprints — never their contents.
 Terminal/local turns are never gated.
 
 ## Telegram setup — end to end
