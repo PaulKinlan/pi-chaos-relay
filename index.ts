@@ -27,7 +27,8 @@ import {
   mimeForFile,
   type ReplyAttachment,
 } from "./relay-client.ts";
-import { readFileSync, appendFileSync, mkdirSync, existsSync, writeFileSync, unlinkSync, statSync } from "node:fs";
+import { readFileSync, appendFileSync, chmodSync, mkdirSync, existsSync, writeFileSync, unlinkSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -94,19 +95,146 @@ const PACKAGE_VERSION = (() => {
 const LOG_PREFIX = "[pi-chaos-relay]";
 const RELAY_LOG_DIR = join(homedir(), ".pi", "agent", "logs");
 const RELAY_LOG_FILE = join(RELAY_LOG_DIR, "chaos-relay.log");
+const RELAY_LOG_DIR_MODE = 0o700;
+const RELAY_LOG_FILE_MODE = 0o600;
 
-/** Relay logs are routed to a file ONLY. They must NOT go to stderr, because pi
+/** One-line reason for a filesystem/permission problem, for the durable log. */
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Tighten `path` to `mode` when it currently carries bits outside `mode` (e.g.
+ * an existing, looser log file left behind by an older release). Returns an
+ * error description when the mode could not be inspected or set, or undefined
+ * on success — including the no-op case where the mode is already tight.
+ */
+function tightenMode(path: string, mode: number): string | undefined {
+  let current: number;
+  try {
+    current = statSync(path).mode & 0o777;
+  } catch (err) {
+    return errText(err);
+  }
+  if ((current & ~mode) !== 0) {
+    try {
+      chmodSync(path, mode);
+    } catch (err) {
+      return errText(err);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Short, non-identifying fingerprint for correlating a channel across durable
+ * log lines without recording its raw identifier (which a co-tenant on a
+ * shared host could read back out of a world-readable log).
+ */
+function shortId(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 8);
+}
+
+/**
+ * Relay logs are routed to a file ONLY. They must NOT go to stderr, because pi
  *  renders extension stderr into the TUI prompt/input area, which is noisy
  *  (e.g. the "WebSocket connected" banner on every (re)connect). Tail
- *  ~/.pi/agent/logs/chaos-relay.log to see them. */
-function log(message: string, ...rest: unknown[]): void {
+ *  ~/.pi/agent/logs/chaos-relay.log to see them.
+ *
+ * The log directory and file are kept owner-only (0700 / 0600) so a co-tenant
+ * on a shared host cannot read pairing codes or channel identifiers out of a
+ * world-readable log. The file is created with mode 0600, and both the
+ * directory and an existing file are tightened on every write. A chmod failure
+ * is surfaced as a WARN line in the log (best-effort) — it must not crash the
+ * extension, but it must not be silently swallowed either.
+ *
+ * Exported so tests can write to the hermetic durable log and assert on its
+ * permissions and redaction without driving the full extension.
+ */
+export function log(message: string, ...rest: unknown[]): void {
   const line = `${LOG_PREFIX} ${message}${rest.length ? " " + rest.map((r) => String(r)).join(" ") : ""}`;
+  const entry = `[${new Date().toISOString()}] ${line}\n`;
   try {
-    mkdirSync(RELAY_LOG_DIR, { recursive: true });
-    appendFileSync(RELAY_LOG_FILE, `[${new Date().toISOString()}] ${line}\n`);
+    mkdirSync(RELAY_LOG_DIR, { recursive: true, mode: RELAY_LOG_DIR_MODE });
   } catch {
-    /* never throw from logging */
+    // No directory means no log file; logging is best-effort and must never
+    // throw into the extension.
+    return;
   }
+
+  const warnings: string[] = [];
+  const dirError = tightenMode(RELAY_LOG_DIR, RELAY_LOG_DIR_MODE);
+  if (dirError) warnings.push(`log directory permissions are not owner-only: ${dirError}`);
+
+  try {
+    appendFileSync(RELAY_LOG_FILE, entry, { mode: RELAY_LOG_FILE_MODE });
+  } catch {
+    return; // unwritable log file — best-effort, never throw
+  }
+
+  const fileError = tightenMode(RELAY_LOG_FILE, RELAY_LOG_FILE_MODE);
+  if (fileError) warnings.push(`log file permissions are not owner-only: ${fileError}`);
+
+  for (const warning of warnings) {
+    try {
+      appendFileSync(
+        RELAY_LOG_FILE,
+        `[${new Date().toISOString()}] ${LOG_PREFIX} WARN: ${warning}\n`,
+        { mode: RELAY_LOG_FILE_MODE },
+      );
+    } catch {
+      /* logging is best-effort */
+    }
+  }
+}
+
+/**
+ * Non-identifying shape of a single channel re-bind outcome. The secret-bearing
+ * fields are carried only so the summary builder can be tested against a real
+ * registration result — they must NEVER be written to the durable log.
+ */
+export interface RebindChannelResult {
+  /** Channel type ("telegram" | "email" | "discord" | "webhook" | …). */
+  type: string;
+  /** false when the re-bind failed or the record lacked re-bind material. */
+  ok: boolean;
+  pairingCode?: string;
+  channelId?: string;
+  botUsername?: string;
+  inboundAddress?: string;
+  webhookUrl?: string;
+  userEmail?: string;
+  label?: string;
+}
+
+/**
+ * Build the durable-log summary for a recovered session's channel re-bind.
+ * Deliberately non-identifying: pairing codes, channel ids, bot usernames,
+ * email addresses, inbound addresses and webhook URLs are withheld so a
+ * co-tenant on a shared host cannot read them out of the log file. Exported for
+ * tests so the invariant is pinned against a real registration result.
+ */
+export function rebindLogSummary(results: ReadonlyArray<RebindChannelResult>): string {
+  const notes = results.map((r) => {
+    if (!r.ok) {
+      return `${r.type} channel could not auto re-bind — re-add it with /chaos-relay or the relay_register_* tool.`;
+    }
+    if (r.type === "telegram" || r.type === "discord") {
+      return `${r.type} channel re-registered — a fresh pairing code is required to re-link (code withheld from the durable log).`;
+    }
+    if (r.type === "email") {
+      return `email channel re-registered — a fresh verification link is required to reactivate (identifiers withheld from the durable log).`;
+    }
+    if (r.type === "webhook") {
+      return `webhook channel re-registered — URL unchanged (withheld from the durable log).`;
+    }
+    return `${r.type} channel re-registered (identifiers withheld from the durable log).`;
+  });
+  return (
+    "chaos-relay recovered a new session after the relay lost the old one. " +
+    "Channel re-binding status (some need a quick manual step):\n- " +
+    notes.join("\n- ")
+  );
 }
 
 // ── Profile lock: detect concurrent pi instances on the same relay profile ──
@@ -505,10 +633,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   /**
    * Re-register persisted channels against the current (new) session and update
    * their stored channelIds. Telegram/email re-registration is automatic, but
-   * the relay issues a fresh pairing code / verification step for security — so
-   * we surface that to the user (log + a message injected into the agent) to
-   * complete the one manual step. Channels without stored re-bind material are
-   * skipped with a note.
+   * the relay issues a fresh pairing code / verification step for security. The
+   * durable log only records a NON-IDENTIFYING summary (see rebindLogSummary);
+   * the operator completes the manual re-link by re-running the relay_register_*
+   * tool (which shows the fresh pairing code / verification link in the TUI).
    */
   async function rebindChannels(): Promise<void> {
     const c = client;
@@ -516,15 +644,19 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const records = loadPersisted().channels ?? [];
     if (records.length === 0) return;
     const updated: RegisteredChannelRecord[] = [];
-    const notes: string[] = [];
+    const results: RebindChannelResult[] = [];
     for (const rec of records) {
       try {
         if (rec.type === "telegram" && rec.botToken) {
           const res = await c.registerTelegram({ botToken: rec.botToken, agentId: cfg.agentId });
           updated.push({ ...rec, channelId: res.channelId, label: res.botUsername });
-          notes.push(
-            `Telegram @${res.botUsername}: re-registered. Send the pairing code "${res.pairingCode}" to the bot to re-link this chat.`,
-          );
+          results.push({
+            type: "telegram",
+            ok: true,
+            pairingCode: res.pairingCode,
+            channelId: res.channelId,
+            botUsername: res.botUsername,
+          });
         } else if (rec.type === "email" && rec.userEmail) {
           const res = await c.registerEmail({
             userEmail: rec.userEmail,
@@ -532,15 +664,23 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
             channelName: rec.channelName,
           });
           updated.push({ ...rec, channelId: res.channelId });
-          notes.push(
-            `Email ${rec.userEmail}: re-registered. Check your inbox and click the verification link to reactivate (then email ${res.inboundAddress}).`,
-          );
+          results.push({
+            type: "email",
+            ok: true,
+            channelId: res.channelId,
+            inboundAddress: res.inboundAddress,
+            userEmail: rec.userEmail,
+          });
         } else if (rec.type === "discord" && rec.botToken) {
           const res = await c.registerDiscord({ botToken: rec.botToken, agentId: cfg.agentId });
           updated.push({ ...rec, channelId: res.channelId, label: res.botUsername });
-          notes.push(
-            `Discord ${res.botUsername}: re-registered. Send the pairing code "${res.pairingCode}" to the bot to re-link this channel.`,
-          );
+          results.push({
+            type: "discord",
+            ok: true,
+            pairingCode: res.pairingCode,
+            channelId: res.channelId,
+            botUsername: res.botUsername,
+          });
         } else if (rec.type === "webhook") {
           // Recreate with the same id + secret so the public URL is unchanged.
           const res = await c.registerWebhook({
@@ -549,33 +689,29 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
             channelName: rec.channelName,
           });
           updated.push({ ...rec, channelId: res.channelId });
-          notes.push(
-            `Webhook ${rec.label ?? rec.channelId}: re-registered. URL unchanged — ${res.webhookUrl}`,
-          );
+          results.push({
+            type: "webhook",
+            ok: true,
+            channelId: res.channelId,
+            webhookUrl: res.webhookUrl,
+            label: rec.label,
+          });
         } else {
           updated.push(rec); // no re-bind material — keep the record, note it
-          notes.push(
-            `${rec.type} channel ${rec.label ?? rec.channelId}: could not auto re-bind (no stored ${rec.type === "telegram" ? "bot token" : "email"}). Re-add it with /chaos-relay or the relay_register_* tool.`,
-          );
+          results.push({ type: rec.type, ok: false });
         }
-      } catch (err) {
+      } catch {
         updated.push(rec);
-        notes.push(
-          `${rec.type} channel ${rec.label ?? rec.channelId}: re-bind failed — ${err instanceof Error ? err.message : String(err)}`,
-        );
+        results.push({ type: rec.type, ok: false });
       }
     }
     setChannelRecords(updated);
     cfg = resolveConfig();
-    if (notes.length > 0) {
-      const summary =
-        "chaos-relay recovered a new session after the relay lost the old one. " +
-        "Channel re-binding status (some need a quick manual step):\n- " +
-        notes.join("\n- ");
-      log(summary);
-      // Do not start an agent turn from session-start recovery. Starting one here
-      // races the CLI's initial prompt in print/subagent sessions. The durable log
-      // preserves the recovery details for explicit status/doctor inspection.
+    if (results.length > 0) {
+      // The summary is deliberately non-identifying (see rebindLogSummary):
+      // pairing codes and raw channel identifiers are withheld from the durable
+      // log, so a co-tenant on a shared host cannot read them back out.
+      log(rebindLogSummary(results));
     }
   }
 
@@ -1310,7 +1446,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
       const transport = ws?.connected ? "WebSocket" : "HTTP";
       log(
-        `relay_reply: sending to ${params.channelType}/${params.channelId} ` +
+        `relay_reply: sending to ${params.channelType}/${shortId(params.channelId)} ` +
           `replyTo=${params.replyTo ?? "none"} via ${transport} (${params.content.length} chars` +
           `${attachments?.length ? `, ${attachments.length} attachment(s)` : ""})`,
       );
@@ -1331,7 +1467,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           // target just fails again, and a fallback error would bury the
           // relay's reason. Surface it verbatim.
           if (res.ok === false) {
-            log(`relay_reply: WS ack REFUSED: ${res.error ?? "no reason given"}`);
+            // The relay's reason names the offending channel — keep the full text
+            // in the tool result (TUI), but withhold it from the durable log.
+            log(`relay_reply: WS ack refused (channel not accepted); see the tool result for the relay's reason`);
             return textResult(formatReplyRefusal(res), res);
           }
           log(
@@ -1368,7 +1506,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         // statuses (401/429/5xx) stay thrown so auth/transport problems
         // surface as errors.
         if (err instanceof RelayError && err.status === 400) {
-          log(`relay_reply: HTTP refused: ${err.message}`);
+          // The relay's reason names the offending channel — keep the full text
+          // in the tool result (TUI), but withhold it from the durable log.
+          log(`relay_reply: HTTP refused (channel not accepted); see the tool result for the relay's reason`);
           return textResult(
             `relay_reply: REFUSED by relay — ${err.message}. Nothing was sent.`,
             { ok: false, error: err.message },

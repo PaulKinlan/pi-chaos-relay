@@ -449,6 +449,11 @@ are removed after 24 hours. You can force an immediate pull with
   requests for those; signed is preferred and automatic when a keypair exists.
 - Bot tokens are sent only to the relay's register endpoint over HTTPS; the relay
   encrypts them at rest. They are not persisted by this extension.
+- The durable relay log (`~/.pi/agent/logs/chaos-relay.log`) is kept owner-only
+  (directory `0700`, file `0600`), and pairing codes, channel ids, bot usernames,
+  email addresses and webhook URLs are withheld from it. The interactive tool
+  output still shows the fresh pairing code / verification link the operator
+  needs to finish linking a channel.
 - Inbound attachments are capped at 3 files per message and 5MB each. The relay
   stores only bounded descriptors and private provider references—not bytes,
   credentials, or Resend signed URLs. Attachment retrieval requires request

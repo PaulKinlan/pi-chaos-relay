@@ -20,11 +20,13 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
   unlinkSync,
   utimesSync,
@@ -48,7 +50,7 @@ delete process.env.CHAOS_RELAY_API_KEY;
 process.env.CHAOS_RELAY_URL = OFFLINE_RELAY_URL;
 
 const config = await import("../config.ts");
-const { default: chaosRelayExtension, claimProfileLock, ApprovalQueue } =
+const { default: chaosRelayExtension, claimProfileLock, ApprovalQueue, log, rebindLogSummary } =
   await import("../index.ts");
 
 type ExtensionApi = Parameters<typeof chaosRelayExtension>[0];
@@ -1482,4 +1484,93 @@ test("an approval reference followed by an em dash still counts as an answer", a
   const b = q.add({ channelId: "c1", toolName: "edit" });
   assert.equal(q.settle({ channelId: "c1", content: `#${b.ref}\u2014no` }), true, "no space needed either");
   assert.equal(await b.promise, false, "'#N—no' denies");
+});
+
+// ── Durable log hardening: owner-only permissions and no pairing codes /
+//    channel identifiers in the durable log.
+
+test("durable log writes with owner-only directory and file modes", () => {
+  const logDir = join(PI_DIR, "agent", "logs");
+  const logPath = join(logDir, "chaos-relay.log");
+  rmSync(logDir, { recursive: true, force: true });
+
+  log("permission test");
+
+  assert.equal(statSync(logDir).mode & 0o777, 0o700, "log directory is owner-only (0700)");
+  assert.equal(statSync(logPath).mode & 0o777, 0o600, "log file is owner-only (0600)");
+});
+
+test("existing loose log directory and file are tightened on write", () => {
+  const logDir = join(PI_DIR, "agent", "logs");
+  const logPath = join(logDir, "chaos-relay.log");
+  rmSync(logDir, { recursive: true, force: true });
+  mkdirSync(logDir, { recursive: true });
+  writeFileSync(logPath, "old permissive entry\n");
+  chmodSync(logDir, 0o755);
+  chmodSync(logPath, 0o644);
+  assert.equal(statSync(logDir).mode & 0o777, 0o755, "precondition: dir is loose");
+  assert.equal(statSync(logPath).mode & 0o777, 0o644, "precondition: file is loose");
+
+  log("tighten test");
+
+  assert.equal(statSync(logDir).mode & 0o777, 0o700, "existing loose dir is tightened to 0700");
+  assert.equal(statSync(logPath).mode & 0o777, 0o600, "existing loose file is tightened to 0600");
+});
+
+test("durable log never records pairing codes or channel identifiers", () => {
+  const logDir = join(PI_DIR, "agent", "logs");
+  const logPath = join(logDir, "chaos-relay.log");
+  const pairingCode = "PAIR-WRITTEN-987654";
+  const channelId = "ch-written-secret";
+  const botUsername = "writtenbot";
+
+  // rebindLogSummary is exactly what rebindChannels() passes to log(); give it
+  // a real registration result carrying a pairing code + identifiers and assert
+  // none survive into the summary or the written file.
+  const summary = rebindLogSummary([
+    {
+      type: "telegram",
+      ok: true,
+      pairingCode,
+      channelId,
+      botUsername,
+    },
+    {
+      type: "email",
+      ok: true,
+      channelId: "ch-email-secret",
+      inboundAddress: "ch-email-secret@relay.example",
+      userEmail: "operator@example.com",
+    },
+    {
+      type: "webhook",
+      ok: true,
+      channelId: "ch-webhook-secret",
+      webhookUrl: "https://relay.example/webhook/ch-webhook-secret?token=topsecret",
+    },
+  ]);
+
+  const secrets = [
+    pairingCode,
+    channelId,
+    botUsername,
+    "ch-email-secret",
+    "ch-email-secret@relay.example",
+    "operator@example.com",
+    "ch-webhook-secret",
+    "topsecret",
+  ];
+  for (const secret of secrets) {
+    assert.ok(!summary.includes(secret), `summary must not leak "${secret}": ${summary}`);
+  }
+  // Still diagnostic: names the channel type and the manual re-link step.
+  assert.match(summary, /telegram channel re-registered/);
+  assert.match(summary, /pairing code/);
+  assert.match(summary, /verification link/);
+
+  log(summary);
+  const logRaw = readFileSync(logPath, "utf-8");
+  for (const secret of secrets) {
+    assert.ok(!logRaw.includes(secret), `written log must not leak "${secret}": ${logRaw}`);
+  }
 });
