@@ -25,12 +25,13 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  statSync,
   unlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 const OFFLINE_RELAY_URL = "http://127.0.0.1:9"; // refused instantly; keeps every connect local
 
@@ -1048,7 +1049,7 @@ test("cancel() drops a request that never reached the user", async (t) => {
   assert.equal(await live.promise, false, "the live request timed out on its own timer");
 });
 
-test("an interrupted session-map write leaves the previous map intact (atomic replace)", () => {
+test("loadSessionMap ignores an orphan temp file beside the session map (reader tolerance)", () => {
   resetState();
   config.setSessionProfile("sess-atomic", "work");
   assert.deepEqual(config.loadSessionMap(), { "sess-atomic": "work" });
@@ -1298,4 +1299,144 @@ test("two concurrent switches to the same profile: exactly one connects, the oth
 
   await Promise.all(switchers.map((s) => s.exited));
   t.diagnostic(`concurrent switch result: ${JSON.stringify(results)}`);
+});
+
+// ── pi-chaos-relay-hp2: the atomic-write test must DISCRIMINATE ──────────────
+//
+// The test above pins a reader property (an orphan temp file is ignored), which
+// passed against the pre-atomic implementation too: nothing read that file
+// either way, so it never proved the WRITE was atomic. This one does — a
+// temp-file + rename replaces the directory entry, so the inode CHANGES, while
+// an in-place writeFileSync keeps the same inode.
+
+test("setSessionProfile replaces the session map via rename, not an in-place write", () => {
+  resetState();
+  config.setSessionProfile("sess-ino", "work");
+  const firstRaw = readFileSync(SESSIONS_PATH, "utf-8");
+  const inoBefore = statSync(SESSIONS_PATH).ino;
+
+  config.setSessionProfile("sess-ino", "home");
+
+  assert.notEqual(
+    statSync(SESSIONS_PATH).ino,
+    inoBefore,
+    "the target was replaced by a rename; an in-place write would keep the same inode",
+  );
+  assert.notEqual(readFileSync(SESSIONS_PATH, "utf-8"), firstRaw, "the map actually changed");
+  assert.deepEqual(config.loadSessionMap(), { "sess-ino": "home" });
+  const leftovers = readdirSync(PI_DIR).filter((f) => f.startsWith(`${basename(SESSIONS_PATH)}.tmp.`));
+  assert.deepEqual(leftovers, [], "no temp residue after a completed write");
+});
+
+// ── pi-chaos-relay-odf: an approval reference may carry punctuation ──────────
+
+test("an approval reference followed by punctuation still counts as an answer", async () => {
+  const q = new ApprovalQueue(60_000);
+  // '#1: yes' and '#1 - yes' used to be read as DENIALS: the ref regex left
+  // ': yes' / ' - yes' for the yes/no test, which does not match.
+  const a = q.add({ channelId: "c1", toolName: "bash" });
+  assert.equal(q.settle({ channelId: "c1", content: `#${a.ref}: yes` }), true);
+  assert.equal(await a.promise, true, "'#N: yes' approves");
+
+  const b = q.add({ channelId: "c1", toolName: "edit" });
+  assert.equal(q.settle({ channelId: "c1", content: `#${b.ref} - yes` }), true);
+  assert.equal(await b.promise, true, "'#N - yes' approves");
+
+  const c = q.add({ channelId: "c1", toolName: "write" });
+  assert.equal(q.settle({ channelId: "c1", content: `#${c.ref}, no` }), true);
+  assert.equal(await c.promise, false, "'#N, no' denies");
+
+  const d = q.add({ channelId: "c1", toolName: "bash" });
+  assert.equal(q.settle({ channelId: "c1", content: `#${d.ref} yes` }), true);
+  assert.equal(await d.promise, true, "the documented '#N yes' still works");
+
+  const e = q.add({ channelId: "c1", toolName: "bash" });
+  assert.equal(q.settle({ channelId: "c1", content: `#${e.ref}    yes` }), true);
+  assert.equal(await e.promise, true, "extra whitespace still works");
+});
+
+// ── pi-chaos-relay-8ni: pid 0, and a future mtime, are not "held by a live peer"
+
+test("a lock file containing '0' is not a live holder and is reclaimable", () => {
+  resetState();
+  const lock = lockPath("pid-zero");
+  // process.kill(0, 0) signals the caller's own process group and succeeds, so
+  // '0' previously looked like a live holder that could never be reclaimed.
+  writeFileSync(lock, "0");
+  const claimed = claimProfileLock("pid-zero");
+  assert.equal(claimed.claimed, true, "pid 0 must not block the claim");
+  assert.equal(readFileSync(lock, "utf-8"), String(process.pid));
+});
+
+test("an empty lock whose mtime is in the FUTURE is reclaimed, not held in grace", () => {
+  resetState();
+  const lock = lockPath("future-mtime");
+  writeFileSync(lock, "");
+  // A clock step / NTP correction can leave mtime ahead of now. The grace window
+  // only applies to a non-negative age, otherwise such a file would stay "just
+  // created" until the wall clock caught up and block the profile indefinitely.
+  const future = Date.now() / 1000 + 3600;
+  utimesSync(lock, future, future);
+  const claimed = claimProfileLock("future-mtime");
+  assert.equal(claimed.claimed, true, "a future-dated empty lock is stale, not in grace");
+  assert.equal(readFileSync(lock, "utf-8"), String(process.pid));
+});
+
+test("a fresh empty lock (age inside the grace window) is still treated as held", () => {
+  resetState();
+  const lock = lockPath("fresh-empty");
+  writeFileSync(lock, "");
+  const claimed = claimProfileLock("fresh-empty");
+  assert.equal(claimed.claimed, false, "the grace window still protects a mid-create lock");
+  assert.equal(readFileSync(lock, "utf-8"), "");
+});
+
+// ── pi-chaos-relay-9oi: a FAILED switch still releases the profile left behind
+
+test("a switch whose connect fails releases the previous profile's lock", async (t) => {
+  resetState();
+  // Session starts on "alpha" (pre-provisioned, so it connects offline and
+  // claims alpha's lock), then switches to a profile that EXISTS but is
+  // unconfigured, so connectAsProfile() attempts a live registration and fails
+  // against the offline relay. The target exists on purpose: a brand-new name
+  // would trip the profile cap in this shared test HOME (which accumulates
+  // config files), testing the wrong refusal.
+  const alpha = writeProfileConfig("alpha", "ak_alpha_offline");
+  writeProfileConfig("default", "ak_default_offline");
+  const targetConfig = config.profilePathForName("brandnew");
+  writeFileSync(targetConfig, "{}\n");
+  const sid = "sess-failed-switch";
+  writeFileSync(SESSIONS_PATH, JSON.stringify({ [sid]: "alpha" }) + "\n");
+  const alphaLock = lockPath("alpha");
+  const targetLock = lockPath("brandnew");
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(
+    fake.handlers,
+    "session_start",
+    { reason: "resume" },
+    makeCtx(sid, fake.notifications),
+  );
+  assert.equal(readFileSync(alphaLock, "utf-8"), String(process.pid), "alpha claimed at session start");
+  assert.equal(config.getConfigPath(), alpha);
+
+  await fake.commands.get("chaos-relay")!.handler(
+    "profile brandnew",
+    makeCtx(sid, fake.notifications),
+  );
+
+  const out = fake.notifications.map((n) => n.message).join("\n");
+  assert.match(out, /couldn't reach the relay to connect/, `switch outcome: ${out}`);
+  assert.equal(
+    existsSync(alphaLock),
+    false,
+    "the profile the session LEFT is released even though the new connect failed",
+  );
+  assert.equal(
+    readFileSync(targetLock, "utf-8"),
+    String(process.pid),
+    "the target stays claimed for the retrying poller",
+  );
+  t.diagnostic(`notifications: ${JSON.stringify(fake.notifications.map((n) => n.message))}`);
 });
