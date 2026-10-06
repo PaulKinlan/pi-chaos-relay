@@ -1046,3 +1046,98 @@ test("cancel() drops a request that never reached the user", async (t) => {
   assert.equal(q.size, 0);
   assert.equal(await live.promise, false, "the live request timed out on its own timer");
 });
+
+test("an interrupted session-map write leaves the previous map intact (atomic replace)", () => {
+  resetState();
+  config.setSessionProfile("sess-atomic", "work");
+  assert.deepEqual(config.loadSessionMap(), { "sess-atomic": "work" });
+  const previousRaw = readFileSync(SESSIONS_PATH, "utf-8");
+
+  // Simulate a crash between the temp write and the rename: an orphan temp file
+  // beside the target holds a partial NEXT map, but the target was never renamed,
+  // so the previous complete map must still be what the reader sees — and the
+  // orphan must be ignored (it is not the target path).
+  const orphan = `${SESSIONS_PATH}.tmp.simulated`;
+  writeFileSync(orphan, '{"sess-atomic":"home"');
+  try {
+    assert.deepEqual(config.loadSessionMap(), { "sess-atomic": "work" });
+    assert.equal(readFileSync(SESSIONS_PATH, "utf-8"), previousRaw, "target map byte-identical");
+  } finally {
+    unlinkSync(orphan);
+  }
+});
+
+test("loadSessionMap tolerates a corrupt session map without crashing", () => {
+  resetState();
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    writeFileSync(SESSIONS_PATH, "{ not json");
+    assert.deepEqual(config.loadSessionMap(), {});
+    writeFileSync(SESSIONS_PATH, "[]");
+    assert.deepEqual(config.loadSessionMap(), {});
+    // A non-string value is a corrupt entry: it is dropped rather than leaking
+    // a non-string profile name into profile resolution (which would crash).
+    writeFileSync(
+      SESSIONS_PATH,
+      JSON.stringify({ "sess-ok": "work", "sess-bad": 123 }) + "\n",
+    );
+    assert.deepEqual(config.loadSessionMap(), { "sess-ok": "work" });
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test("relay_switch_profile refuses a new profile beyond the cap without writing a file", async () => {
+  resetState();
+  // Remove any profile configs left by earlier tests so the count is deterministic.
+  for (const f of relayStateFiles()) {
+    if (/^chaos-relay(?:\.(.+))?\.json$/.test(f)) {
+      try {
+        unlinkSync(join(PI_DIR, f));
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+  const cap = config.MAX_PROFILE_CONFIGS;
+  for (let i = 0; i < cap; i++) {
+    writeProfileConfig(i === 0 ? "default" : `fill-${i}`, `ak_fill_${i}`);
+  }
+  assert.equal(config.countProfileConfigs(), cap);
+
+  const overflowPath = config.profilePathForName("overflow");
+  assert.equal(existsSync(overflowPath), false);
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  const tool = fake.tools.find((t) => t.name === "relay_switch_profile");
+  assert.ok(tool, "extension registers relay_switch_profile");
+  const execute = tool.execute as (
+    id: string,
+    params: { name: string },
+    signal: unknown,
+    onUpdate: unknown,
+    ctx: unknown,
+  ) => Promise<unknown>;
+  const result = await execute("t1", { name: "overflow" }, undefined, undefined, {
+    ui: {
+      notify: (message: string, level?: string) => fake.notifications.push({ message, level }),
+    },
+  });
+
+  const text =
+    (result as { content?: Array<{ text?: string }> })?.content?.[0]?.text ?? String(result);
+  assert.match(
+    text,
+    /profile cap of 100 is already reached \(100 profile files on disk\)/,
+  );
+  assert.equal(existsSync(overflowPath), false, "no profile config file was written beyond the cap");
+  assert.equal(config.countProfileConfigs(), cap, "profile count unchanged after the refusal");
+  assert.ok(
+    fake.notifications.some(
+      (n) => n.level === "warning" && n.message.includes("profile cap of 100"),
+    ),
+    `refusal was surfaced as a warning notification (${JSON.stringify(fake.notifications)})`,
+  );
+});

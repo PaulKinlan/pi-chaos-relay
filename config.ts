@@ -72,13 +72,54 @@ let activeConfigPath = configPathFor(envOf());
 const SESSION_MAP_PATH = join(CONFIG_DIR, "chaos-relay-sessions.json");
 const SESSION_MAP_MAX = 200; // LRU cap so the map can't grow unbounded
 
-export function loadSessionMap(): Record<string, string> {
-  try {
-    const obj = JSON.parse(readFileSync(SESSION_MAP_PATH, "utf-8"));
-    return obj && typeof obj === "object" ? obj as Record<string, string> : {};
-  } catch {
-    return {};
+/** (path, reason) pairs already warned about for the session→profile map. */
+const warnedCorruptSessionMaps = new Set<string>();
+
+function warnCorruptSessionMap(reason: string): Record<string, string> {
+  if (!warnedCorruptSessionMaps.has(reason)) {
+    warnedCorruptSessionMaps.add(reason);
+    console.warn(`pi-chaos-relay: ${reason} — ignoring the session→profile map.`);
   }
+  return {};
+}
+
+/**
+ * Read the session→profile map, tolerating anything that is not valid persisted
+ * JSON — the same tolerant-read policy as {@link readPersisted}. A missing map is
+ * the normal "no bindings yet" case and stays silent; a truncated/corrupt map
+ * (an interrupted or concurrent write) degrades to an empty map with ONE warning
+ * instead of throwing on the session-start path.
+ */
+export function loadSessionMap(): Record<string, string> {
+  let raw: string;
+  try {
+    raw = readFileSync(SESSION_MAP_PATH, "utf-8");
+  } catch (err) {
+    // Not existing is the normal "nothing recorded yet" case — stay quiet.
+    if ((err as { code?: string }).code === "ENOENT") return {};
+    return warnCorruptSessionMap(`Failed to read ${SESSION_MAP_PATH}: ${messageOf(err)}`);
+  }
+  if (raw.trim() === "") return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return warnCorruptSessionMap(`Failed to parse ${SESSION_MAP_PATH}: ${messageOf(err)}`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    const got = parsed === null ? "null" : Array.isArray(parsed) ? "an array" : typeof parsed;
+    return warnCorruptSessionMap(
+      `Failed to parse ${SESSION_MAP_PATH}: expected a JSON object, got ${got}`,
+    );
+  }
+  // Drop non-string values: a corrupt entry must not leak a non-string profile
+  // name into getSessionProfile → chooseProfile → configPathFor, where it would
+  // hit .trim() and crash a session start.
+  const map: Record<string, string> = {};
+  for (const [sessionId, profile] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof profile === "string") map[sessionId] = profile;
+  }
+  return map;
 }
 
 /** The profile bound to a pi session, or undefined if none recorded. */
@@ -163,13 +204,14 @@ export function resolveProfileLockCollision(opts: {
   return { action: "refuse", profile: opts.profile, pid, message };
 }
 
-/** Persist `sessionId → profile` (best-effort). Bounded by an LRU cap. */
+/** Persist `sessionId → profile` atomically (best-effort). Bounded by an LRU cap. */
 export function setSessionProfile(sessionId: string | undefined, profile: string): void {
   if (!sessionId) return;
   try {
-    if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
     const next = applySessionProfile(loadSessionMap(), sessionId, profile);
-    writeFileSync(SESSION_MAP_PATH, JSON.stringify(next, null, 2) + "\n");
+    // Temp-file + rename so an interrupted/concurrent write can never leave a
+    // truncated map at the target; the previous complete map survives instead.
+    atomicWriteSync(SESSION_MAP_PATH, JSON.stringify(next, null, 2) + "\n");
   } catch {
     /* best effort */
   }
@@ -204,6 +246,9 @@ export function activeProfileName(): string {
   return profileNameForPath(activeConfigPath);
 }
 
+/** Profile config files under ~/.pi: chaos-relay.json or chaos-relay.<name>.json. */
+const PROFILE_FILE_RE = /^chaos-relay(?:\.(.+))?\.json$/;
+
 /**
  * List known profiles — every chaos-relay[.<name>].json in ~/.pi, plus the
  * active one (which may live elsewhere via CHAOS_RELAY_CONFIG).
@@ -213,13 +258,63 @@ export function listProfiles(): { name: string; active: boolean }[] {
   const names = new Set<string>([active]);
   try {
     for (const f of readdirSync(CONFIG_DIR)) {
-      const m = f.match(/^chaos-relay(?:\.(.+))?\.json$/);
+      const m = f.match(PROFILE_FILE_RE);
       if (m) names.add(m[1] ?? "default");
     }
   } catch {
     /* ~/.pi may not exist yet */
   }
   return [...names].sort().map((name) => ({ name, active: name === active }));
+}
+
+/**
+ * Hard cap on on-disk profile config files under ~/.pi. Each file is a separate
+ * relay identity (its own keypair), so an LLM-callable switch must not be able
+ * to mint them without bound.
+ */
+export const MAX_PROFILE_CONFIGS = 100;
+
+/** Number of profile config files on disk (chaos-relay[.<name>].json). */
+export function countProfileConfigs(dir: string = CONFIG_DIR): number {
+  try {
+    return readdirSync(dir).filter((f) => PROFILE_FILE_RE.test(f)).length;
+  } catch {
+    return 0;
+  }
+}
+
+export type ProfileCreateOutcome =
+  | { action: "allow"; profile: string }
+  | { action: "refuse"; profile: string; limit: number; message: string };
+
+/**
+ * Pure decision for creating a NEW profile file. Refuses only when the target
+ * does not already exist AND the on-disk profile count has reached the cap — an
+ * existing-but-unconfigured profile is a switch, not a creation, and stays
+ * allowed. Exported so the cap is unit-testable without the pi runtime.
+ */
+export function resolveProfileCreate(opts: {
+  profile: string;
+  exists: boolean;
+  existingCount: number;
+  limit?: number;
+}): ProfileCreateOutcome {
+  const limit = opts.limit ?? MAX_PROFILE_CONFIGS;
+  if (opts.exists) return { action: "allow", profile: opts.profile };
+  if (opts.existingCount >= limit) {
+    return {
+      action: "refuse",
+      profile: opts.profile,
+      limit,
+      message:
+        `Relay profile "${opts.profile}" would create a new identity, but the ` +
+        `profile cap of ${limit} is already reached (${opts.existingCount} profile ` +
+        `file${opts.existingCount === 1 ? "" : "s"} on disk). Reuse an existing ` +
+        `profile (/chaos-relay profile <name>) or remove unused profile files ` +
+        `from ~/.pi (chaos-relay*.json) before creating another.`,
+    };
+  }
+  return { action: "allow", profile: opts.profile };
 }
 
 export type ApprovalMode = "off" | "writes" | "all";

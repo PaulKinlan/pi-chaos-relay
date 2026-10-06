@@ -21,6 +21,9 @@ import {
   resetPersisted,
   resolveConfig,
   resolveProfileLockCollision,
+  resolveProfileCreate,
+  countProfileConfigs,
+  MAX_PROFILE_CONFIGS,
   savePersisted,
   loadMessageState,
   saveMessageState,
@@ -182,6 +185,57 @@ test("resolveProfileLockCollision: unknown holder still refuses without inventin
   assert.equal(outcome.pid, null);
   assert.match(outcome.message, /"work"/);
   assert.doesNotMatch(outcome.message, /PID (null|undefined|NaN)/);
+});
+
+test("resolveProfileCreate: an existing profile is a switch, never a cap refusal", () => {
+  // Even far beyond the cap, switching to a profile that already has a file is
+  // allowed — the cap bounds CREATION, not reuse of existing identities.
+  const outcome = resolveProfileCreate({
+    profile: "work",
+    exists: true,
+    existingCount: MAX_PROFILE_CONFIGS + 500,
+  });
+  assert.deepEqual(outcome, { action: "allow", profile: "work" });
+});
+
+test("resolveProfileCreate: below the cap, a new profile is allowed", () => {
+  const outcome = resolveProfileCreate({
+    profile: "staging",
+    exists: false,
+    existingCount: MAX_PROFILE_CONFIGS - 1,
+  });
+  assert.deepEqual(outcome, { action: "allow", profile: "staging" });
+});
+
+test("resolveProfileCreate: at the cap, a new profile is refused with a clear message", () => {
+  const outcome = resolveProfileCreate({
+    profile: "overflow",
+    exists: false,
+    existingCount: MAX_PROFILE_CONFIGS,
+  });
+  assert.ok(outcome.action === "refuse", "must refuse at the cap");
+  assert.equal(outcome.profile, "overflow");
+  assert.equal(outcome.limit, MAX_PROFILE_CONFIGS);
+  assert.match(outcome.message, /"overflow"/);
+  assert.match(outcome.message, /profile cap of 100/);
+  assert.match(outcome.message, /100 profile files on disk/);
+  assert.match(outcome.message, /\/chaos-relay profile/);
+  assert.match(outcome.message, /chaos-relay\*\.json/);
+});
+
+test("countProfileConfigs counts only chaos-relay*.json profile files", () => {
+  const dir = join(tmpdir(), `chaos-relay-count-${process.pid}-${Date.now()}`);
+  mkdirSync(dir, { recursive: true });
+  try {
+    writeFileSync(join(dir, "chaos-relay.json"), "{}");
+    writeFileSync(join(dir, "chaos-relay.work.json"), "{}");
+    // The message-tracking side-car sits next to a profile but is NOT a profile.
+    writeFileSync(join(dir, "chaos-relay.json.state"), "{}");
+    writeFileSync(join(dir, "unrelated.txt"), "x");
+    assert.equal(countProfileConfigs(dir), 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 /** Snapshot and restore the env vars these tests touch. */

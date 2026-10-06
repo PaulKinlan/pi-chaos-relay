@@ -138,6 +138,10 @@ and persists across restarts (resuming a session reconnects as the same identity
   connections **at once**, the user launches separate pi instances with
   `CHAOS_RELAY_PROFILE=<name>`. Each instance needs its **own channel** (e.g. a
   different Telegram bot) to be addressable.
+- Creating a profile is capped at **100** profile files. `relay_switch_profile`
+  (and `/chaos-relay profile <name>`) refuses to create a new one beyond that,
+  with a clear message and no file written — reuse an existing profile or remove
+  unused `~/.pi/chaos-relay*.json` files first.
 
 ## Tool approvals
 
