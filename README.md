@@ -446,8 +446,15 @@ replay (a 5-minute lookback it sends every time the WebSocket connects) never
 re-processes a message already handled before a restart. Fresh messages are
 injected into the agent as a user message that includes each message's `id`,
 `channelType`, `channelId`, sender, and content — everything the agent needs to
-call `relay_reply`. Inbound Telegram/email attachment descriptors are downloaded
-through an ECDSA-signed, user/message-scoped relay endpoint. Files are written to
+call `relay_reply`. When a message was sent as a **reply** (Telegram
+reply-threading, e.g. tapping reply on a question and answering "Drop"), the
+replied-to message travels with it as an
+`[In reply to message id="…" from "…": "…quoted text…"]` line **before** the
+content, so a terse answer can be resolved to the question it answered; channels
+that give only the id (or only the quoted text) still get
+`[In reply to message id="…"]`. Inbound Telegram/email attachment descriptors
+are downloaded through an ECDSA-signed, user/message-scoped relay endpoint.
+Files are written to
 private `0700` directories with mode `0600`; supported PNG/JPEG/GIF/WebP images
 are also injected directly into the Pi image context after magic-byte checks.
 Per-file failures are shown without dropping the text message. Stale local files
