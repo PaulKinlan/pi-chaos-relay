@@ -305,6 +305,29 @@ test("a failing catch-up is logged and leaves the socket usable", async () => {
   );
 });
 
+test("a failing catch-up log is redacted to the origin, not the URL secret", async () => {
+  const secret = "catchup-query-secret";
+  const h = harness({
+    onCatchUp: async () => {
+      throw new Error(
+        `fetch failed: https://relay.example.com/messages?token=${secret}#part2`,
+      );
+    },
+  });
+  h.ws.start();
+  h.last().open();
+  await settle();
+
+  const text = h.logs.join("\n");
+  assert.ok(text.includes("catch-up poll failed"), `logs the failure: ${text}`);
+  assert.ok(!text.includes(secret), `must not leak the query token: ${text}`);
+  assert.ok(!text.includes("token="), `must not leak the query string: ${text}`);
+  assert.ok(!text.includes("/messages"), `must not leak the path: ${text}`);
+  assert.ok(!text.includes("part2"), `must not leak the fragment: ${text}`);
+  assert.ok(text.includes("https://relay.example.com"), `keeps the origin: ${text}`);
+  h.ws.stop();
+});
+
 test("no catch-up callback is not an error", async () => {
   const h = harness();
   h.ws.start();
@@ -892,6 +915,33 @@ test("a failing auth recovery is logged and reconnection continues", async () =>
     `expected an auth-recovery failure log, saw ${JSON.stringify(h.logs)}`,
   );
   assert.ok(h.sockets.length >= 3, "kept reconnecting after the failed recovery");
+  h.ws.stop();
+});
+
+test("a failing auth recovery log is redacted to the origin, not the URL secret", async () => {
+  const secret = "authrecovery-query-secret";
+  const h = harness({
+    maxBackoffMs: 0,
+    onAuthFailure: async () => {
+      throw new Error(
+        `re-register failed: https://relay.example.com/auth/register?token=${secret}#part2`,
+      );
+    },
+  });
+  h.ws.start();
+
+  h.last().drop(1006);
+  await flush();
+  h.last().drop(1006);
+  await flush();
+
+  const text = h.logs.join("\n");
+  assert.ok(text.includes("auth recovery failed"), `logs the failure: ${text}`);
+  assert.ok(!text.includes(secret), `must not leak the query token: ${text}`);
+  assert.ok(!text.includes("token="), `must not leak the query string: ${text}`);
+  assert.ok(!text.includes("/auth/register"), `must not leak the path: ${text}`);
+  assert.ok(!text.includes("part2"), `must not leak the fragment: ${text}`);
+  assert.ok(text.includes("https://relay.example.com"), `keeps the origin: ${text}`);
   h.ws.stop();
 });
 

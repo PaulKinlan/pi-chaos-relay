@@ -31,6 +31,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateKeyPair } from "../crypto.ts";
+import { RelayError } from "../relay-client.ts";
 
 const OFFLINE_RELAY_URL = "http://127.0.0.1:9"; // refused instantly; keeps every connect local
 
@@ -47,7 +48,7 @@ delete process.env.CHAOS_RELAY_API_KEY;
 process.env.CHAOS_RELAY_URL = OFFLINE_RELAY_URL;
 
 const config = await import("../config.ts");
-const { default: chaosRelayExtension } = await import("../index.ts");
+const { default: chaosRelayExtension, toFriendly } = await import("../index.ts");
 
 type ExtensionApi = Parameters<typeof chaosRelayExtension>[0];
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -785,7 +786,8 @@ test("doctor never echoes a secret-shaped CHAOS_RELAY_URL", async () => {
 test("doctor strips credentials from a valid CHAOS_RELAY_URL (origin only)", async () => {
   resetState();
   const password = "supersecretpass";
-  const credUrl = `https://user:${password}@example.com`;
+  const querySecret = "doctor-origin-query-secret";
+  const credUrl = `https://user:${password}@example.com/health?token=${querySecret}#part2`;
   const prevUrl = process.env.CHAOS_RELAY_URL;
   process.env.CHAOS_RELAY_URL = credUrl;
   const origFetch = globalThis.fetch;
@@ -801,6 +803,10 @@ test("doctor strips credentials from a valid CHAOS_RELAY_URL (origin only)", asy
     const output = fake.notifications.map((n) => n.message).join("\n");
     assert.ok(!output.includes(password), `doctor output must not leak the password: ${output}`);
     assert.ok(!output.includes("user@example.com"), `doctor output must not leak userinfo: ${output}`);
+    assert.ok(!output.includes(querySecret), `doctor output must not leak the query token: ${output}`);
+    assert.ok(!output.includes("token="), `doctor output must not leak the query string: ${output}`);
+    assert.ok(!output.includes("/health"), `doctor output must not leak the path: ${output}`);
+    assert.ok(!output.includes("part2"), `doctor output must not leak the fragment: ${output}`);
     // The origin is still shown so the operator can see which host is in effect.
     assert.ok(output.includes("https://example.com"), `doctor shows the redacted origin (${output})`);
   } finally {
@@ -813,12 +819,13 @@ test("doctor strips credentials from a valid CHAOS_RELAY_URL (origin only)", asy
 test("status strips credentials from the relayUrl (origin only)", async () => {
   resetState();
   const password = "supersecretpass";
+  const querySecret = "status-origin-query-secret";
   // An apiKey makes the profile "configured", so status runs the live health
   // probe. The probe is stubbed to time out, exercising the health() error path
   // (which would otherwise leak `this.base` raw on the pre-fix build).
   writeFileSync(
     join(PI_DIR, "chaos-relay.json"),
-    JSON.stringify({ relayUrl: `https://user:${password}@example.com`, apiKey: "ak" }) + "\n",
+    JSON.stringify({ relayUrl: `https://user:${password}@example.com/health?token=${querySecret}#part2`, apiKey: "ak" }) + "\n",
   );
   const prevUrl = process.env.CHAOS_RELAY_URL;
   delete process.env.CHAOS_RELAY_URL;
@@ -836,6 +843,10 @@ test("status strips credentials from the relayUrl (origin only)", async () => {
     const status = fake.notifications.map((n) => n.message).join("\n");
     assert.ok(!status.includes(password), `status must not leak the password: ${status}`);
     assert.ok(!status.includes("user@example.com"), `status must not leak userinfo: ${status}`);
+    assert.ok(!status.includes(querySecret), `status must not leak the query token: ${status}`);
+    assert.ok(!status.includes("token="), `status must not leak the query string: ${status}`);
+    assert.ok(!status.includes("/health"), `status must not leak the path: ${status}`);
+    assert.ok(!status.includes("part2"), `status must not leak the fragment: ${status}`);
     assert.ok(status.includes("https://example.com"), `status shows the redacted origin (${status})`);
   } finally {
     if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
@@ -879,9 +890,10 @@ test("status redacts query/fragment URL secrets from the health error", async ()
 test("reset strips credentials from the cleared relayUrl (origin only)", async () => {
   resetState();
   const password = "supersecretpass";
+  const querySecret = "reset-origin-query-secret";
   writeFileSync(
     join(PI_DIR, "chaos-relay.json"),
-    JSON.stringify({ relayUrl: `https://user:${password}@example.com`, apiKey: "ak" }) + "\n",
+    JSON.stringify({ relayUrl: `https://user:${password}@example.com/health?token=${querySecret}#part2`, apiKey: "ak" }) + "\n",
   );
   const prevUrl = process.env.CHAOS_RELAY_URL;
   delete process.env.CHAOS_RELAY_URL;
@@ -898,6 +910,10 @@ test("reset strips credentials from the cleared relayUrl (origin only)", async (
   const output = fake.notifications.map((n) => n.message).join("\n");
   assert.ok(!output.includes(password), `reset must not leak the password: ${output}`);
   assert.ok(!output.includes("user@example.com"), `reset must not leak userinfo: ${output}`);
+  assert.ok(!output.includes(querySecret), `reset must not leak the query token: ${output}`);
+  assert.ok(!output.includes("token="), `reset must not leak the query string: ${output}`);
+  assert.ok(!output.includes("/health"), `reset must not leak the path: ${output}`);
+  assert.ok(!output.includes("part2"), `reset must not leak the fragment: ${output}`);
 });
 
 test("the invalid-env warning and auto-provision log strip credentials from the persisted URL", async (t) => {
@@ -1104,6 +1120,31 @@ test("the top-level command catch redacts URL secrets from bubble-up errors", as
     else process.env.CHAOS_RELAY_URL = prevUrl;
     globalThis.fetch = origFetch;
   }
+});
+
+test("toFriendly redacts URL secrets from RelayError and generic Error messages", () => {
+  const secret = "friendly-query-secret";
+  const relayErr = new RelayError(
+    `fetch failed: https://user:pw@example.com/health?token=${secret}#part2`,
+    0,
+  );
+  const friendlyRelay = toFriendly(relayErr);
+  assert.ok(friendlyRelay instanceof Error, "returns an Error for a RelayError");
+  assert.ok(!friendlyRelay.message.includes(secret), `must not leak the query token: ${friendlyRelay.message}`);
+  assert.ok(!friendlyRelay.message.includes("token="), `must not leak the query string: ${friendlyRelay.message}`);
+  assert.ok(!friendlyRelay.message.includes("/health"), `must not leak the path: ${friendlyRelay.message}`);
+  assert.ok(!friendlyRelay.message.includes("part2"), `must not leak the fragment: ${friendlyRelay.message}`);
+  assert.ok(friendlyRelay.message.includes("https://example.com"), `keeps the origin: ${friendlyRelay.message}`);
+
+  const genericErr = new Error(`fetch failed: https://example.com/health?token=${secret}#part2`);
+  const friendlyGeneric = toFriendly(genericErr);
+  assert.ok(friendlyGeneric instanceof Error, "returns an Error for a generic Error");
+  assert.ok(friendlyGeneric !== genericErr, "returns a NEW Error, not the original");
+  assert.ok(!friendlyGeneric.message.includes(secret), `must not leak the query token: ${friendlyGeneric.message}`);
+  assert.ok(!friendlyGeneric.message.includes("token="), `must not leak the query string: ${friendlyGeneric.message}`);
+  assert.ok(!friendlyGeneric.message.includes("/health"), `must not leak the path: ${friendlyGeneric.message}`);
+  assert.ok(!friendlyGeneric.message.includes("part2"), `must not leak the fragment: ${friendlyGeneric.message}`);
+  assert.ok(friendlyGeneric.message.includes("https://example.com"), `keeps the origin: ${friendlyGeneric.message}`);
 });
 
 test("auth recovery re-bind logs the webhook origin, not the secret URL", async () => {

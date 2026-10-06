@@ -227,7 +227,10 @@ export class RelayWebSocket {
         this.opts.onMessage(missed);
       }
     } catch (err) {
-      this.log(`catch-up poll failed: ${(err as Error).message}`);
+      const message = redactUrlSecretsFromMessage(
+        err instanceof Error ? err.message : String(err),
+      );
+      this.log(`catch-up poll failed: ${message}`);
     }
   }
 
@@ -359,7 +362,13 @@ export class RelayWebSocket {
             this.log("auth recovered — reconnecting with refreshed apiKey");
           }
         })
-        .catch((err) => this.log(`auth recovery failed: ${(err as Error).message}`))
+        .catch((err) =>
+          this.log(
+            `auth recovery failed: ${redactUrlSecretsFromMessage(
+              err instanceof Error ? err.message : String(err),
+            )}`,
+          ),
+        )
         .finally(() => this.armReconnectTimer());
       return;
     }

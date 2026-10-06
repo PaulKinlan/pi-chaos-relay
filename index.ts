@@ -584,7 +584,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     deliveryQueue = deliveryQueue
       .then(() => deliverToAgent(messages))
       .catch((err) => {
-        log(`attachment delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+        log(`attachment delivery failed: ${redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err))}`);
       });
     return deliveryQueue;
   }
@@ -2095,13 +2095,17 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   logGettingStarted();
 }
 
-/** Turn relay errors into agent-friendly Error messages. */
-function toFriendly(err: unknown): Error {
+/** Turn relay errors into agent-friendly Error messages, with any embedded
+ *  URL secrets redacted so they never reach the LLM tool response or the
+ *  conversation transcript. */
+export function toFriendly(err: unknown): Error {
   if (err instanceof RelayError) {
-    return new Error(err.message);
+    return new Error(redactUrlSecretsFromMessage(err.message));
   }
-  if (err instanceof Error) return err;
-  return new Error(String(err));
+  if (err instanceof Error) {
+    return new Error(redactUrlSecretsFromMessage(err.message));
+  }
+  return new Error(redactUrlSecretsFromMessage(String(err)));
 }
 
 // Re-export types for consumers/tests.

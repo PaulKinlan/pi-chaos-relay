@@ -51,3 +51,49 @@ test("safeUrlOrigin renders origin only and marks non-http values invalid", () =
   assert.equal(safeUrlOrigin("not a url"), "<invalid>");
   assert.equal(safeUrlOrigin(""), "<unset>");
 });
+
+test("redactUrlSecretsFromMessage strips a URL ending a sentence with a trailing period", () => {
+  const secret = "trailing-period-secret";
+  const out = redactUrlSecretsFromMessage(
+    `see https://example.com/health?token=${secret}.`,
+  );
+  assert.ok(!out.includes(secret), `must not leak the query token: ${out}`);
+  assert.ok(!out.includes("token="), `must not leak the query string: ${out}`);
+  assert.ok(!out.includes("/health"), `must not leak the path: ${out}`);
+  assert.ok(out.includes("https://example.com."), `keeps the origin and the sentence period: ${out}`);
+});
+
+test("redactUrlSecretsFromMessage strips a ws:// URL query secret too", () => {
+  const secret = "ws-plain-secret";
+  const out = redactUrlSecretsFromMessage(
+    `ws socket failed: ws://example.com/socket?token=${secret}`,
+  );
+  assert.ok(!out.includes(secret), `must not leak the ws token: ${out}`);
+  assert.ok(!out.includes("token="), `must not leak the query string: ${out}`);
+  assert.ok(!out.includes("/socket"), `must not leak the path: ${out}`);
+  assert.ok(out.includes("ws://example.com"), `keeps the ws origin: ${out}`);
+});
+
+test("redactUrlSecretsFromMessage redacts every URL in a multi-URL message", () => {
+  const first = "first-token-secret";
+  const second = "second-token-secret";
+  const out = redactUrlSecretsFromMessage(
+    `a: https://a.example.com/x?token=${first} b: https://b.example.com/y?token=${second}`,
+  );
+  assert.ok(!out.includes(first), `must not leak the first token: ${out}`);
+  assert.ok(!out.includes(second), `must not leak the second token: ${out}`);
+  assert.ok(!out.includes("token="), `must not leak either query string: ${out}`);
+  assert.ok(out.includes("https://a.example.com"), `keeps the first origin: ${out}`);
+  assert.ok(out.includes("https://b.example.com"), `keeps the second origin: ${out}`);
+});
+
+test("redactUrlSecretsFromMessage leaves a bare host without scheme alone", () => {
+  const secret = "bare-host-secret";
+  const bare = `example.com/health?token=${secret}`;
+  assert.equal(redactUrlSecretsFromMessage(bare), bare);
+});
+
+test("safeUrlOrigin marks ws:// and ftp:// invalid", () => {
+  assert.equal(safeUrlOrigin("ws://example.com/socket?token=s"), "<invalid>");
+  assert.equal(safeUrlOrigin("ftp://example.com/file"), "<invalid>");
+});

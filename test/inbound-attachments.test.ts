@@ -115,6 +115,24 @@ test("attachment failure preserves and annotates the text message", async () => 
   assert.match(result.messages[0].content, /Attachment unavailable: image\.png — expired/);
 });
 
+test("attachment failure annotation redacts URL secrets from the reason", async () => {
+  const root = await mkdtemp(join(tmpdir(), "relay-inbound-test-"));
+  const secret = "attachment-download-secret";
+  const client = fakeClient(async () => {
+    throw new Error(
+      `download failed: https://relay.example.com/files/a.png?token=${secret}#part2`,
+    );
+  });
+  const result = await materializeInboundAttachments(client, [message()], root);
+  assert.equal(result.files.length, 0);
+  assert.match(result.messages[0].content, /Attachment unavailable: image\.png — download failed/);
+  assert.ok(!result.messages[0].content.includes(secret), `must not leak the query token: ${result.messages[0].content}`);
+  assert.ok(!result.messages[0].content.includes("token="), `must not leak the query string: ${result.messages[0].content}`);
+  assert.ok(!result.messages[0].content.includes("/files"), `must not leak the path: ${result.messages[0].content}`);
+  assert.ok(!result.messages[0].content.includes("part2"), `must not leak the fragment: ${result.messages[0].content}`);
+  assert.ok(result.messages[0].content.includes("https://relay.example.com"), `keeps the origin: ${result.messages[0].content}`);
+});
+
 test("materializer refuses more than three descriptors per message", async () => {
   const root = await mkdtemp(join(tmpdir(), "relay-inbound-test-"));
   let calls = 0;
