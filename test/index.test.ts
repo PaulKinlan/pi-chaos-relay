@@ -26,6 +26,7 @@ import {
   readFileSync,
   readdirSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1140,4 +1141,161 @@ test("relay_switch_profile refuses a new profile beyond the cap without writing 
     ),
     `refusal was surfaced as a warning notification (${JSON.stringify(fake.notifications)})`,
   );
+});
+
+// ── pi-chaos-relay-bw5: /chaos-relay profile claims the lock before connect ──
+
+test("switchProfile claims the lock, refuses a live holder, and reclaims a stale one", async (t) => {
+  resetState();
+  writeProfileConfig("default", "ak_default_offline");
+  writeProfileConfig("beta", "ak_beta_offline");
+  const lock = lockPath("beta");
+
+  // (a) a live holder: refused, named, and its file untouched.
+  const holderPid = startOtherLiveSession(t);
+  writeFileSync(lock, String(holderPid));
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  const cmd = fake.commands.get("chaos-relay")!;
+  const ctx = makeCtx("sess-switch-a", fake.notifications);
+  await cmd.handler("profile beta", ctx);
+
+  const refusal = fake.notifications.map((n) => n.message).join("\n");
+  assert.match(refusal, /Relay profile "beta" is already held/, `refusal: ${refusal}`);
+  assert.ok(refusal.includes(String(holderPid)), "refusal names the live holder's pid");
+  assert.equal(readFileSync(lock, "utf-8"), String(holderPid), "holder's lock untouched");
+  assert.notEqual(
+    config.getConfigPath(),
+    config.profilePathForName("beta"),
+    "a refused switch does not move the session onto the held profile",
+  );
+
+  // (b) a stale holder (dead pid): reclaimed and the switch proceeds.
+  writeFileSync(lock, "2147483646");
+  assert.equal(isAlive(2147483646), false, "test premise: the recorded pid is dead");
+  const fake2 = makeFakePi();
+  chaosRelayExtension(fake2.pi as unknown as ExtensionApi);
+  await fake2.commands.get("chaos-relay")!.handler(
+    "profile beta",
+    makeCtx("sess-switch-b", fake2.notifications),
+  );
+  assert.equal(readFileSync(lock, "utf-8"), String(process.pid), "stale lock reclaimed by us");
+  assert.equal(
+    config.getConfigPath(),
+    config.profilePathForName("beta"),
+    "the switch completed onto the reclaimed profile",
+  );
+  const switched = fake2.notifications.map((n) => n.message).join("\n");
+  assert.match(switched, /Switched to profile "beta"/, `switch outcome: ${switched}`);
+});
+
+test("an empty lock file is only reclaimed after the create grace (a racer may be mid-create)", () => {
+  resetState();
+  const lock = lockPath("grace");
+  // Fresh empty file: indistinguishable from another process's in-flight
+  // exclusive create, so it must be treated as held, not stolen.
+  writeFileSync(lock, "");
+  const fresh = claimProfileLock("grace");
+  assert.equal(fresh.claimed, false, "a just-created empty lock is treated as held");
+  assert.equal(readFileSync(lock, "utf-8"), "", "and is not deleted");
+
+  // Old empty file: a crashed leftover, so it is reclaimed.
+  const old = (Date.now() - 60_000) / 1000;
+  utimesSync(lock, old, old);
+  const reclaimed = claimProfileLock("grace");
+  assert.equal(reclaimed.claimed, true, "an old empty lock is a stale leftover");
+  assert.equal(readFileSync(lock, "utf-8"), String(process.pid), "now names this process");
+});
+
+test("two concurrent switches to the same profile: exactly one connects, the other is refused", async (t) => {
+  resetState();
+  writeProfileConfig("default", "ak_default_offline");
+  const target = writeProfileConfig("shared", "ak_shared_offline");
+  const lock = lockPath("shared");
+  const extUrl = new URL("../index.ts", import.meta.url).href;
+  const HOLD_MS = 4_000;
+  // Inter-process on purpose: the lock records a pid, so two sessions in ONE
+  // process are indistinguishable to it. The threat the bead describes is two
+  // pi processes switching to one profile, which is what this drives.
+  const startAt = Date.now() + 900;
+  const child = `
+    const { default: chaosRelayExtension } = await import(${JSON.stringify(extUrl)});
+    const commands = new Map();
+    const notifications = [];
+    const pi = {
+      on() {},
+      registerCommand(name, def) { commands.set(name, def); },
+      registerTool() {},
+      sendUserMessage() {},
+    };
+    chaosRelayExtension(pi);
+    const ctx = {
+      model: { input: ["text"] },
+      sessionManager: { getSessionId: () => "child-" + process.pid },
+      ui: { notify: (message, level) => notifications.push({ message, level }) },
+    };
+    while (Date.now() < Number(process.env.START_AT)) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    await commands.get("chaos-relay").handler("profile shared", ctx);
+    console.log(JSON.stringify({
+      pid: process.pid,
+      notifications: notifications.map((n) => n.message),
+    }));
+    // Hold the lock (if won) so the loser must see a LIVE holder.
+    await new Promise((r) => setTimeout(r, ${HOLD_MS}));
+  `;
+
+  function startSwitcher(): { firstLine: Promise<string>; exited: Promise<void> } {
+    const p = spawn(process.execPath, ["--input-type=module", "-e", child], {
+      env: { ...process.env, START_AT: String(startAt) },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let buffer = "";
+    let err = "";
+    let resolveFirst!: (line: string) => void;
+    const firstLine = new Promise<string>((resolve) => (resolveFirst = resolve));
+    p.stdout.on("data", (c) => {
+      buffer += String(c);
+      const nl = buffer.indexOf("\n");
+      if (nl >= 0) resolveFirst(buffer.slice(0, nl));
+    });
+    p.stderr.on("data", (c) => (err += String(c)));
+    const exited = new Promise<void>((resolve, reject) =>
+      p.on("close", (code) =>
+        code === 0 ? resolve() : reject(new Error(`switcher exited ${code}: ${err}`)),
+      ),
+    );
+    return { firstLine, exited };
+  }
+
+  const switchers = [startSwitcher(), startSwitcher()];
+  const results = (await Promise.all(switchers.map((s) => s.firstLine))).map(
+    (line) => JSON.parse(line) as { pid: number; notifications: string[] },
+  );
+  const connected = results.filter((r) => r.notifications.some((m) => /Switched to profile "shared"/.test(m)));
+  const refused = results.filter((r) => !connected.includes(r));
+  assert.equal(
+    connected.length,
+    1,
+    `exactly one concurrent switch may connect: ${JSON.stringify(results)}`,
+  );
+  assert.equal(refused.length, 1, "the other switch is refused");
+  assert.ok(
+    refused[0].notifications.some((m) => /already held/.test(m)),
+    `the refused switch explains itself: ${JSON.stringify(refused[0].notifications)}`,
+  );
+  assert.ok(
+    refused[0].notifications.some((m) => m.includes(String(connected[0].pid))),
+    "the refusal names the winning process's pid",
+  );
+  assert.equal(
+    readFileSync(lock, "utf-8"),
+    String(connected[0].pid),
+    "the lock names the process that actually connected",
+  );
+  assert.equal(readFileSync(target, "utf-8").length > 0, true, "target profile config exists");
+
+  await Promise.all(switchers.map((s) => s.exited));
+  t.diagnostic(`concurrent switch result: ${JSON.stringify(results)}`);
 });
