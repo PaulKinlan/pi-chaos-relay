@@ -76,7 +76,7 @@ import {
 import { RelayWebSocket } from "./ws-client.ts";
 import { parseConnectInput } from "./connect.ts";
 import { safeUrlOrigin, redactUrlSecretsFromMessage } from "./url-redact.ts";
-import { approvalDecision } from "./approval-policy.ts";
+import { approvalDecision, LOCAL_FILE_READ_TOOLS } from "./approval-policy.ts";
 
 /**
  * Slow safety poll. The WebSocket is the primary transport (instant push);
@@ -636,6 +636,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   let activeTurn:
     | { channelType: ChannelMessage["channelType"]; channelId: string; from: string }
     | undefined;
+  /** True once the CURRENT channel-driven turn has read local file contents
+   *  (read/grep). Cleared at turn start/end. Used by the approval gate so a
+   *  text-only relay_reply cannot exfiltrate what a read just pulled in. */
+  let turnReadLocalFile = false;
 
   /**
    * Re-register with the persisted keypair to recover a working apiKey after a
@@ -1179,8 +1183,12 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
   function approvalNeeded(toolName: string, input?: Record<string, unknown>): boolean {
     // Delegate to the pure per-tool policy (approval-policy.ts) — the single
-    // source of truth for the mode x tool matrix, unit-tested in full.
-    return approvalDecision(cfg.approvalMode, toolName, input);
+    // source of truth for the mode x tool matrix, unit-tested in full. The
+    // turn state carries whether this turn has read local files, so a
+    // text-only reply after a read is gated under the default "writes" mode.
+    return approvalDecision(cfg.approvalMode, toolName, input, {
+      hasReadLocalFile: turnReadLocalFile,
+    });
   }
 
   function summarizeToolCall(toolName: string, input: Record<string, unknown>): string {
@@ -1310,6 +1318,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // concurrent turn cannot shift a stale origin into a fresh session.
     pendingOrigins = [];
     activeTurn = undefined;
+    turnReadLocalFile = false;
     if (poller) poller.reset();
     if (attachmentCleanupTimer) clearInterval(attachmentCleanupTimer);
     await cleanupStaleInboundAttachments();
@@ -1370,6 +1379,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // Drop any undelivered turn origins so the next session starts clean.
     pendingOrigins = [];
     activeTurn = undefined;
+    turnReadLocalFile = false;
     if (attachmentCleanupTimer) {
       clearInterval(attachmentCleanupTimer);
       attachmentCleanupTimer = undefined;
@@ -1386,24 +1396,38 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   pi.on("agent_start", () => {
     // Shift this turn's origin off the queue (a terminal/local turn has none).
     activeTurn = pendingOrigins.shift() ?? undefined;
+    // A fresh turn starts untainted: local-file reads from a previous turn
+    // must not gate this turn's text replies.
+    turnReadLocalFile = false;
     startTyping();
   });
   pi.on("agent_end", () => {
     stopTyping();
     activeTurn = undefined;
+    turnReadLocalFile = false;
   });
 
   // Tool approval: when enabled and the turn came from a channel, pause risky
   // tools and ask the user over that channel before they run.
   pi.on("tool_call", async (event) => {
-    if (!approvalNeeded(event.toolName, event.input as Record<string, unknown> | undefined)) return; // allow
+    const input = event.input as Record<string, unknown> | undefined;
+    const gated = approvalNeeded(event.toolName, input);
+    if (!gated) {
+      // Allowed to run. If this is a channel-driven turn running a local-file
+      // read/search, mark the turn so a later text-only relay_reply is gated
+      // (read -> plain-text reply would otherwise exfiltrate file contents).
+      if (activeTurn && LOCAL_FILE_READ_TOOLS.has(event.toolName)) {
+        turnReadLocalFile = true;
+      }
+      return;
+    }
     // Only gate turns driven from a channel — terminal/local use is unaffected.
     if (!activeTurn) return;
     // Pause the typing indicator while we wait on the human.
     stopTyping();
     const approved = await requestApproval(
       event.toolName,
-      event.input as Record<string, unknown>,
+      input ?? {},
       activeTurn,
     );
     if (!approved) {
@@ -1413,6 +1437,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           `The user denied this ${event.toolName} call over ${activeTurn.channelType}. ` +
           `Do not retry it; ask them what to do instead.`,
       };
+    }
+    // The gated tool was approved and will run: taint the turn if it reads files.
+    if (LOCAL_FILE_READ_TOOLS.has(event.toolName)) {
+      turnReadLocalFile = true;
     }
   });
 
@@ -2091,7 +2119,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
               ctx.ui.notify(
                 `Tool approvals: ${cfg.approvalMode}. ` +
                   `Set with /chaos-relay approvals <off|writes|all> — ` +
-                  `off=autonomous, writes=ask before shell/edit/write, all=ask before every tool.`,
+                  `off=autonomous, writes=ask before shell/edit/write (and text replies after reading files), all=ask before every tool.`,
                 "info",
               );
               break;
@@ -2137,7 +2165,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       ["status", "Show config, poller state, and live relay health (default when run with no subcommand)"],
       ["poll", "Poll once now and deliver any new messages"],
       ["stop", "Stop the background poller"],
-      ["approvals [off|writes|all]", "Show or set the tool-approval policy — off=autonomous, writes=ask before shell/edit/write, all=ask before every tool"],
+      ["approvals [off|writes|all]", "Show or set the tool-approval policy — off=autonomous, writes=ask before shell/edit/write (and text replies after reading files), all=ask before every tool"],
       ["doctor", "Diagnostics: config validity, credentials, relay reachability, transport, channels"],
       ["reset [all]", "Clear a corrupted relayUrl (keeps creds/channels); 'reset all' wipes the config file"],
       ["help", "Show this command reference"],
@@ -2398,7 +2426,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       }`,
       `userId:        ${current.userId ?? "(unknown)"}`,
       `transport:     WebSocket (${ws?.connected ? "connected" : ws ? "connecting/reconnecting" : "stopped"}) + ${SAFETY_POLL_MS}ms safety poll`,
-      `approvals:     ${current.approvalMode} (off=autonomous, writes=shell/edit/write, all=every tool)`,
+      `approvals:     ${current.approvalMode} (off=autonomous, writes=shell/edit/write + replies after reads, all=every tool)`,
       `local channels:${current.channels.length ? ` ${current.channels.length} cached record(s)` : " none"}`,
     ];
     for (const ch of current.channels) {

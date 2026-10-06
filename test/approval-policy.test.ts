@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { approvalDecision } from "../approval-policy.ts";
+import { approvalDecision, LOCAL_FILE_READ_TOOLS } from "../approval-policy.ts";
 
 test("off gates nothing (explicit opt-out)", () => {
   assert.equal(approvalDecision("off", "bash"), false);
@@ -28,6 +28,46 @@ test("writes: relay_reply is gated only with outbound files", () => {
     true,
     "shipping a file is write-class",
   );
+});
+
+test("writes: a text-only relay_reply is gated once the turn has read local files", () => {
+  // Fresh turn (no local-file read yet): the conversation still flows freely.
+  assert.equal(
+    approvalDecision("writes", "relay_reply", {}, { hasReadLocalFile: false }),
+    false,
+  );
+  assert.equal(
+    approvalDecision("writes", "relay_reply", { content: "hi" }),
+    false,
+  );
+  // After a read/grep in this turn, a plain-text reply can carry file contents
+  // out — gate it.
+  assert.equal(
+    approvalDecision("writes", "relay_reply", { content: "secret" }, { hasReadLocalFile: true }),
+    true,
+    "read -> text reply is the exfiltration path and must be gated",
+  );
+  // File attachments stay gated regardless of turn state.
+  assert.equal(
+    approvalDecision("writes", "relay_reply", { files: ["/x"] }, { hasReadLocalFile: false }),
+    true,
+  );
+});
+
+test("writes: read/search tools themselves stay ungated (the reply gate closes the egress)", () => {
+  assert.equal(approvalDecision("writes", "read", {}, { hasReadLocalFile: false }), false);
+  assert.equal(approvalDecision("writes", "grep", {}, { hasReadLocalFile: false }), false);
+});
+
+test("LOCAL_FILE_READ_TOOLS names the content-returning local-file tools", () => {
+  assert.ok(LOCAL_FILE_READ_TOOLS.has("read"));
+  assert.ok(LOCAL_FILE_READ_TOOLS.has("grep"));
+  assert.equal(LOCAL_FILE_READ_TOOLS.has("bash"), false, "bash is gated separately as write-class");
+});
+
+test("off: turn read state does not gate anything (explicit opt-out)", () => {
+  assert.equal(approvalDecision("off", "relay_reply", { content: "x" }, { hasReadLocalFile: true }), false);
+  assert.equal(approvalDecision("off", "read", {}, { hasReadLocalFile: true }), false);
 });
 
 test("writes: other relay tools stay ungated", () => {

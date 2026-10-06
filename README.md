@@ -368,9 +368,15 @@ channel before risky tools run:
 
 | Mode | Behaviour |
 |------|-----------|
-| `writes` *(default)* | Ask before `bash`, `edit`, and `write`; reads/searches run freely. `relay_reply` is gated only when it ships a file attachment; the other relay plumbing is ungated. |
+| `writes` *(default)* | Ask before `bash`, `edit`, and `write`; reads/searches run freely. `relay_reply` is gated when it ships a file attachment, **and a text-only `relay_reply` is gated once the current turn has read a local file (`read`/`grep`)** — this closes the read → text-reply exfiltration path without prompting on every read. The other relay plumbing is ungated. |
 | `all` | Ask before **every** tool except the read-only relay plumbing (`relay_check_messages`, `relay_list_profiles`). |
 | `off` | Fully autonomous — run every tool. Best paired with a sandbox/container. |
+
+The `writes` read guard is **turn-scoped**: it blocks the direct read-then-reply
+leak without gating the reads themselves, but it does not remember a read into
+the next turn. For the strongest posture — where a channel-driven turn cannot
+read local files at all without approval — use `all` (which also gates every
+read/search and every reply).
 
 `writes` is the default so a channel-driven session is NOT ungated out of the
 box; choose `off` (or `/chaos-relay approvals off`) for the old fully-autonomous
