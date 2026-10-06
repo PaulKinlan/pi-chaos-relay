@@ -54,3 +54,57 @@ export function redactUrlSecretsFromMessage(message: string): string {
     return originOnly(match.slice(0, end)) + match.slice(end);
   });
 }
+
+// Secret-signalling key-name components, matched case-insensitively. A value
+// is scrubbed when its `NAME=value` assignment's NAME contains one of these as
+// a whole `_`/`-`-delimited part (so `key`, `token`, `password`, … are caught,
+// but an unrelated word that merely CONTAINS "key" is not).
+const SECRET_VALUE_KEYS = new Set([
+  "token",
+  "secret",
+  "key",
+  "password",
+  "passwd",
+  "pwd",
+  "auth",
+  "authorization",
+  "credential",
+  "apikey",
+  "api-key",
+  "api_key",
+  "privatekey",
+  "private-key",
+  "private_key",
+]);
+
+/** `NAME=value` where NAME looks like it names a secret (value is replaced). */
+const SECRET_ASSIGNMENT_RE =
+  /\b([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s;|&]+)/gi;
+
+/** A standalone high-entropy token: 24+ chars of the base64/hex token alphabet.
+ * Length is the entropy heuristic — enough to redact a pasted key/credential
+ * without hiding ordinary prose. */
+const LONG_SECRET_TOKEN_RE = /[A-Za-z0-9+/=_-]{24,}/g;
+
+function looksSecretName(name: string): boolean {
+  return name.split(/[_-]/).some((part) => SECRET_VALUE_KEYS.has(part.toLowerCase()));
+}
+
+/**
+ * Scrub secret-shaped values from a shell command for DISPLAY (an approval
+ * prompt). The operator still sees WHAT the command does, but any value that
+ * could BE a secret is withheld:
+ *   - URL userinfo / query / fragment (via redactUrlSecretsFromMessage);
+ *   - `NAME=value` assignments whose NAME signals a secret;
+ *   - standalone high-entropy tokens (≥ 24 base64/hex chars).
+ * Over-redaction is intentional: a value that merely LOOKS secret is safer to
+ * hide than to ship.
+ */
+export function redactCommandSecrets(command: string): string {
+  let out = redactUrlSecretsFromMessage(command);
+  out = out.replace(SECRET_ASSIGNMENT_RE, (match, name: string) =>
+    looksSecretName(name) ? `${name}=<redacted>` : match,
+  );
+  out = out.replace(LONG_SECRET_TOKEN_RE, "<redacted>");
+  return out;
+}

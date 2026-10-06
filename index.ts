@@ -29,7 +29,7 @@ import {
 } from "./relay-client.ts";
 import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, appendFileSync, chmodSync, mkdirSync, existsSync, writeFileSync, unlinkSync, statSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, isAbsolute, join, relative } from "node:path";
 import { homedir } from "node:os";
 import {
   cleanupStaleInboundAttachments,
@@ -75,8 +75,8 @@ import {
 } from "./reply-format.ts";
 import { RelayWebSocket } from "./ws-client.ts";
 import { parseConnectInput } from "./connect.ts";
-import { safeUrlOrigin, redactUrlSecretsFromMessage } from "./url-redact.ts";
-import { approvalDecision, LOCAL_FILE_READ_TOOLS } from "./approval-policy.ts";
+import { safeUrlOrigin, redactUrlSecretsFromMessage, redactCommandSecrets } from "./url-redact.ts";
+import { approvalDecision, LOCAL_INSPECTION_TOOLS } from "./approval-policy.ts";
 
 /**
  * Slow safety poll. The WebSocket is the primary transport (instant push);
@@ -601,6 +601,86 @@ export class ApprovalQueue {
   }
 }
 
+/** One-line description of a gated tool call for the approval question. The
+ * question is sent TO the channel driving the turn, so it must never echo a
+ * raw secret value: a gated `relay_reply`/`write`/`edit`/`bash` can carry
+ * local file contents (or other secrets) the agent inspected earlier, and
+ * echoing them would ship the secret out before anyone approved. Field names
+ * (path, content, command, …) are not secret; their VALUES are — so the
+ * summary shows enough to judge the call (the command, the target path, the
+ * size) while withholding the secret-bearing contents. */
+export function summarizeToolCall(toolName: string, input: Record<string, unknown>): string {
+  if (toolName === "relay_reply") {
+    // Payload-free: channel + size only. The reply body can carry local file
+    // contents, so it is NEVER echoed back to the channel.
+    const channelType = typeof input.channelType === "string" ? input.channelType : "?";
+    const channelId = typeof input.channelId === "string" ? input.channelId : "";
+    const content = typeof input.content === "string" ? input.content : "";
+    const files = Array.isArray(input.files) ? input.files.length : 0;
+    const parts: Array<string | null> = [
+      `channel ${channelType}`,
+      channelId ? `#${shortId(channelId)}` : null,
+      `${content.length} chars / ${Buffer.byteLength(content, "utf8")} bytes`,
+    ];
+    if (files > 0) parts.push(`${files} attachment(s)`);
+    return `relay_reply: ${parts.filter((p): p is string => p !== null).join(", ")}`;
+  }
+  if (toolName === "bash") {
+    // Show the command (redacted of secret-shaped values) so the operator can
+    // judge benign vs destructive, but never the secrets embedded in it.
+    const command = typeof input.command === "string" ? input.command : "";
+    const redacted = redactCommandSecrets(command);
+    return `bash: ${truncateForDisplay(redacted)}`;
+  }
+  if (toolName === "write" || toolName === "edit") {
+    const path = typeof input.path === "string" ? input.path : "";
+    const target = path ? summarizePath(path) : "?";
+    if (toolName === "write") {
+      const content = typeof input.content === "string" ? input.content : "";
+      return `write: ${target} (${Buffer.byteLength(content, "utf8")} bytes)`;
+    }
+    const edits = Array.isArray(input.edits) ? input.edits : [];
+    let bytes = 0;
+    for (const e of edits) {
+      const edit = e as { oldText?: unknown; newText?: unknown };
+      if (typeof edit.oldText === "string") bytes += Buffer.byteLength(edit.oldText, "utf8");
+      if (typeof edit.newText === "string") bytes += Buffer.byteLength(edit.newText, "utf8");
+    }
+    return `edit: ${target} (${edits.length} edit(s), ${bytes} bytes)`;
+  }
+  // Any other gated tool: never echo raw values, only shapes.
+  const entries = Object.entries(input ?? {});
+  const parts = entries.map(([key, value]) => {
+    if ((key === "path" || key === "file_path") && typeof value === "string") {
+      return `${key}=${summarizePath(value)}`;
+    }
+    if (typeof value === "string") return `${key}:${value.length} chars`;
+    if (Array.isArray(value)) return `${key}:${value.length} item(s)`;
+    if (value === null || value === undefined) return key;
+    return `${key}:object`;
+  });
+  return `${toolName}${parts.length ? ": " + parts.join(", ") : ""}`;
+}
+
+/** Render a file path for DISPLAY: relative to the working directory when
+ * possible, otherwise its basename. A path is not a secret, but an absolute
+ * path can leak the operator's home/username, so it is not echoed verbatim. */
+function summarizePath(raw: string): string {
+  const path = raw.replace(/\\/g, "/");
+  if (!path.startsWith("/") && !/^[A-Za-z]:\//.test(path)) return path;
+  const rel = relative(process.cwd(), path);
+  if (!rel.startsWith("..") && !isAbsolute(rel)) return rel || ".";
+  return basename(path);
+}
+
+/** Keep a command summary readable; very long commands are cut with a length
+ * note. Truncation only ever HIDES text, so it cannot leak a secret. */
+function truncateForDisplay(text: string): string {
+  const max = 400;
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}… (${text.length} chars total)`;
+}
+
 export default function chaosRelayExtension(pi: ExtensionAPI): void {
   let client: RelayClient | undefined;
   let poller: MessagePoller | undefined;
@@ -636,10 +716,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   let activeTurn:
     | { channelType: ChannelMessage["channelType"]; channelId: string; from: string }
     | undefined;
-  /** True once THIS SESSION has read local file contents (read/grep) — from any
-   *  turn, channel-driven or terminal/local. Cleared only at session start and
-   *  shutdown, never at turn boundaries, so a channel turn cannot text-reply a
-   *  secret read in an earlier turn without approval. Used by the approval gate. */
+  /** True once THIS SESSION has inspected local content (read/grep/bash) — from
+   *  any turn, channel-driven or terminal/local. Cleared only at session start
+   *  and shutdown, never at turn boundaries, so a channel turn cannot text-reply
+   *  a secret inspected in an earlier turn without approval. Used by the
+   *  approval gate. */
   let sessionReadLocalFile = false;
 
   /**
@@ -1193,39 +1274,6 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     });
   }
 
-  /** One-line, payload-free description of a gated tool call for the approval
-   * question. The question is sent TO the channel driving the turn, so it must
-   * never echo a raw input value: a gated `relay_reply`/`write`/`edit`/`bash`
-   * can carry local file contents (or other secrets) the agent read earlier,
-   * and echoing them would ship the secret out before anyone approved. Field
-   * names (path, content, command, …) are not secret; their VALUES are. */
-  function summarizeToolCall(toolName: string, input: Record<string, unknown>): string {
-    if (toolName === "relay_reply") {
-      const channelType = typeof input.channelType === "string" ? input.channelType : "?";
-      const channelId = typeof input.channelId === "string" ? input.channelId : "";
-      const content = typeof input.content === "string" ? input.content : "";
-      const files = Array.isArray(input.files) ? input.files.length : 0;
-      const parts: Array<string | null> = [
-        `channel ${channelType}`,
-        channelId ? `#${shortId(channelId)}` : null,
-        `${content.length} chars / ${Buffer.byteLength(content, "utf8")} bytes`,
-      ];
-      if (files > 0) parts.push(`${files} attachment(s)`);
-      return `relay_reply: ${parts.filter((p): p is string => p !== null).join(", ")}`;
-    }
-    const entries = Object.entries(input ?? {});
-    const parts = entries.map(([key, value]) => {
-      if ((key === "path" || key === "file_path") && typeof value === "string") {
-        return `${key}#${shortId(value)}`;
-      }
-      if (typeof value === "string") return `${key}:${value.length} chars`;
-      if (Array.isArray(value)) return `${key}:${value.length} item(s)`;
-      if (value === null || value === undefined) return key;
-      return `${key}:object`;
-    });
-    return `${toolName}${parts.length ? ": " + parts.join(", ") : ""}`;
-  }
-
   /** Ask the channel to approve a tool call; resolves true=allow, false=deny. */
   async function requestApproval(
     toolName: string,
@@ -1440,20 +1488,21 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const input = event.input as Record<string, unknown> | undefined;
     const gated = approvalNeeded(event.toolName, input);
     if (!gated) {
-      // Runs ungated. A local-file read/search — from a channel turn OR a
-      // terminal/local turn — taints the session so a later channel-driven
-      // text-only relay_reply is gated (read -> plain-text reply would
-      // otherwise exfiltrate file contents across turns).
-      if (LOCAL_FILE_READ_TOOLS.has(event.toolName)) {
+      // Runs ungated. A local-inspection tool (read/grep/bash) — from a channel
+      // turn OR a terminal/local turn — taints the session so a later
+      // channel-driven text-only relay_reply is gated (inspect -> plain-text
+      // reply would otherwise exfiltrate the contents across turns).
+      if (LOCAL_INSPECTION_TOOLS.has(event.toolName)) {
         sessionReadLocalFile = true;
       }
       return;
     }
     // Only turns driven from a channel require approval. A terminal/local turn
-    // still runs the gated tool (no channel to ask), but a local-file read there
-    // must also taint the session for later channel turns.
+    // still runs the gated tool (no channel to ask), but an inspection tool
+    // (read/grep/bash) there must also taint the session for later channel
+    // turns.
     if (!activeTurn) {
-      if (LOCAL_FILE_READ_TOOLS.has(event.toolName)) {
+      if (LOCAL_INSPECTION_TOOLS.has(event.toolName)) {
         sessionReadLocalFile = true;
       }
       return;
@@ -1473,9 +1522,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           `Do not retry it; ask them what to do instead.`,
       };
     }
-    // The gated tool was approved and will run: taint the session if it reads
-    // files, so a later channel turn still cannot text-reply them out freely.
-    if (LOCAL_FILE_READ_TOOLS.has(event.toolName)) {
+    // The gated tool was approved and will run: taint the session if it can
+    // inspect local content (read/grep/bash), so a later channel turn still
+    // cannot text-reply it out freely.
+    if (LOCAL_INSPECTION_TOOLS.has(event.toolName)) {
       sessionReadLocalFile = true;
     }
   });

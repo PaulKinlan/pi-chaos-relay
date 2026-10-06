@@ -14,16 +14,16 @@ import type { ApprovalMode } from "./config.ts";
 const RISKY_WRITE_TOOLS = new Set(["bash", "edit", "write"]);
 
 /**
- * Tools that return local file CONTENT into the agent's context. Under the
- * default "writes" posture these stay ungated so a channel-driven turn can
- * still read and search the codebase freely — but running one marks the
- * SESSION as having read local files, and a text-only `relay_reply` from a
- * later channel turn is then gated (see `approvalDecision`). That closes the
- * read → text-reply exfiltration path without prompting on every read.
- * Exported so the extension marks sessions using the SAME single source of
- * truth the policy gates on.
+ * Tools whose execution can surface local file contents into the agent's
+ * context. `read`/`grep` return file contents directly; `bash` can run
+ * arbitrary local inspection (cat a file, print a secret, …). Running any of
+ * these — gated or ungated — marks the SESSION as having inspected local
+ * content, so a text-only `relay_reply` from a later channel turn is then
+ * gated (see `approvalDecision`). That closes the inspect → text-reply
+ * exfiltration path without prompting on every read. Exported so the extension
+ * marks sessions using the SAME single source of truth the policy gates on.
  */
-export const LOCAL_FILE_READ_TOOLS = new Set(["read", "grep"]);
+export const LOCAL_INSPECTION_TOOLS = new Set(["read", "grep", "bash"]);
 
 /** Read-only relay plumbing — never gated (gating it would deadlock the very
  *  channel the approval question is asked over). */
@@ -31,9 +31,9 @@ const RELAY_READ_ONLY_TOOLS = new Set(["relay_check_messages", "relay_list_profi
 
 /** Session-scoped context the approval gate needs beyond the tool call itself. */
 export interface SessionApprovalState {
-  /** True once the session has read local file contents (read/grep); it stays
-   *  set until the session ends so a later channel turn cannot text-reply them
-   *  out without approval. */
+  /** True once the session has inspected local content (read/grep/bash); it
+   *  stays set until the session ends so a later channel turn cannot text-reply
+   *  it out without approval. */
   hasReadLocalFile?: boolean;
 }
 
@@ -44,7 +44,7 @@ export interface SessionApprovalState {
  * - `writes`: non-relay write-class tools (`bash`/`edit`/`write`) are gated;
  *   among the relay tools, `relay_reply` is gated when it carries outbound
  *   file attachments (it ships local bytes out — write-class) OR when the
- *   session has already read local file contents (a text-only reply can then
+ *   session has already inspected local content (a text-only reply can then
  *   carry those contents out). The rest of the namespace stays ungated.
  * - `all`: everything is gated EXCEPT the read-only relay plumbing
  *   (`relay_check_messages`, `relay_list_profiles`). Any `relay_*` name not in
@@ -68,7 +68,7 @@ export function approvalDecision(
     return !RELAY_READ_ONLY_TOOLS.has(toolName);
   }
   // "writes": relay_reply is gated for outbound files, and for text-only
-  // replies once the session has read local file contents.
+  // replies once the session has inspected local content.
   if (toolName === "relay_reply") {
     const files = input?.files;
     if (Array.isArray(files) && files.length > 0) return true;

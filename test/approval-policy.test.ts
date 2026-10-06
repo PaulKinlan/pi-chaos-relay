@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { approvalDecision, LOCAL_FILE_READ_TOOLS } from "../approval-policy.ts";
+import { approvalDecision, LOCAL_INSPECTION_TOOLS } from "../approval-policy.ts";
 
 test("off gates nothing (explicit opt-out)", () => {
   assert.equal(approvalDecision("off", "bash"), false);
@@ -59,10 +59,10 @@ test("writes: read/search tools themselves stay ungated (the reply gate closes t
   assert.equal(approvalDecision("writes", "grep", {}, { hasReadLocalFile: false }), false);
 });
 
-test("LOCAL_FILE_READ_TOOLS names the content-returning local-file tools", () => {
-  assert.ok(LOCAL_FILE_READ_TOOLS.has("read"));
-  assert.ok(LOCAL_FILE_READ_TOOLS.has("grep"));
-  assert.equal(LOCAL_FILE_READ_TOOLS.has("bash"), false, "bash is gated separately as write-class");
+test("LOCAL_INSPECTION_TOOLS names the tools that can surface local content", () => {
+  assert.ok(LOCAL_INSPECTION_TOOLS.has("read"));
+  assert.ok(LOCAL_INSPECTION_TOOLS.has("grep"));
+  assert.ok(LOCAL_INSPECTION_TOOLS.has("bash"), "bash can run arbitrary local inspection (cat, print, …)");
 });
 
 test("off: session read state does not gate anything (explicit opt-out)", () => {
