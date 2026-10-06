@@ -139,12 +139,18 @@ function lockPath(profile: string): string {
  * auth-recovery path (and the channel re-bind it triggers) can be driven. */
 class FailingWebSocket {
   static instances: FailingWebSocket[] = [];
+  /** The URL this socket was constructed for — lets a test pick ITS OWN
+   * instance out of the shared static registry by apiKey, instead of assuming
+   * `instances[0]` belongs to it (stale clients from earlier tests can still
+   * construct into the registry while this test is running). */
+  readonly url: string;
   readyState = 0;
   onopen: ((event: unknown) => void) | null = null;
   onmessage: ((event: unknown) => void) | null = null;
   onerror: ((event: unknown) => void) | null = null;
   onclose: ((event: { code: number }) => void) | null = null;
-  constructor(_url: string) {
+  constructor(url: string) {
+    this.url = url;
     FailingWebSocket.instances.push(this);
   }
   send(): void {}
@@ -1192,6 +1198,10 @@ test("auth recovery re-bind logs the webhook origin, not the secret URL", async 
   const origFetch = globalThis.fetch;
   const origWs = globalThis.WebSocket;
   FailingWebSocket.instances = [];
+  const ownSockets = () =>
+    FailingWebSocket.instances.filter((ws) =>
+      ws.url.includes(`token=${encodeURIComponent("old-key")}`),
+    );
   globalThis.fetch = (async (input: unknown, _init?: unknown) => {
     const href = typeof input === "string" ? input : String(input);
     if (href.endsWith("/auth/register")) {
@@ -1218,10 +1228,13 @@ test("auth recovery re-bind logs the webhook origin, not the secret URL", async 
     chaosRelayExtension(fake.pi as unknown as ExtensionApi);
     await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-rebind", fake.notifications));
 
-    assert.ok(FailingWebSocket.instances.length >= 1, "WS constructed");
-    FailingWebSocket.instances[0].failHandshake(1006);
-    await waitFor(() => FailingWebSocket.instances.length >= 2);
-    FailingWebSocket.instances[1].failHandshake(1006);
+    assert.ok(ownSockets().length >= 1, "this test's WS was constructed (token=old-key)");
+    const first = ownSockets()[0];
+    first.failHandshake(1006);
+    await waitFor(() => ownSockets().length >= 2);
+    const second = ownSockets().find((ws) => ws !== first);
+    assert.ok(second, "the client under test reconnected with its own apiKey");
+    second.failHandshake(1006);
 
     const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
     await waitFor(() => {
