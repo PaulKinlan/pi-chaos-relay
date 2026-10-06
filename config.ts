@@ -804,6 +804,65 @@ function envInt(name: string): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+/** The identity-bearing fields of a server public JWK, or undefined when it is
+ *  not a usable EC P-256 public key. Only these fields identify the key;
+ *  metadata like `alg`/`key_ops`/`ext` may legitimately differ across
+ *  re-serializations and must not be part of the comparison. */
+function serverKeyIdentity(key: JsonWebKey | undefined): string | undefined {
+  if (!key || typeof key !== "object") return undefined;
+  const { kty, crv, x, y } = key;
+  if (kty !== "EC" || typeof crv !== "string" || typeof x !== "string" || typeof y !== "string") {
+    return undefined;
+  }
+  return JSON.stringify({ kty, crv, x, y });
+}
+
+export type ServerKeyPinOutcome =
+  | { action: "adopt"; serverPublicKey?: JsonWebKey }
+  | { action: "refuse"; message: string };
+
+/**
+ * Enforce the trust-on-first-use pin on the relay's public key. Registration
+ * returns the server's public key; once a key is pinned, a LATER registration
+ * returning a different key means the relay's identity changed (or a MITM is
+ * answering re-registration), so fail closed instead of silently overwriting
+ * the pin.
+ *
+ * - no pin yet          → adopt the fresh key (first contact, TOFU)
+ * - relay sent no key   → keep the existing pin
+ * - same key            → adopt (no-op)
+ * - different key       → refuse with a clear, non-identifying reason
+ *
+ * The comparison covers only the EC key material (kty/crv/x/y), so an
+ * unparseable fresh key is treated as a mismatch and refused, never adopted
+ * over a usable pin.
+ */
+export function resolveServerKeyPin(opts: {
+  pinned?: JsonWebKey;
+  fresh?: JsonWebKey;
+}): ServerKeyPinOutcome {
+  const { pinned, fresh } = opts;
+  if (!pinned) return { action: "adopt", serverPublicKey: fresh };
+  if (!fresh) return { action: "adopt", serverPublicKey: pinned };
+
+  const pinnedId = serverKeyIdentity(pinned);
+  const freshId = serverKeyIdentity(fresh);
+  // A malformed pin is not enforceable (it never identified a usable key), so
+  // fall through to adopting the fresh key in that case. A usable pin with a
+  // missing/different/unparseable fresh key refuses.
+  if (pinnedId !== undefined && (freshId === undefined || freshId !== pinnedId)) {
+    return {
+      action: "refuse",
+      message:
+        "relay server identity changed: the relay presented a public key different " +
+        "from the one pinned at first registration. Refusing to overwrite the pin " +
+        "(possible man-in-the-middle). If the relay legitimately rotated its key, " +
+        "remove the stale serverPublicKey from the relay config and re-register.",
+    };
+  }
+  return { action: "adopt", serverPublicKey: fresh };
+}
+
 /**
  * Resolve the effective config. Env vars override the persisted file.
  *

@@ -11,9 +11,9 @@
  * ack timeouts and reconnect delays are injected as short values rather than
  * slept through.
  *
- * This branch is TESTS ONLY: no production file is changed, and defects found
- * here are reported (not fixed, and not pinned as expected behaviour). The four
- * tests named "KNOWN DEFECT" at the end of this file document them.
+ * Untrusted frames are dropped rather than dereferenced, and reply acks
+ * correlate FIFO within a single socket: pending replies are cleared on every
+ * unexpected close so a later socket's ack can never settle an earlier reply.
  */
 
 import { test } from "node:test";
@@ -414,12 +414,30 @@ test("JSON payloads that are not objects are ignored", () => {
   h.ws.start();
   const socket = h.last();
   socket.open();
-  // The JSON literal `null` is deliberately absent here: it does NOT survive
-  // this path — see the "KNOWN DEFECT" test at the end of this file.
-  for (const raw of ["123", "\"a string\"", "[]", "true", "[1,2]"]) {
+  for (const raw of ["null", "123", "\"a string\"", "[]", "true", "[1,2]"]) {
     assert.doesNotThrow(() => socket.deliver(raw), `frame ${raw} threw`);
   }
   assert.deepEqual(h.delivered, []);
+  assert.equal(
+    h.logs.filter((l) => l.includes("dropping non-object relay frame")).length,
+    6,
+    `expected one drop log per non-object frame, saw ${JSON.stringify(h.logs)}`,
+  );
+  h.ws.stop();
+});
+
+test("a JSON `null` frame is dropped without throwing", () => {
+  const h = harness();
+  h.ws.start();
+  const socket = h.last();
+  socket.open();
+  assert.doesNotThrow(() => socket.deliver("null"));
+  assert.deepEqual(h.delivered, []);
+  assert.equal(h.ws.connected, true, "the socket stayed usable");
+  assert.ok(
+    h.logs.some((l) => l.includes("dropping non-object relay frame")),
+    `expected a non-object frame log, saw ${JSON.stringify(h.logs)}`,
+  );
   h.ws.stop();
 });
 
@@ -985,10 +1003,9 @@ test("a ping is not sent on a socket that is not open", (t) => {
 
 // --- KNOWN DEFECTS (reported, deliberately not asserted as correct) --------
 //
-// This branch is TESTS ONLY: the transport is not changed here, and none of
-// these tests pins the current behaviour as expected. Each one drives its
-// reproduction and then skips itself, reporting what it observed. They each
-// need their own bead before anything is asserted about them.
+// start() idempotency is the one remaining reported defect: it drives its
+// reproduction and skips itself, reporting what it observed. It needs its own
+// bead before anything is asserted about it.
 
 test("KNOWN DEFECT: start() is not idempotent", (t) => {
   // Repro: `node --test test/ws-client.test.ts`
@@ -1012,58 +1029,7 @@ test("KNOWN DEFECT: start() is not idempotent", (t) => {
   t.skip("known defect (documented idempotency does not hold) — awaiting its own bead");
 });
 
-test("KNOWN DEFECT: a JSON `null` frame throws out of handleFrame", (t) => {
-  // Repro: `node --test test/ws-client.test.ts`
-  //   send the single text frame `null` (the JSON literal, 4 bytes) as the
-  //   relay would: 0x81 0x04 'n' 'u' 'l' 'l'
-  // Observed: a TypeError "Cannot read properties of null (reading 'type')"
-  //   is thrown out of handleFrame (ws-client.ts:214-222 — `JSON.parse` returns
-  //   null, and the switch then reads `data.type`).
-  // Expected: the frame is dropped like any other malformed frame, leaving the
-  //   socket usable.
-  // Severity: with a real socket the throw escapes the `onmessage` handler as
-  //   an uncaught exception, so any peer that can write one frame to the socket
-  //   can kill the pi process.
-  const h = harness();
-  h.ws.start();
-  const socket = h.last();
-  socket.open();
-
-  let thrown: unknown;
-  try {
-    socket.deliver("null");
-  } catch (err) {
-    thrown = err;
-  }
-  if (thrown instanceof Error) {
-    t.diagnostic(
-      `observed: ${thrown.name}: ${thrown.message} (socket still connected: ${h.ws.connected})`,
-    );
-  } else {
-    t.diagnostic("no longer throws — the defect looks fixed; assert it here");
-  }
-  h.ws.stop();
-  t.skip("known defect (untrusted frame crashes the handler) — awaiting its own bead");
-});
-
-test("KNOWN DEFECT: pending replies survive a reconnect and steal the next ack", (t) => {
-  // Repro: `node --test test/ws-client.test.ts`
-  //   1. reply A on socket 1, never acked
-  //   2. socket 1 drops (1006); the transport reconnects to socket 2
-  //   3. reply B on socket 2
-  //   4. the relay acks B on socket 2 with `{type:"reply_ack",ok:true,responseId:"ack-b"}`
-  // Observed: the ack for B resolves reply A's promise, and B stays pending
-  //   until its ack timeout. `pending` is only cleared by stop()
-  //   (ws-client.ts:115-131), never by an unexpected close
-  //   (ws-client.ts:173-183), and acks correlate FIFO with no echo id
-  //   (ws-client.ts:228-242).
-  // Expected: an ack settles the reply it belongs to, and replies sent on a
-  //   socket that died are rejected rather than left to be re-pointed at a
-  //   later connection's ack.
-  // Severity: A's caller is told the reply was delivered when it never was
-  //   (in index.ts:877 the WS path is treated as delivered on `ok`), and B's
-  //   caller times out and re-sends over HTTP — so one reply is lost and the
-  //   next is duplicated.
+test("pending replies are rejected on reconnect and cannot steal the next ack", async () => {
   const h = harness({ maxBackoffMs: 0 });
   h.ws.start();
   const first = h.last();
@@ -1071,44 +1037,25 @@ test("KNOWN DEFECT: pending replies survive a reconnect and steal the next ack",
 
   const a = outcome(h.ws.reply({ ...replyPayload, content: "A" }, 5_000));
   first.drop(1006);
-  return flush().then(() => {
-    const second = h.last();
-    second.open();
-    const b = outcome(h.ws.reply({ ...replyPayload, content: "B" }, 5_000));
-    second.deliver(
-      JSON.stringify({ type: "reply_ack", ok: true, responseId: "ack-b" }),
-    );
-    return pendingish(b).then(async (bState) => {
-      t.diagnostic(`reply A outcome: ${await a}`);
-      t.diagnostic(`reply B outcome after the ack for B: ${bState}`);
-      h.ws.stop();
-      t.skip("known defect (ack correlation after a reconnect) — awaiting its own bead");
-    });
-  });
+  assert.equal(await a, "rejected WebSocket closed");
+  await flush();
+
+  const second = h.last();
+  second.open();
+  const b = outcome(h.ws.reply({ ...replyPayload, content: "B" }, 5_000));
+  second.deliver(JSON.stringify({ type: "reply_ack", ok: true, responseId: "ack-b" }));
+  assert.equal(await b, 'resolved {"ok":true,"responseId":"ack-b"}');
+  h.ws.stop();
 });
 
-test("KNOWN DEFECT: an unexpected close leaves in-flight replies pending", (t) => {
-  // Repro: `node --test test/ws-client.test.ts`
-  //   1. reply with a 40ms ack timeout on an open socket
-  //   2. the socket drops (1006) — the frame can no longer be acked
-  //   3. observe the reply promise immediately after the close
-  // Observed: still pending; it only settles when its ack timeout fires, so the
-  //   caller's HTTP fallback (index.ts:906) waits the full ackTimeoutMs
-  //   (10s by default) after the socket has already died.
-  // Expected: pending replies are rejected when the socket closes, as stop()
-  //   already does (ws-client.ts:120-123, "WebSocket closed").
-  // Same root cause as the reconnect/ack-correlation defect above: an
-  //   unexpected close (ws-client.ts:173-183) does not touch `pending`.
+test("an unexpected close rejects in-flight replies immediately", async () => {
   const h = harness({ maxBackoffMs: 0 });
   h.ws.start();
   const socket = h.last();
   socket.open();
 
-  const reply = outcome(h.ws.reply(replyPayload, 40));
+  const reply = outcome(h.ws.reply(replyPayload, 5_000));
   socket.drop(1006);
-  return pendingish(reply, 15).then((state) => {
-    t.diagnostic(`reply outcome 15ms after the socket dropped: ${state}`);
-    h.ws.stop();
-    t.skip("known defect (no fail-fast on an unexpected close) — awaiting its own bead");
-  });
+  assert.equal(await reply, "rejected WebSocket closed");
+  h.ws.stop();
 });
