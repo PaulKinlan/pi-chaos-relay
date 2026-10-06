@@ -1310,3 +1310,266 @@ test("a batch mixing senders is attributed to the earliest message's origin", as
     "a mixed batch is attributed to the earliest message's origin (first-wins, documented)",
   );
 });
+
+test("a turn that starts during slow attachment hydration does not consume the not-yet-delivered origin", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak", approvalMode: "all" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  // Hold the attachment download open so hydration stays in-flight while we
+  // start another turn.
+  let releaseDownload!: () => void;
+  const downloadGate = new Promise<void>((resolve) => {
+    releaseDownload = resolve;
+  });
+
+  const replyDests: string[] = [];
+  globalThis.fetch = (async (url: unknown, init?: unknown) => {
+    const u = String(url);
+    if (u.includes("/attachments/")) {
+      await downloadGate;
+      return new Response("attachment-bytes", {
+        status: 200,
+        headers: { "Content-Type": "text/plain", "Content-Length": "16" },
+      });
+    }
+    if (u.includes("/messages")) {
+      return new Response(
+        JSON.stringify({
+          messages: [
+            {
+              id: "slow1",
+              channelType: "telegram",
+              channelId: "chanA",
+              from: "alice",
+              content: "hello with an attachment",
+              timestamp: "2026-01-01T00:00:01Z",
+              attachments: [{ id: "att1", filename: "f.txt", mimeType: "text/plain", size: 16 }],
+            },
+          ],
+          since: "2026-01-01T00:00:01Z",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (u.includes("/reply")) {
+      const body = JSON.parse(String((init as { body?: string })?.body ?? "{}"));
+      replyDests.push(body.channelId);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+
+  const flushAsync = async () => {
+    await new Promise((r) => setTimeout(r, 30));
+  };
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-slow", fake.notifications));
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-slow", fake.notifications)));
+
+  // The safety poll delivers the attachment-bearing message; hydration blocks on
+  // the download gate above.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+
+  // Another turn starts and ends while hydration is still pending. It must not
+  // consume the origin that has not actually been delivered.
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-slow", fake.notifications));
+  await callHandler(fake.handlers, "agent_end", {}, makeCtx("sess-slow", fake.notifications));
+
+  // Let hydration finish; the followUp is now actually delivered.
+  releaseDownload();
+  await flushAsync();
+
+  // The relay message's own turn starts and must carry chanA's origin.
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-slow", fake.notifications));
+
+  const toolHandlers = fake.handlers.get("tool_call");
+  assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
+  toolHandlers![0]({ toolName: "bash", input: { command: "x" } }, makeCtx("sess-slow", fake.notifications));
+  await flushAsync();
+
+  assert.deepEqual(
+    replyDests,
+    ["chanA"],
+    "the slow-hydrated relay turn is gated and asked over its own channel",
+  );
+});
+
+test("a hydration failure enqueues no origin and leaves the next turn aligned", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak", approvalMode: "all" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  let messagesServed = 0;
+  const replyDests: string[] = [];
+  globalThis.fetch = (async (url: unknown, init?: unknown) => {
+    const u = String(url);
+    if (u.includes("/messages")) {
+      messagesServed++;
+      const msg =
+        messagesServed === 1
+          ? {
+              id: "bad1",
+              channelType: "telegram",
+              channelId: "chanA",
+              from: "alice",
+              content: "broken hydration",
+              timestamp: "2026-01-01T00:00:01Z",
+              // Force materializeInboundAttachments to throw: `.slice` on a
+              // string yields a string, and `attachments.map` is not a function.
+              attachments: "not-an-array",
+            }
+          : {
+              id: "ok1",
+              channelType: "telegram",
+              channelId: "chanB",
+              from: "bob",
+              content: "clean message",
+              timestamp: "2026-01-01T00:00:02Z",
+            };
+      return new Response(JSON.stringify({ messages: [msg], since: "2026-01-01T00:00:02Z" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (u.includes("/reply")) {
+      const body = JSON.parse(String((init as { body?: string })?.body ?? "{}"));
+      replyDests.push(body.channelId);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+
+  const flushAsync = async () => {
+    await new Promise((r) => setTimeout(r, 60));
+  };
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-hydfail", fake.notifications));
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-hydfail", fake.notifications)));
+
+  // First delivery fails during hydration: nothing is sent and nothing enqueued.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+
+  // Second delivery succeeds; its origin must be the only one in the queue.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-hydfail", fake.notifications));
+
+  const toolHandlers = fake.handlers.get("tool_call");
+  assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
+  toolHandlers![0]({ toolName: "bash", input: { command: "x" } }, makeCtx("sess-hydfail", fake.notifications));
+  await flushAsync();
+
+  assert.deepEqual(
+    replyDests,
+    ["chanB"],
+    "the clean turn is gated over its own channel, not desynced by the failed hydration",
+  );
+});
+
+test("session shutdown and start clear pending origins so a new session cannot inherit them", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak", approvalMode: "all" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  const replyDests: string[] = [];
+  globalThis.fetch = (async (url: unknown, init?: unknown) => {
+    const u = String(url);
+    if (u.includes("/messages")) {
+      return new Response(
+        JSON.stringify({
+          messages: [
+            {
+              id: "stale1",
+              channelType: "telegram",
+              channelId: "chanA",
+              from: "alice",
+              content: "queued then session ends",
+              timestamp: "2026-01-01T00:00:01Z",
+            },
+          ],
+          since: "2026-01-01T00:00:01Z",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (u.includes("/reply")) {
+      const body = JSON.parse(String((init as { body?: string })?.body ?? "{}"));
+      replyDests.push(body.channelId);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+
+  const flushAsync = async () => {
+    await new Promise((r) => setTimeout(r, 60));
+  };
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-reset", fake.notifications));
+
+  // A relay message arrives and its origin is queued, but the turn never starts
+  // before the session ends.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+
+  await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-reset", fake.notifications));
+  await callHandler(fake.handlers, "session_start", { reason: "resume" }, makeCtx("sess-reset2", fake.notifications));
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-reset2", fake.notifications)));
+
+  // A terminal/local turn in the new session must be ungated: the stale origin
+  // from the previous session must already be gone.
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-reset2", fake.notifications));
+
+  const toolHandlers = fake.handlers.get("tool_call");
+  assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
+  toolHandlers![0]({ toolName: "bash", input: { command: "x" } }, makeCtx("sess-reset2", fake.notifications));
+  await flushAsync();
+
+  assert.deepEqual(
+    replyDests,
+    [],
+    "no stale origin leaks across the session boundary into a terminal turn",
+  );
+});

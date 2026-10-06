@@ -774,9 +774,25 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
    * examples (reload-runtime, git-merge-and-resolve).
    */
   async function deliverToAgent(messages: ChannelMessage[]): Promise<void> {
-    // Enqueue this turn's origin. A batch can mix channels/senders; attribute it
-    // to the FIRST (earliest) message — the one that initiated the turn — and
-    // warn so a mixed batch is never silently attributed to the last message.
+    const c = ensureClient();
+    const hydrated = c
+      ? await materializeInboundAttachments(c, messages)
+      : { messages, images: [], files: [] };
+    const text = formatMessagesForAgent(hydrated.messages);
+    const includesImages = hydrated.images.length > 0 && activeModelAcceptsImages;
+    const content = includesImages
+      ? [{ type: "text" as const, text }, ...hydrated.images]
+      : text;
+
+    // Enqueue this turn's origin only now that hydration has succeeded and the
+    // followUp is about to be delivered. A batch can mix channels/senders;
+    // attribute it to the FIRST (earliest) message — the one that initiated the
+    // turn — and warn so a mixed batch is never silently attributed to the last
+    // message. (Pre-1.0 decision: earliest-origin + warning; the per-origin
+    // delivery follow-up is deferred.) Enqueueing here, not before the await,
+    // keeps one queue entry per delivered turn: a hydration failure (or a turn
+    // that starts during a slow hydration) can never consume or shift an origin
+    // that was never actually delivered.
     const first = messages[0];
     if (first) {
       pendingOrigins.push({
@@ -792,15 +808,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         );
       }
     }
-    const c = ensureClient();
-    const hydrated = c
-      ? await materializeInboundAttachments(c, messages)
-      : { messages, images: [], files: [] };
-    const text = formatMessagesForAgent(hydrated.messages);
-    const includesImages = hydrated.images.length > 0 && activeModelAcceptsImages;
-    const content = includesImages
-      ? [{ type: "text" as const, text }, ...hydrated.images]
-      : text;
+
     try {
       pi.sendUserMessage(content, { deliverAs: "followUp" });
     } catch (err) {
@@ -985,6 +993,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // --- Lifecycle: start/stop the background poller with the session ----------
 
   pi.on("session_start", async (event, ctx) => {
+    // A new session must never inherit turn-origin state from a previous one:
+    // clear pending origins and the active turn before any async work, so a
+    // concurrent turn cannot shift a stale origin into a fresh session.
+    pendingOrigins = [];
+    activeTurn = undefined;
     if (poller) poller.reset();
     if (attachmentCleanupTimer) clearInterval(attachmentCleanupTimer);
     await cleanupStaleInboundAttachments();
@@ -1042,6 +1055,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => {
     stopPolling();
     stopTyping();
+    // Drop any undelivered turn origins so the next session starts clean.
+    pendingOrigins = [];
+    activeTurn = undefined;
     if (attachmentCleanupTimer) {
       clearInterval(attachmentCleanupTimer);
       attachmentCleanupTimer = undefined;
