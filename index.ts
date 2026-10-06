@@ -27,6 +27,7 @@ import {
   mimeForFile,
   type ReplyAttachment,
 } from "./relay-client.ts";
+import { randomBytes } from "node:crypto";
 import { readFileSync, appendFileSync, mkdirSync, existsSync, writeFileSync, unlinkSync } from "node:fs";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
@@ -219,7 +220,12 @@ export interface PendingApprovalEntry {
   /** Short human-facing reference, shown to the user as `#<ref>`. */
   ref: number;
   channelId: string;
+  /** Sender of the message that triggered the gated turn. Only this sender can
+   *  answer; a different participant's message is not consumed. */
+  from: string;
   toolName: string;
+  /** Unguessable token the user must echo back, shown in the prompt. */
+  nonce: string;
 }
 
 /**
@@ -265,14 +271,22 @@ export class ApprovalQueue {
    * user-facing `ref`, and a `cancel` for the caller's own failure path (e.g.
    * the question could not be sent).
    */
-  add(opts: { channelId: string; toolName: string }): {
+  add(opts: { channelId: string; from: string; toolName: string }): {
     ref: number;
+    nonce: string;
     promise: Promise<boolean>;
     cancel: () => void;
   } {
     const ref = ++this.seq;
+    const nonce = randomBytes(6).toString("hex");
     const id = `${opts.channelId}#${ref}`;
-    const entry: PendingApprovalEntry = { ref, channelId: opts.channelId, toolName: opts.toolName };
+    const entry: PendingApprovalEntry = {
+      ref,
+      channelId: opts.channelId,
+      from: opts.from,
+      toolName: opts.toolName,
+      nonce,
+    };
     let settle!: (approved: boolean) => void;
     const promise = new Promise<boolean>((resolve) => {
       settle = resolve;
@@ -288,6 +302,7 @@ export class ApprovalQueue {
     this.pending.set(id, { entry, resolve: settle, timer });
     return {
       ref,
+      nonce,
       promise,
       cancel: () => {
         const held = this.pending.get(id);
@@ -303,48 +318,32 @@ export class ApprovalQueue {
    * true when the message was consumed (so the caller does not forward it to
    * the agent), false when it answers nothing pending here.
    */
-  settle(message: { channelId: string; content: string }): boolean {
+  settle(message: { channelId: string; from: string; content: string }): boolean {
     if (this.pending.size === 0) return false;
-    const addressed = /^\s*#(\d+)\b/.exec(message.content);
-    let id: string | undefined;
-    let body = message.content;
-    if (addressed) {
-      const ref = Number(addressed[1]);
-      // An addressed reply wins only if that request is outstanding on this
-      // channel; otherwise it is consumed (the user meant to answer something)
-      // but resolves nothing, and the request keeps waiting for its own answer.
-      for (const [key, held] of this.pending) {
-        if (held.entry.ref === ref && held.entry.channelId === message.channelId) {
-          id = key;
-          break;
-        }
-      }
-      body = message.content.slice(addressed[0].length);
-      if (id === undefined) {
-        this.log(`approval: reply addresses #${ref}, which is not pending on this channel — ignored`);
+    const answer = /^\s*(yes|no)\s+([0-9a-f]+)\s*$/i.exec(message.content);
+    if (!answer) return false; // not a well-formed answer — forward it untouched
+    const nonce = answer[2].toLowerCase();
+    for (const [key, held] of this.pending) {
+      if (
+        held.entry.nonce === nonce &&
+        held.entry.channelId === message.channelId &&
+        held.entry.from === message.from
+      ) {
+        clearTimeout(held.timer);
+        this.pending.delete(key);
+        const approved = answer[1].toLowerCase() === "yes";
+        this.log(
+          `approval: reply "${message.content.slice(0, 24)}" → #${held.entry.ref} ` +
+            `${approved ? "approved" : "denied"}`,
+        );
+        held.resolve(approved);
         return true;
       }
-    } else {
-      // Unaddressed: the oldest outstanding request on this channel, matching
-      // the behaviour when only one approval could ever be pending.
-      for (const [key, held] of this.pending) {
-        if (held.entry.channelId === message.channelId) {
-          id = key;
-          break;
-        }
-      }
-      if (id === undefined) return false; // another channel's request — forward it
     }
-    const held = this.pending.get(id)!;
-    const approved = /^\s*(y|yes|yep|ok|okay|approve|allow|sure|do it)\b/i.test(body);
-    clearTimeout(held.timer);
-    this.pending.delete(id);
-    this.log(
-      `approval: reply "${message.content.slice(0, 24)}" → #${held.entry.ref} ` +
-        `${approved ? "approved" : "denied"}`,
-    );
-    held.resolve(approved);
-    return true;
+    // The nonce names no pending request from this sender on this channel
+    // (stale, wrong sender, or wrong channel): leave it for the agent — a
+    // non-answer never counts as consent.
+    return false;
   }
 }
 
@@ -389,7 +388,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // message from it, not on terminal-driven turns).
   let typingTimer: ReturnType<typeof setInterval> | undefined;
   let lastChannel:
-    | { channelType: ChannelMessage["channelType"]; channelId: string }
+    | { channelType: ChannelMessage["channelType"]; channelId: string; from: string }
     | undefined;
   let relayInputSinceIdle = false;
 
@@ -769,7 +768,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // indicator there while the agent works on it.
     const last = messages[messages.length - 1];
     if (last) {
-      lastChannel = { channelType: last.channelType, channelId: last.channelId };
+      lastChannel = { channelType: last.channelType, channelId: last.channelId, from: last.from };
       relayInputSinceIdle = true;
     }
     const c = ensureClient();
@@ -856,36 +855,47 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   async function requestApproval(
     toolName: string,
     input: Record<string, unknown>,
-    ch: { channelType: ChannelMessage["channelType"]; channelId: string },
+    ch: { channelType: ChannelMessage["channelType"]; channelId: string; from: string },
   ): Promise<boolean> {
     const c = ensureClient();
-    if (!c) return true; // can't ask → don't block
-    // Register the request FIRST so the question can carry its reference and
-    // so a reply can never arrive for a request the queue does not know about.
-    const { ref, promise, cancel } = approvals.add({
+    if (!c) {
+      // Fail CLOSED: if the relay client can't even be built to ask, deny. This
+      // is only reached on channel-driven turns, so a missing client means the
+      // relay is genuinely unavailable — never silently allow a gated tool.
+      log("approval: relay client unavailable — denying tool call");
+      return false;
+    }
+    // Register the request FIRST so the question can carry its nonce and so a
+    // reply can never arrive for a request the queue does not know about.
+    const { ref, nonce, promise, cancel } = approvals.add({
       channelId: ch.channelId,
+      from: ch.from,
       toolName,
     });
     const other = approvals.size - 1;
     const question = `⚠️ Approval needed — the agent wants to run:\n` +
       `${summarizeToolCall(toolName, input)}\n\n` +
-      `Reply "yes" to allow or "no" to deny (auto-denies in 5 min).` +
+      `Reply "yes ${nonce}" to allow or "no ${nonce}" to deny (auto-denies in 5 min).` +
       (other > 0
-        ? `\n\n(${approvals.size} approval requests are waiting — reply ` +
-          `"#${ref} yes" or "#${ref} no" to answer this one specifically.)`
+        ? `\n\n(${approvals.size} approval requests are waiting — each shows its own code; answer the one you mean.)`
         : "");
     try {
       if (ws?.connected) {
-        await ws.reply({ channelType: ch.channelType, channelId: ch.channelId, content: question });
+        try {
+          await ws.reply({ channelType: ch.channelType, channelId: ch.channelId, content: question });
+        } catch {
+          // WS ack timeout / dropped socket: one HTTP retry before denying.
+          await c.reply({ channelType: ch.channelType, channelId: ch.channelId, content: question });
+        }
       } else {
         await c.reply({ channelType: ch.channelType, channelId: ch.channelId, content: question });
       }
     } catch (err) {
-      // The question never reached anyone: drop this entry so it cannot consume
-      // a later message, and allow the tool call as before.
+      // Fail CLOSED: the question never reached anyone. Drop the entry and deny
+      // rather than silently allowing a gated tool with no human answer.
       cancel();
-      log(`approval: failed to send request, allowing by default: ${err instanceof Error ? err.message : String(err)}`);
-      return true;
+      log(`approval: failed to send request, denying: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
     }
     log(`approval: requested for ${toolName} via ${ch.channelType} (#${ref}); waiting for reply`);
     return await promise;
@@ -899,7 +909,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     for (const m of fresh) {
       // settle() consumes only messages answering an outstanding request on
       // that channel; everything else is forwarded to the agent as before.
-      if (approvals.settle({ channelId: m.channelId, content: m.content ?? "" })) continue;
+      if (approvals.settle({ channelId: m.channelId, from: m.from, content: m.content ?? "" })) continue;
       out.push(m);
     }
     return out;
@@ -1075,7 +1085,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         );
       }
       try {
-        const messages = await poller.poll();
+        const messages = consumeApprovalReplies(await poller.poll());
         const hydrated = await materializeInboundAttachments(c, messages);
         const modelAcceptsImages = ctx.model?.input?.includes("image") ?? false;
         return {

@@ -969,80 +969,108 @@ test("claimProfileLock: two processes racing the same profile — exactly one wi
   t.diagnostic(`race result: ${JSON.stringify(results)}`);
 });
 
-// ── pi-chaos-relay-abl: concurrent approvals each get their own decision ─────
+// ── pi-chaos-relay-abl / pi-chaos-relay-jqf: approval queue semantics ─────
 
-test("two concurrent approval requests resolve separately (no cross-resolve, no loss)", async () => {
-  const logs: string[] = [];
-  const q = new ApprovalQueue(60_000, (m) => logs.push(m));
-  const first = q.add({ channelId: "c1", toolName: "bash" });
-  const second = q.add({ channelId: "c1", toolName: "edit" });
-  assert.equal(q.size, 2, "both requests are outstanding");
-  assert.notEqual(first.ref, second.ref, "each request has its own reference");
+test("an approval is answered only by its nonce from the originating sender", async () => {
+  const q = new ApprovalQueue(60_000);
+  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  // The correct answer echoes the unguessable nonce from the same sender/channel.
+  assert.equal(
+    q.settle({ channelId: "c1", from: "alice", content: `yes ${req.nonce}` }),
+    true,
+    "consumed",
+  );
+  assert.equal(await req.promise, true);
+  assert.equal(q.size, 0);
+});
 
-  // Unaddressed reply → the OLDEST outstanding request on that channel.
-  assert.equal(q.settle({ channelId: "c1", content: "yes" }), true, "message consumed");
-  assert.equal(await first.promise, true, "the first call got the approval");
+test("an approval answer from a different sender is not consumed (forwarded)", async () => {
+  const q = new ApprovalQueue(60_000);
+  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  // A different participant on the same channel, even with the right nonce,
+  // cannot authorise — the message is forwarded to the agent, not consumed.
+  assert.equal(
+    q.settle({ channelId: "c1", from: "bob", content: `yes ${req.nonce}` }),
+    false,
+    "forwarded",
+  );
+  assert.equal(q.size, 1, "still pending");
+  // A different channel cannot answer it either.
+  assert.equal(
+    q.settle({ channelId: "c2", from: "alice", content: `yes ${req.nonce}` }),
+    false,
+    "forwarded (wrong channel)",
+  );
+  assert.equal(q.size, 1, "still pending");
+  // The originating sender can still answer.
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `yes ${req.nonce}` }), true);
+  assert.equal(await req.promise, true);
+});
+
+test("a malformed or nonce-less answer is not consent", async () => {
+  const q = new ApprovalQueue(60_000);
+  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  // Old-style answers (no nonce) never count.
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: "yes" }), false);
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: "ok" }), false);
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: "do it" }), false);
+  // A wrong nonce is not an answer either.
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: "yes deadbeef" }), false);
+  assert.equal(q.size, 1, "still pending after non-answers");
+  // "no <nonce>" denies.
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `no ${req.nonce}` }), true);
+  assert.equal(await req.promise, false);
+});
+
+test("two concurrent approvals resolve separately via their own nonces", async () => {
+  const q = new ApprovalQueue(60_000);
+  const first = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  const second = q.add({ channelId: "c1", from: "alice", toolName: "edit" });
+  assert.equal(q.size, 2);
+  assert.notEqual(first.nonce, second.nonce, "distinct nonces");
+
+  // Answer the SECOND first — the nonce disambiguates, no oldest-first rule.
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `no ${second.nonce}` }), true);
+  assert.equal(await second.promise, false);
   assert.equal(q.size, 1, "only the answered request was settled");
 
-  // Addressed reply → the request it names, even though it is not the oldest.
-  assert.equal(q.settle({ channelId: "c1", content: `#${second.ref} no` }), true);
-  assert.equal(await second.promise, false, "the second call got its own (denied) decision");
-  assert.equal(q.size, 0, "no request left behind");
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `yes ${first.nonce}` }), true);
+  assert.equal(await first.promise, true);
+  assert.equal(q.size, 0);
 });
 
 test("each approval request times out independently", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const logs: string[] = [];
   const q = new ApprovalQueue(60_000, (m) => logs.push(m));
-  const first = q.add({ channelId: "c1", toolName: "bash" });
+  const first = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
   t.mock.timers.tick(30_000);
-  const second = q.add({ channelId: "c1", toolName: "edit" });
+  const second = q.add({ channelId: "c1", from: "alice", toolName: "edit" });
 
   t.mock.timers.tick(30_000); // first reaches 60s; second is only 30s old
   assert.equal(await first.promise, false, "the older request auto-denied on its own timeout");
   assert.equal(q.size, 1, "the younger request was NOT wiped by the older one's timeout");
 
-  // …and the younger one is still answerable afterwards.
-  assert.equal(q.settle({ channelId: "c1", content: "yes" }), true);
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `yes ${second.nonce}` }), true);
   assert.equal(await second.promise, true, "the surviving request still gets its answer");
   assert.equal(q.size, 0);
-});
-
-test("approval replies are routed by channel and by reference", async () => {
-  const q = new ApprovalQueue(60_000);
-  const a = q.add({ channelId: "c1", toolName: "bash" });
-  const b = q.add({ channelId: "c2", toolName: "bash" });
-
-  // Another channel's message answers nothing here and must be forwarded.
-  assert.equal(q.settle({ channelId: "c3", content: "yes" }), false, "not consumed");
-  assert.equal(q.size, 2, "no request resolved by an unrelated channel");
-
-  // An explicit reference resolves that request, not the oldest.
-  assert.equal(q.settle({ channelId: "c2", content: `#${b.ref} yes` }), true);
-  assert.equal(await b.promise, true);
-  assert.equal(q.size, 1, "the c1 request is still waiting");
-
-  // A reference to nothing pending is consumed but resolves nothing.
-  assert.equal(q.settle({ channelId: "c1", content: "#999 yes" }), true, "consumed");
-  assert.equal(q.size, 1, "an unknown reference must not settle a real request");
-  assert.equal(q.settle({ channelId: "c1", content: "yes" }), true);
-  assert.equal(await a.promise, true, "the real request still settles normally");
 });
 
 test("cancel() drops a request that never reached the user", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const q = new ApprovalQueue(60_000);
-  const dropped = q.add({ channelId: "c1", toolName: "bash" });
+  const dropped = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
   dropped.cancel();
   assert.equal(q.size, 0, "the entry is gone");
   assert.equal(
-    q.settle({ channelId: "c1", content: "yes" }),
+    q.settle({ channelId: "c1", from: "alice", content: `yes ${dropped.nonce}` }),
     false,
     "a message no longer answers a cancelled request (it is forwarded to the agent)",
   );
   // Its timer cannot fire later and deny a different request.
-  const live = q.add({ channelId: "c1", toolName: "edit" });
+  const live = q.add({ channelId: "c1", from: "alice", toolName: "edit" });
   t.mock.timers.tick(120_000);
   assert.equal(q.size, 0);
   assert.equal(await live.promise, false, "the live request timed out on its own timer");
 });
+
