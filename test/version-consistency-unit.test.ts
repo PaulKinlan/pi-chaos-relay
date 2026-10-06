@@ -201,3 +201,49 @@ test("the guard also holds under --preserve-symlinks-main (import.meta.url keeps
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("the guard FAILS CLOSED when argv[1] exists but cannot be canonicalised", () => {
+  // The reviewer's finding: argv[1] present but realpathSync throwing made the
+  // guard return false, so Node exited 0 — a green gate that checked nothing,
+  // while the comment claimed it refused. Driven by doctoring argv[1] to an
+  // unresolvable path before importing the module (the raw-url comparison
+  // cannot match it, so the realpath path is reached).
+  const child = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `process.argv[1] = "/nonexistent/pi-chaos-relay/gate-that-cannot-resolve.mjs";\n` +
+        `await import(${JSON.stringify(SCRIPT.href)});\n` +
+        `process.stdout.write("imported-without-cli");`,
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(
+    child.status,
+    1,
+    `must refuse loudly rather than exiting 0: status=${child.status} stdout=${child.stdout} stderr=${child.stderr}`,
+  );
+  assert.match(child.stderr, /cannot resolve the invoked path/);
+  assert.match(child.stderr, /refusing to run/);
+  assert.equal(child.stdout, "", "the CLI must not have run");
+});
+
+test("a pure import (no argv[1]) still does not execute the CLI", () => {
+  // The fail-closed path must not swallow the legitimate import case the other
+  // tests depend on: no argv[1] means "imported", which stays false.
+  const child = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `delete process.argv[1];\n` +
+        `await import(${JSON.stringify(SCRIPT.href)});\n` +
+        `process.stdout.write("imported-without-cli");`,
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(child.status, 0, `status=${child.status} stderr=${child.stderr}`);
+  assert.equal(child.stdout, "imported-without-cli");
+  assert.equal(child.stderr, "", "no refusal for a plain import");
+});

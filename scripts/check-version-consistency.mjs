@@ -275,6 +275,8 @@ function main() {
 // comparison rather than skipping the check.
 function isEntryPoint() {
   const invoked = process.argv[1];
+  // No argv[1] means this module was IMPORTED, not run — never execute the CLI
+  // in that case (that is what lets the tests import the helpers).
   if (!invoked) return false;
   const raw = pathToFileURL(invoked).href;
   // Test the RAW url FIRST. Under --preserve-symlinks-main (or
@@ -285,11 +287,18 @@ function isEntryPoint() {
   if (import.meta.url === raw) return true;
   try {
     return import.meta.url === pathToFileURL(realpathSync(invoked)).href;
-  } catch {
-    // realpath unavailable (path deleted mid-run, exotic mount): the raw
-    // comparison above has already been tried, so there is nothing else to
-    // match against. Refuse to run rather than skipping the check silently.
-    return false;
+  } catch (err) {
+    // argv[1] EXISTS but cannot be canonicalised (deleted mid-run, unreadable
+    // parent, exotic mount). Returning false here would let Node exit 0 — a
+    // green gate that checked nothing — so FAIL CLOSED and say why. (An
+    // earlier version of this comment claimed that while the code quietly
+    // returned false: the comment was the bug.)
+    console.error(
+      `check-version-consistency: cannot resolve the invoked path ${invoked} ` +
+        `(${err instanceof Error ? err.message : String(err)}); refusing to run ` +
+        `rather than skipping the check`,
+    );
+    process.exit(1);
   }
 }
 
