@@ -114,26 +114,88 @@ function lockFilePath(profile: string): string {
 }
 
 function isProcessAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the process EXISTS but belongs to another user — treating
+    // that as "dead" would make the stale-lock cleanup unlink a live holder's
+    // lock. Only ESRCH (no such process) is genuinely dead.
+    return (err as { code?: string }).code === "EPERM";
+  }
 }
 
 /** Check if another live pi process holds the lock for this profile. */
-function checkProfileLock(profile: string): { locked: boolean; pid: number | null } {
-  const path = lockFilePath(profile);
-  if (!existsSync(path)) return { locked: false, pid: null };
+function readLockHolder(path: string): number | null {
   try {
     const pid = parseInt(readFileSync(path, "utf-8").trim(), 10);
-    if (isNaN(pid)) return { locked: false, pid: null };
-    if (pid !== process.pid && isProcessAlive(pid)) return { locked: true, pid };
-    // Stale lock (process died) — clean it
-    try { unlinkSync(path); } catch { /* ignore */ }
-    return { locked: false, pid: null };
-  } catch { return { locked: false, pid: null }; }
+    return Number.isNaN(pid) ? null : pid;
+  } catch {
+    return null;
+  }
 }
 
-/** Claim this profile for the current process. */
-function writeProfileLock(profile: string): void {
-  try { writeFileSync(lockFilePath(profile), String(process.pid)); } catch { /* ignore */ }
+/**
+ * Atomically claim `profile` for this process, BEFORE any connect or
+ * registration work.
+ *
+ * Why: the previous flow read the lock, awaited connectAsProfile() (which can
+ * perform a live relay registration), and only then wrote the lock with a
+ * plain writeFileSync — a TOCTOU window in which two pi processes starting
+ * together both observe "unlocked", both connect, and both write, so two live
+ * sessions share one relay identity and defeat the collision refusal.
+ *
+ * `flag: "wx"` is an exclusive create: exactly one of two racers can win, and
+ * the loser gets EEXIST instead of clobbering the winner. On EEXIST the holder
+ * is inspected — a live holder (a different pid that still exists) means
+ * refuse; a stale file (dead pid, unparseable, or our own pid) is removed and
+ * the exclusive create retried, bounded. There is NO path that overwrites a
+ * live holder's lock.
+ *
+ * `claimed: true` means this process may proceed (for the exotic case where
+ * the lock file cannot be created at all — see `lockError` — it proceeds
+ * without holding one, keeping the historical fail-open behaviour rather than
+ * breaking every session on an unwritable ~/.pi). `pid` is the holder's pid
+ * when the claim was refused, for the collision message.
+ */
+export function claimProfileLock(profile: string): {
+  claimed: boolean;
+  pid: number | null;
+  path: string;
+  lockError?: string;
+} {
+  const path = lockFilePath(profile);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      writeFileSync(path, String(process.pid), { flag: "wx", mode: 0o600 });
+      return { claimed: true, pid: process.pid, path };
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code !== "EEXIST") {
+        // Unexpected FS error (read-only ~/.pi, exotic mount): proceed without
+        // the lock, but report it so the caller can warn — never overwrite.
+        return {
+          claimed: true,
+          pid: null,
+          path,
+          lockError: err instanceof Error ? err.message : String(err),
+        };
+      }
+      const holder = readLockHolder(path);
+      if (holder !== null && holder !== process.pid && isProcessAlive(holder)) {
+        return { claimed: false, pid: holder, path };
+      }
+      // Stale (dead pid, garbage, or our own pid) — clear it and retry the
+      // exclusive create; a racing cleaner just means we see EEXIST again.
+      try {
+        unlinkSync(path);
+      } catch {
+        /* already gone / another process cleaned it */
+      }
+    }
+  }
+  // Lost the retry loop: a real collision, not a stale file.
+  return { claimed: false, pid: readLockHolder(path), path };
 }
 
 /** Release the profile lock on shutdown — but only a lock this process wrote.
@@ -150,6 +212,140 @@ function removeProfileLock(profile: string): void {
 /** Wrap text content into the AgentToolResult shape pi expects. */
 function textResult(text: string, details: unknown = {}) {
   return { content: [{ type: "text" as const, text }], details };
+}
+
+/** One outstanding tool-approval request. */
+export interface PendingApprovalEntry {
+  /** Short human-facing reference, shown to the user as `#<ref>`. */
+  ref: number;
+  channelId: string;
+  toolName: string;
+}
+
+/**
+ * Outstanding tool-approval requests, one entry each.
+ *
+ * Replaces the single global `pendingApproval` slot, whose failure modes were:
+ * a second gated tool call overwrote the first (the first was then un-resolvable),
+ * any entry's timeout resolved whichever promise the slot happened to hold and
+ * could wipe an unrelated second request (leaving it to hang forever), and a
+ * reply resolved whatever entry occupied the slot rather than the one asked
+ * about — so two concurrent gated calls could cross-resolve or lose one.
+ *
+ * Each request now owns its id, timer and resolver. A reply resolves the
+ * request it names (`#2 yes`) or, unaddressed, the OLDEST outstanding request
+ * on that channel — which is exactly the old single-request behaviour when only
+ * one is pending. Timers are independent: one request timing out denies only
+ * itself.
+ */
+export class ApprovalQueue {
+  private readonly pending = new Map<string, {
+    entry: PendingApprovalEntry;
+    resolve: (approved: boolean) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
+  private seq = 0;
+  // Declared and assigned explicitly: node runs this file in strip-only
+  // TypeScript mode, which does not support constructor parameter properties.
+  private readonly timeoutMs: number;
+  private readonly log: (message: string) => void;
+
+  constructor(timeoutMs: number, log: (message: string) => void = () => {}) {
+    this.timeoutMs = timeoutMs;
+    this.log = log;
+  }
+
+  /** Number of requests still awaiting an answer. */
+  get size(): number {
+    return this.pending.size;
+  }
+
+  /**
+   * Register a request and return the promise the tool call awaits, its
+   * user-facing `ref`, and a `cancel` for the caller's own failure path (e.g.
+   * the question could not be sent).
+   */
+  add(opts: { channelId: string; toolName: string }): {
+    ref: number;
+    promise: Promise<boolean>;
+    cancel: () => void;
+  } {
+    const ref = ++this.seq;
+    const id = `${opts.channelId}#${ref}`;
+    const entry: PendingApprovalEntry = { ref, channelId: opts.channelId, toolName: opts.toolName };
+    let settle!: (approved: boolean) => void;
+    const promise = new Promise<boolean>((resolve) => {
+      settle = resolve;
+    });
+    const timer = setTimeout(() => {
+      // Time out ONLY this request; another's answer cannot satisfy it, and its
+      // timeout cannot touch another request.
+      if (!this.pending.delete(id)) return;
+      this.log(`approval: request #${ref} (${opts.toolName}) timed out → denied`);
+      settle(false);
+    }, this.timeoutMs);
+    if (typeof timer.unref === "function") timer.unref();
+    this.pending.set(id, { entry, resolve: settle, timer });
+    return {
+      ref,
+      promise,
+      cancel: () => {
+        const held = this.pending.get(id);
+        if (!held) return;
+        clearTimeout(held.timer);
+        this.pending.delete(id);
+      },
+    };
+  }
+
+  /**
+   * Try to consume `message` as an answer to an outstanding request. Returns
+   * true when the message was consumed (so the caller does not forward it to
+   * the agent), false when it answers nothing pending here.
+   */
+  settle(message: { channelId: string; content: string }): boolean {
+    if (this.pending.size === 0) return false;
+    const addressed = /^\s*#(\d+)\b/.exec(message.content);
+    let id: string | undefined;
+    let body = message.content;
+    if (addressed) {
+      const ref = Number(addressed[1]);
+      // An addressed reply wins only if that request is outstanding on this
+      // channel; otherwise it is consumed (the user meant to answer something)
+      // but resolves nothing, and the request keeps waiting for its own answer.
+      for (const [key, held] of this.pending) {
+        if (held.entry.ref === ref && held.entry.channelId === message.channelId) {
+          id = key;
+          break;
+        }
+      }
+      body = message.content.slice(addressed[0].length);
+      if (id === undefined) {
+        this.log(`approval: reply addresses #${ref}, which is not pending on this channel — ignored`);
+        return true;
+      }
+    } else {
+      // Unaddressed: the oldest outstanding request on this channel, matching
+      // the behaviour when only one approval could ever be pending.
+      for (const [key, held] of this.pending) {
+        if (held.entry.channelId === message.channelId) {
+          id = key;
+          break;
+        }
+      }
+      if (id === undefined) return false; // another channel's request — forward it
+    }
+    const held = this.pending.get(id)!;
+    const approved = /^\s*(y|yes|yep|ok|okay|approve|allow|sure|do it)\b/i.test(body);
+    clearTimeout(held.timer);
+    this.pending.delete(id);
+    this.log(
+      `approval: reply "${message.content.slice(0, 24)}" → #${held.entry.ref} ` +
+        `${approved ? "approved" : "denied"}`,
+    );
+    held.resolve(approved);
+    return true;
+  }
 }
 
 /**
@@ -632,9 +828,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // is consumed as the yes/no answer (it is not forwarded to the agent).
   const APPROVAL_TIMEOUT_MS = 5 * 60 * 1000;
   const RISKY_WRITE_TOOLS = new Set(["bash", "edit", "write"]);
-  let pendingApproval:
-    | { channelId: string; resolve: (approved: boolean) => void; timer: ReturnType<typeof setTimeout> }
-    | undefined;
+  // One entry per outstanding request, each with its own timer and resolver.
+  // (A single global slot let a second gated call overwrite the first, let any
+  // entry's timeout resolve the wrong promise, and could leave one request
+  // hanging forever — see the ApprovalQueue doc comment.)
+  const approvals = new ApprovalQueue(APPROVAL_TIMEOUT_MS, (m) => log(m));
 
   function approvalNeeded(toolName: string): boolean {
     if (cfg.approvalMode === "off") return false;
@@ -662,9 +860,20 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   ): Promise<boolean> {
     const c = ensureClient();
     if (!c) return true; // can't ask → don't block
+    // Register the request FIRST so the question can carry its reference and
+    // so a reply can never arrive for a request the queue does not know about.
+    const { ref, promise, cancel } = approvals.add({
+      channelId: ch.channelId,
+      toolName,
+    });
+    const other = approvals.size - 1;
     const question = `⚠️ Approval needed — the agent wants to run:\n` +
       `${summarizeToolCall(toolName, input)}\n\n` +
-      `Reply "yes" to allow or "no" to deny (auto-denies in 5 min).`;
+      `Reply "yes" to allow or "no" to deny (auto-denies in 5 min).` +
+      (other > 0
+        ? `\n\n(${approvals.size} approval requests are waiting — reply ` +
+          `"#${ref} yes" or "#${ref} no" to answer this one specifically.)`
+        : "");
     try {
       if (ws?.connected) {
         await ws.reply({ channelType: ch.channelType, channelId: ch.channelId, content: question });
@@ -672,39 +881,25 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         await c.reply({ channelType: ch.channelType, channelId: ch.channelId, content: question });
       }
     } catch (err) {
+      // The question never reached anyone: drop this entry so it cannot consume
+      // a later message, and allow the tool call as before.
+      cancel();
       log(`approval: failed to send request, allowing by default: ${err instanceof Error ? err.message : String(err)}`);
       return true;
     }
-    log(`approval: requested for ${toolName} via ${ch.channelType}; waiting for reply`);
-    return await new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => {
-        if (pendingApproval) {
-          pendingApproval = undefined;
-          log("approval: timed out → denied");
-          resolve(false);
-        }
-      }, APPROVAL_TIMEOUT_MS);
-      if (typeof timer.unref === "function") timer.unref();
-      pendingApproval = { channelId: ch.channelId, resolve, timer };
-    });
+    log(`approval: requested for ${toolName} via ${ch.channelType} (#${ref}); waiting for reply`);
+    return await promise;
   }
 
   /** If an approval is pending, consume the answering message from `fresh`
-   * (so it is not forwarded to the agent) and resolve the approval. */
+   * (so it is not forwarded to the agent) and resolve that approval. */
   function consumeApprovalReplies(fresh: ChannelMessage[]): ChannelMessage[] {
-    if (!pendingApproval) return fresh;
+    if (approvals.size === 0) return fresh;
     const out: ChannelMessage[] = [];
     for (const m of fresh) {
-      if (pendingApproval && m.channelId === pendingApproval.channelId) {
-        const approved = /^\s*(y|yes|yep|ok|okay|approve|allow|sure|do it)\b/i
-          .test(m.content ?? "");
-        clearTimeout(pendingApproval.timer);
-        const resolve = pendingApproval.resolve;
-        pendingApproval = undefined;
-        log(`approval: reply "${(m.content ?? "").slice(0, 24)}" → ${approved ? "approved" : "denied"}`);
-        resolve(approved);
-        continue; // consume — do not forward to the agent
-      }
+      // settle() consumes only messages answering an outstanding request on
+      // that channel; everything else is forwarded to the agent as before.
+      if (approvals.settle({ channelId: m.channelId, content: m.content ?? "" })) continue;
       out.push(m);
     }
     return out;
@@ -779,12 +974,22 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // relay session the operator never chose — and one per collision, unbounded.
     // Refuse instead: name the profile and its lock file, and stay on the
     // previous profile (or unbound) rather than silently switching identity.
-    const lock = checkProfileLock(chosenProfile);
+    // Claim the profile ATOMICALLY, before any connect or registration. The
+    // exclusive create means exactly one of two racing processes can win, so
+    // the collision refusal can no longer be defeated by the TOCTOU that
+    // existed when the lock was written only after an awaited connect.
+    const claim = claimProfileLock(chosenProfile);
+    if (claim.lockError) {
+      log(
+        `session ${event.reason}: could not create the profile lock (${claim.lockError}) — ` +
+          `continuing without one; concurrent sessions on this profile cannot be detected`,
+      );
+    }
     const decision = resolveProfileLockCollision({
       profile: chosenProfile,
-      locked: lock.locked,
-      pid: lock.pid,
-      lockPath: lockFilePath(chosenProfile),
+      locked: !claim.claimed,
+      pid: claim.pid,
+      lockPath: claim.path,
     });
     if (decision.action === "refuse") {
       log(`session ${event.reason}: ${decision.message}`);
@@ -795,9 +1000,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
     const result = await connectAsProfile(profile, (m) => ctx.ui.notify(m, "warning"));
     if (!result.connected) {
+      // The profile stays claimed: this session selected the identity, and the
+      // poller keeps retrying. Releasing it here would reopen the race.
       log(`session ${event.reason}: selected profile "${profile}" but couldn't connect (will retry on next poll)`);
     } else {
-      writeProfileLock(profile);
       log(`session ${event.reason}: connected as profile "${profile}"`);
     }
   });
