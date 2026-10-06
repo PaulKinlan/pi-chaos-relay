@@ -32,9 +32,10 @@
  *     local branch named `origin/master` can silently become the base. Pass a
  *     fully-qualified ref (`refs/remotes/origin/master`) to make it unambiguous.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const USAGE = "usage: node scripts/check-version-consistency.mjs --base <git-ref> [--dir <path>]";
 
@@ -70,16 +71,61 @@ function parseArgs(argv) {
   return opts;
 }
 
-/** Numeric comparison of dot-separated versions. Returns >0, 0 or <0. */
+/**
+ * Split a version into its numeric release segments and its prerelease
+ * identifiers. Build metadata (`+...`) is ignored, as semver specifies.
+ */
+function parseVersion(v) {
+  const withoutBuild = String(v).split("+")[0];
+  const dash = withoutBuild.indexOf("-");
+  const release = dash === -1 ? withoutBuild : withoutBuild.slice(0, dash);
+  const prerelease =
+    dash === -1 ? [] : withoutBuild.slice(dash + 1).split(".").filter((id) => id !== "");
+  return { parts: release.split(".").map((part) => Number.parseInt(part, 10) || 0), prerelease };
+}
+
+/**
+ * Compare two versions with semver precedence. Returns >0, 0 or <0.
+ *
+ * Release segments compare numerically with missing segments treated as zero
+ * ("1.0" === "1.0.0"), and a malformed segment folds to zero through
+ * `parseInt(...) || 0` rather than throwing — this runs in a gate, where a
+ * surprising-but-comparable value beats a crash.
+ *
+ * A PRERELEASE SORTS BELOW ITS RELEASE ("1.0.0-beta" < "1.0.0", semver §11),
+ * and two prereleases compare identifier by identifier: numeric identifiers
+ * numerically, numeric before alphanumeric, alphanumeric lexically, and fewer
+ * identifiers first when all preceding ones are equal. Build metadata is
+ * ignored for precedence.
+ */
 export function compareVersions(a, b) {
-  const split = (v) => String(v).split(".").map((part) => Number.parseInt(part, 10) || 0);
-  const left = split(a);
-  const right = split(b);
-  const length = Math.max(left.length, right.length);
+  const left = parseVersion(a);
+  const right = parseVersion(b);
+  const length = Math.max(left.parts.length, right.parts.length);
   for (let i = 0; i < length; i += 1) {
-    const l = left[i] ?? 0;
-    const r = right[i] ?? 0;
+    const l = left.parts[i] ?? 0;
+    const r = right.parts[i] ?? 0;
     if (l !== r) return l - r;
+  }
+  if (left.prerelease.length === 0 && right.prerelease.length === 0) return 0;
+  if (left.prerelease.length === 0) return 1; // a release outranks a prerelease
+  if (right.prerelease.length === 0) return -1; // a prerelease is below its release
+  const count = Math.max(left.prerelease.length, right.prerelease.length);
+  for (let i = 0; i < count; i += 1) {
+    const l = left.prerelease[i];
+    const r = right.prerelease[i];
+    if (l === undefined) return -1; // fewer identifiers sorts lower
+    if (r === undefined) return 1;
+    const lNumeric = /^\d+$/.test(l);
+    const rNumeric = /^\d+$/.test(r);
+    if (lNumeric && rNumeric) {
+      const diff = Number(l) - Number(r);
+      if (diff !== 0) return diff;
+    } else if (lNumeric !== rNumeric) {
+      return lNumeric ? -1 : 1; // numeric identifiers sort before alphanumeric
+    } else if (l !== r) {
+      return l < r ? -1 : 1;
+    }
   }
   return 0;
 }
@@ -155,62 +201,86 @@ function readBaseVersion(dir, base, problems) {
   }
 }
 
-const opts = parseArgs(process.argv.slice(2));
-const dir = resolve(opts.dir);
-const problems = [];
+function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  const dir = resolve(opts.dir);
+  const problems = [];
 
-const pkg = readJson(dir, "package.json", problems);
-const lock = readJson(dir, "package-lock.json", problems);
+  const pkg = readJson(dir, "package.json", problems);
+  const lock = readJson(dir, "package-lock.json", problems);
 
-const pkgVersion = pkg?.version;
-const lockTop = lock?.version;
-const lockRoot = lock?.packages?.[""]?.version;
+  const pkgVersion = pkg?.version;
+  const lockTop = lock?.version;
+  const lockRoot = lock?.packages?.[""]?.version;
 
-if (pkg && (typeof pkgVersion !== "string" || pkgVersion === "")) {
-  problems.push("package.json has no version");
-}
-if (lock && (typeof lockTop !== "string" || lockTop === "")) {
-  problems.push("package-lock.json has no top-level version");
-}
-if (lock && (typeof lockRoot !== "string" || lockRoot === "")) {
-  problems.push('package-lock.json has no version at packages[""]');
-}
-if (typeof pkgVersion === "string" && typeof lockTop === "string" && pkgVersion !== lockTop) {
-  problems.push(`package.json (${pkgVersion}) != package-lock.json top-level (${lockTop})`);
-}
-if (typeof pkgVersion === "string" && typeof lockRoot === "string" && pkgVersion !== lockRoot) {
-  problems.push(`package.json (${pkgVersion}) != package-lock.json packages[""] (${lockRoot})`);
+  if (pkg && (typeof pkgVersion !== "string" || pkgVersion === "")) {
+    problems.push("package.json has no version");
+  }
+  if (lock && (typeof lockTop !== "string" || lockTop === "")) {
+    problems.push("package-lock.json has no top-level version");
+  }
+  if (lock && (typeof lockRoot !== "string" || lockRoot === "")) {
+    problems.push('package-lock.json has no version at packages[""]');
+  }
+  if (typeof pkgVersion === "string" && typeof lockTop === "string" && pkgVersion !== lockTop) {
+    problems.push(`package.json (${pkgVersion}) != package-lock.json top-level (${lockTop})`);
+  }
+  if (typeof pkgVersion === "string" && typeof lockRoot === "string" && pkgVersion !== lockRoot) {
+    problems.push(`package.json (${pkgVersion}) != package-lock.json packages[""] (${lockRoot})`);
+  }
+
+  // Ambiguity guard: refuse rather than resolve a bare name by git's precedence.
+  const ambiguous = ambiguousBaseRefs(dir, opts.base);
+  let baseVersion;
+  if (ambiguous.length > 1) {
+    problems.push(
+      `base ref '${opts.base}' is AMBIGUOUS: it resolves to ${ambiguous.join(" and ")}, and git ` +
+        "picks one of them by precedence (refs/heads before refs/remotes) with only a warning. " +
+        "Refusing rather than comparing against a ref you may not have meant; pass a " +
+        `fully-qualified ref, e.g. refs/remotes/${opts.base}`,
+    );
+  } else {
+    baseVersion = readBaseVersion(dir, opts.base, problems);
+    if (
+      baseVersion !== undefined &&
+      typeof pkgVersion === "string" &&
+      compareVersions(pkgVersion, baseVersion) < 0
+    ) {
+      problems.push(`version ${pkgVersion} is BELOW ${opts.base} (${baseVersion})`);
+    }
+  }
+
+  const summary =
+    `package.json=${pkgVersion ?? "?"}, package-lock.json=${lockTop ?? "?"}, ` +
+    `packages[""]=${lockRoot ?? "?"}, ${opts.base}=${baseVersion ?? "?"}`;
+
+  if (problems.length > 0) {
+    for (const problem of problems) console.error(`check-version-consistency: ${problem}`);
+    console.error(`check-version-consistency: FAILED (${summary})`);
+    process.exit(1);
+  }
+
+  console.log(`check-version-consistency: OK (${summary})`);
 }
 
-// Ambiguity guard: refuse rather than resolve a bare name by git's precedence.
-const ambiguous = ambiguousBaseRefs(dir, opts.base);
-let baseVersion;
-if (ambiguous.length > 1) {
-  problems.push(
-    `base ref '${opts.base}' is AMBIGUOUS: it resolves to ${ambiguous.join(" and ")}, and git ` +
-      "picks one of them by precedence (refs/heads before refs/remotes) with only a warning. " +
-      "Refusing rather than comparing against a ref you may not have meant; pass a " +
-      `fully-qualified ref, e.g. refs/remotes/${opts.base}`,
-  );
-} else {
-  baseVersion = readBaseVersion(dir, opts.base, problems);
-  if (
-    baseVersion !== undefined &&
-    typeof pkgVersion === "string" &&
-    compareVersions(pkgVersion, baseVersion) < 0
-  ) {
-    problems.push(`version ${pkgVersion} is BELOW ${opts.base} (${baseVersion})`);
+// Execute the CLI only when this file is the entry point, so the module can be
+// imported (by tests) without running parseArgs and exiting on import.
+//
+// process.argv[1] must be CANONICALIZED before comparing: Node resolves
+// import.meta.url through symlinks but leaves argv[1] as the path the caller
+// typed, so invoking this script through a symlink used to compare the
+// symlink's URL against the real module URL, skip main(), and exit 0 — a
+// SILENT gate bypass (a green gate that checked nothing). realpathSync fixes
+// that; if it fails (path deleted mid-run, exotic mount) fall back to the plain
+// comparison rather than skipping the check.
+function isEntryPoint() {
+  const invoked = process.argv[1];
+  if (!invoked) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(invoked)).href;
+  } catch {
+    return import.meta.url === pathToFileURL(invoked).href;
   }
 }
 
-const summary =
-  `package.json=${pkgVersion ?? "?"}, package-lock.json=${lockTop ?? "?"}, ` +
-  `packages[""]=${lockRoot ?? "?"}, ${opts.base}=${baseVersion ?? "?"}`;
-
-if (problems.length > 0) {
-  for (const problem of problems) console.error(`check-version-consistency: ${problem}`);
-  console.error(`check-version-consistency: FAILED (${summary})`);
-  process.exit(1);
-}
-
-console.log(`check-version-consistency: OK (${summary})`);
+if (isEntryPoint()) main();
