@@ -27,8 +27,8 @@ import {
   mimeForFile,
   type ReplyAttachment,
 } from "./relay-client.ts";
+import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, appendFileSync, chmodSync, mkdirSync, existsSync, writeFileSync, unlinkSync, statSync } from "node:fs";
-import { createHash } from "node:crypto";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -410,7 +410,12 @@ export interface PendingApprovalEntry {
   /** Short human-facing reference, shown to the user as `#<ref>`. */
   ref: number;
   channelId: string;
+  /** Sender of the message that triggered the gated turn. Only this sender can
+   *  answer; a different participant's message is not consumed. */
+  from: string;
   toolName: string;
+  /** Unguessable token the user must echo back, shown in the prompt. */
+  nonce: string;
 }
 
 /**
@@ -424,10 +429,12 @@ export interface PendingApprovalEntry {
  * about — so two concurrent gated calls could cross-resolve or lose one.
  *
  * Each request now owns its id, timer and resolver. A reply resolves the
- * request it names (`#2 yes`) or, unaddressed, the OLDEST outstanding request
- * on that channel — which is exactly the old single-request behaviour when only
- * one is pending. Timers are independent: one request timing out denies only
- * itself.
+ * request it names — by nonce (`yes <nonce>`) or by reference (`#2: yes`) — and
+ * only when it comes from the channel AND sender the request was asked on. An
+ * unaddressed reply (a bare `yes`/`ok`) is never consent: it is forwarded to the
+ * agent like any other message, as is a reference that names no request still
+ * outstanding for that sender. Timers are independent: one request timing out
+ * denies only itself.
  */
 export class ApprovalQueue {
   private readonly pending = new Map<string, {
@@ -456,14 +463,22 @@ export class ApprovalQueue {
    * user-facing `ref`, and a `cancel` for the caller's own failure path (e.g.
    * the question could not be sent).
    */
-  add(opts: { channelId: string; toolName: string }): {
+  add(opts: { channelId: string; from: string; toolName: string }): {
     ref: number;
+    nonce: string;
     promise: Promise<boolean>;
     cancel: () => void;
   } {
     const ref = ++this.seq;
+    const nonce = randomBytes(6).toString("hex");
     const id = `${opts.channelId}#${ref}`;
-    const entry: PendingApprovalEntry = { ref, channelId: opts.channelId, toolName: opts.toolName };
+    const entry: PendingApprovalEntry = {
+      ref,
+      channelId: opts.channelId,
+      from: opts.from,
+      toolName: opts.toolName,
+      nonce,
+    };
     let settle!: (approved: boolean) => void;
     const promise = new Promise<boolean>((resolve) => {
       settle = resolve;
@@ -479,6 +494,7 @@ export class ApprovalQueue {
     this.pending.set(id, { entry, resolve: settle, timer });
     return {
       ref,
+      nonce,
       promise,
       cancel: () => {
         const held = this.pending.get(id);
@@ -494,8 +510,41 @@ export class ApprovalQueue {
    * true when the message was consumed (so the caller does not forward it to
    * the agent), false when it answers nothing pending here.
    */
-  settle(message: { channelId: string; content: string }): boolean {
+  settle(message: { channelId: string; from: string; content: string }): boolean {
     if (this.pending.size === 0) return false;
+    // Two accepted answer forms, and both must keep working:
+    //  (1) the nonce form — "yes <nonce>" / "no <nonce>" — which binds the answer
+    //      to one exact request AND to the channel and sender it was asked on, so
+    //      a bare yes/no from anywhere is never consent;
+    //  (2) the reference form — "#2: yes", "#2 - yes", "#2, no" — punctuation
+    //      tolerated (the original /^\s*#(\d+)\b/ read "#2: yes" as a denial),
+    //      resolved against the request that reference names on this channel, and
+    //      also bound to the sender who was asked.
+    const answer = /^\s*(yes|no)\s+([0-9a-f]+)[.!]?\s*$/i.exec(message.content);
+    if (answer) {
+      const nonce = answer[2].toLowerCase();
+      for (const [key, held] of this.pending) {
+        if (
+          held.entry.nonce === nonce &&
+          held.entry.channelId === message.channelId &&
+          held.entry.from === message.from
+        ) {
+          clearTimeout(held.timer);
+          this.pending.delete(key);
+          const approved = answer[1].toLowerCase() === "yes";
+          this.log(
+            `approval: reply "${message.content.slice(0, 24)}" → #${held.entry.ref} ` +
+              `${approved ? "approved" : "denied"}`,
+          );
+          held.resolve(approved);
+          return true;
+        }
+      }
+      // The nonce names no pending request from this sender on this channel
+      // (stale, wrong sender, or wrong channel): leave it for the agent — a
+      // non-answer never counts as consent.
+      return false;
+    }
     // The reference may be followed by punctuation rather than a bare space —
     // "#2: yes", "#2 - yes", "#2, no" are all answers. Requiring whitespace
     // only (the original /^\s*#(\d+)\b/) sent the remainder ": yes" to the
@@ -507,29 +556,33 @@ export class ApprovalQueue {
     if (addressed) {
       const ref = Number(addressed[1]);
       // An addressed reply wins only if that request is outstanding on this
-      // channel; otherwise it is consumed (the user meant to answer something)
-      // but resolves nothing, and the request keeps waiting for its own answer.
+      // channel for this sender; otherwise it is consumed (the user meant to
+      // answer something) but resolves nothing, and the request keeps waiting
+      // for its own answer.
       for (const [key, held] of this.pending) {
-        if (held.entry.ref === ref && held.entry.channelId === message.channelId) {
+        if (
+          held.entry.ref === ref &&
+          held.entry.channelId === message.channelId &&
+          held.entry.from === message.from
+        ) {
           id = key;
           break;
         }
       }
       body = message.content.slice(addressed[0].length);
       if (id === undefined) {
-        this.log(`approval: reply addresses #${ref}, which is not pending on this channel — ignored`);
-        return true;
+        // Names a request that is not outstanding HERE for this sender (stale,
+        // another channel, or another sender's request): not an answer, so
+        // forward it rather than swallowing somebody else's message.
+        this.log(`approval: reply addresses #${ref}, which is not pending for this sender on this channel — forwarded`);
+        return false;
       }
     } else {
-      // Unaddressed: the oldest outstanding request on this channel, matching
-      // the behaviour when only one approval could ever be pending.
-      for (const [key, held] of this.pending) {
-        if (held.entry.channelId === message.channelId) {
-          id = key;
-          break;
-        }
-      }
-      if (id === undefined) return false; // another channel's request — forward it
+      // Unaddressed ("yes", "ok", "do it", a stray nonce): NEVER consent. Only an
+      // answer that names the request — its nonce or its "#N" reference — is tied
+      // to a specific outstanding question, so a bare yes/no is forwarded to the
+      // agent like any other message.
+      return false;
     }
     const held = this.pending.get(id)!;
     const approved = /^\s*(y|yes|yep|ok|okay|approve|allow|sure|do it)\b/i.test(body);
@@ -584,10 +637,20 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // only show "typing" in the channel when the agent is actually working on a
   // message from it, not on terminal-driven turns).
   let typingTimer: ReturnType<typeof setInterval> | undefined;
-  let lastChannel:
-    | { channelType: ChannelMessage["channelType"]; channelId: string }
+  /** FIFO of relay turn origins, one per delivered relay turn. The agent can be
+   *  busy when a message arrives — its followUp becomes a LATER turn that must
+   *  still carry the origin — so a boolean "relay input since idle" cannot
+   *  represent queued turns. */
+  let pendingOrigins: {
+    channelType: ChannelMessage["channelType"];
+    channelId: string;
+    from: string;
+  }[] = [];
+  /** The CURRENT turn's origin, shifted from the queue at turn start and dropped
+   *  at turn end. A gated tool call asks — and is answered by — this. */
+  let activeTurn:
+    | { channelType: ChannelMessage["channelType"]; channelId: string; from: string }
     | undefined;
-  let relayInputSinceIdle = false;
 
   /**
    * Re-register with the persisted keypair to recover a working apiKey after a
@@ -1041,13 +1104,6 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
    * examples (reload-runtime, git-merge-and-resolve).
    */
   async function deliverToAgent(messages: ChannelMessage[]): Promise<void> {
-    // Remember where the latest message came from so we can show a typing
-    // indicator there while the agent works on it.
-    const last = messages[messages.length - 1];
-    if (last) {
-      lastChannel = { channelType: last.channelType, channelId: last.channelId };
-      relayInputSinceIdle = true;
-    }
     const c = ensureClient();
     const hydrated = c
       ? await materializeInboundAttachments(c, messages)
@@ -1057,6 +1113,32 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const content = includesImages
       ? [{ type: "text" as const, text }, ...hydrated.images]
       : text;
+
+    // Enqueue this turn's origin only now that hydration has succeeded and the
+    // followUp is about to be delivered. A batch can mix channels/senders;
+    // attribute it to the FIRST (earliest) message — the one that initiated the
+    // turn — and warn so a mixed batch is never silently attributed to the last
+    // message. (Pre-1.0 decision: earliest-origin + warning; the per-origin
+    // delivery follow-up is deferred.) Enqueueing here, not before the await,
+    // keeps one queue entry per delivered turn: a hydration failure (or a turn
+    // that starts during a slow hydration) can never consume or shift an origin
+    // that was never actually delivered.
+    const first = messages[0];
+    if (first) {
+      pendingOrigins.push({
+        channelType: first.channelType,
+        channelId: first.channelId,
+        from: first.from,
+      });
+      const distinct = new Set(messages.map((m) => `${m.channelId}\u0000${m.from}`));
+      if (distinct.size > 1) {
+        log(
+          `WARN: a delivery batch mixes ${distinct.size} channel/sender origins — ` +
+            `attributing the turn to the earliest (${first.from} on ${first.channelId})`,
+        );
+      }
+    }
+
     try {
       pi.sendUserMessage(content, { deliverAs: "followUp" });
     } catch (err) {
@@ -1081,10 +1163,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   /** Repeatedly send a "typing" indicator to the active channel until stopped. */
   function startTyping(): void {
     stopTyping();
-    if (!relayInputSinceIdle || !lastChannel) return;
+    if (!activeTurn) return;
     const c = ensureClient();
     if (!c) return;
-    const ch = lastChannel;
+    const ch = activeTurn;
     const ping = () => void c.sendTyping(ch.channelType, ch.channelId);
     ping(); // immediate, then refresh before Telegram's ~5s expiry
     typingTimer = setInterval(ping, 4000);
@@ -1132,36 +1214,47 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   async function requestApproval(
     toolName: string,
     input: Record<string, unknown>,
-    ch: { channelType: ChannelMessage["channelType"]; channelId: string },
+    ch: { channelType: ChannelMessage["channelType"]; channelId: string; from: string },
   ): Promise<boolean> {
     const c = ensureClient();
-    if (!c) return true; // can't ask → don't block
-    // Register the request FIRST so the question can carry its reference and
-    // so a reply can never arrive for a request the queue does not know about.
-    const { ref, promise, cancel } = approvals.add({
+    if (!c) {
+      // Fail CLOSED: if the relay client can't even be built to ask, deny. This
+      // is only reached on channel-driven turns, so a missing client means the
+      // relay is genuinely unavailable — never silently allow a gated tool.
+      log("approval: relay client unavailable — denying tool call");
+      return false;
+    }
+    // Register the request FIRST so the question can carry its nonce and so a
+    // reply can never arrive for a request the queue does not know about.
+    const { ref, nonce, promise, cancel } = approvals.add({
       channelId: ch.channelId,
+      from: ch.from,
       toolName,
     });
     const other = approvals.size - 1;
     const question = `⚠️ Approval needed — the agent wants to run:\n` +
       `${summarizeToolCall(toolName, input)}\n\n` +
-      `Reply "yes" to allow or "no" to deny (auto-denies in 5 min).` +
+      `Reply "yes ${nonce}" to allow or "no ${nonce}" to deny (auto-denies in 5 min).` +
       (other > 0
-        ? `\n\n(${approvals.size} approval requests are waiting — reply ` +
-          `"#${ref} yes" or "#${ref} no" to answer this one specifically.)`
+        ? `\n\n(${approvals.size} approval requests are waiting — each shows its own code; answer the one you mean.)`
         : "");
     try {
       if (ws?.connected) {
-        await ws.reply({ channelType: ch.channelType, channelId: ch.channelId, content: question });
+        try {
+          await ws.reply({ channelType: ch.channelType, channelId: ch.channelId, content: question });
+        } catch {
+          // WS ack timeout / dropped socket: one HTTP retry before denying.
+          await c.reply({ channelType: ch.channelType, channelId: ch.channelId, content: question });
+        }
       } else {
         await c.reply({ channelType: ch.channelType, channelId: ch.channelId, content: question });
       }
     } catch (err) {
-      // The question never reached anyone: drop this entry so it cannot consume
-      // a later message, and allow the tool call as before.
+      // Fail CLOSED: the question never reached anyone. Drop the entry and deny
+      // rather than silently allowing a gated tool with no human answer.
       cancel();
-      log(`approval: failed to send request, allowing by default: ${err instanceof Error ? err.message : String(err)}`);
-      return true;
+      log(`approval: failed to send request, denying: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
     }
     log(`approval: requested for ${toolName} via ${ch.channelType} (#${ref}); waiting for reply`);
     return await promise;
@@ -1175,7 +1268,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     for (const m of fresh) {
       // settle() consumes only messages answering an outstanding request on
       // that channel; everything else is forwarded to the agent as before.
-      if (approvals.settle({ channelId: m.channelId, content: m.content ?? "" })) continue;
+      if (approvals.settle({ channelId: m.channelId, from: m.from, content: m.content ?? "" })) continue;
       out.push(m);
     }
     return out;
@@ -1230,6 +1323,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // --- Lifecycle: start/stop the background poller with the session ----------
 
   pi.on("session_start", async (event, ctx) => {
+    // A new session must never inherit turn-origin state from a previous one:
+    // clear pending origins and the active turn before any async work, so a
+    // concurrent turn cannot shift a stale origin into a fresh session.
+    pendingOrigins = [];
+    activeTurn = undefined;
     if (poller) poller.reset();
     if (attachmentCleanupTimer) clearInterval(attachmentCleanupTimer);
     await cleanupStaleInboundAttachments();
@@ -1287,6 +1385,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => {
     stopPolling();
     stopTyping();
+    // Drop any undelivered turn origins so the next session starts clean.
+    pendingOrigins = [];
+    activeTurn = undefined;
     if (attachmentCleanupTimer) {
       clearInterval(attachmentCleanupTimer);
       attachmentCleanupTimer = undefined;
@@ -1300,10 +1401,14 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
   // Show a "typing" indicator in the active channel while the agent works on a
   // relay-delivered message, and clear it when the run finishes.
-  pi.on("agent_start", () => startTyping());
+  pi.on("agent_start", () => {
+    // Shift this turn's origin off the queue (a terminal/local turn has none).
+    activeTurn = pendingOrigins.shift() ?? undefined;
+    startTyping();
+  });
   pi.on("agent_end", () => {
     stopTyping();
-    relayInputSinceIdle = false;
+    activeTurn = undefined;
   });
 
   // Tool approval: when enabled and the turn came from a channel, pause risky
@@ -1311,19 +1416,19 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   pi.on("tool_call", async (event) => {
     if (!approvalNeeded(event.toolName)) return; // allow
     // Only gate turns driven from a channel — terminal/local use is unaffected.
-    if (!relayInputSinceIdle || !lastChannel) return;
+    if (!activeTurn) return;
     // Pause the typing indicator while we wait on the human.
     stopTyping();
     const approved = await requestApproval(
       event.toolName,
       event.input as Record<string, unknown>,
-      lastChannel,
+      activeTurn,
     );
     if (!approved) {
       return {
         block: true,
         reason:
-          `The user denied this ${event.toolName} call over ${lastChannel.channelType}. ` +
+          `The user denied this ${event.toolName} call over ${activeTurn.channelType}. ` +
           `Do not retry it; ask them what to do instead.`,
       };
     }
@@ -1351,7 +1456,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         );
       }
       try {
-        const messages = await poller.poll();
+        const messages = consumeApprovalReplies(await poller.poll());
         const hydrated = await materializeInboundAttachments(c, messages);
         const modelAcceptsImages = ctx.model?.input?.includes("image") ?? false;
         return {

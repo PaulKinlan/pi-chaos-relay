@@ -374,7 +374,8 @@ channel before risky tools run:
 
 Set with `/chaos-relay approvals writes` or the `CHAOS_RELAY_APPROVAL_MODE` env var.
 When a tool is gated, the agent pauses and sends an approval request to the active
-channel; **reply `yes` to allow or `no` to deny** (auto-denies after 5 minutes).
+channel; **reply `yes <code>` to allow or `no <code>` to deny** — the prompt shows a
+short code, and only the originating sender's reply counts (auto-denies after 5 minutes).
 Terminal/local turns are never gated.
 
 ## Telegram setup — end to end

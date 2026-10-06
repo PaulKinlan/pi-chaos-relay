@@ -973,79 +973,122 @@ test("claimProfileLock: two processes racing the same profile — exactly one wi
   t.diagnostic(`race result: ${JSON.stringify(results)}`);
 });
 
-// ── pi-chaos-relay-abl: concurrent approvals each get their own decision ─────
+// ── pi-chaos-relay-abl / pi-chaos-relay-jqf: approval queue semantics ─────
 
-test("two concurrent approval requests resolve separately (no cross-resolve, no loss)", async () => {
-  const logs: string[] = [];
-  const q = new ApprovalQueue(60_000, (m) => logs.push(m));
-  const first = q.add({ channelId: "c1", toolName: "bash" });
-  const second = q.add({ channelId: "c1", toolName: "edit" });
-  assert.equal(q.size, 2, "both requests are outstanding");
-  assert.notEqual(first.ref, second.ref, "each request has its own reference");
+test("an approval is answered only by its nonce from the originating sender", async () => {
+  const q = new ApprovalQueue(60_000);
+  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  // The request issues a real, unguessable token (a regression that dropped the
+  // nonce would leave every answer unmatched and forwarded).
+  assert.match(req.nonce, /^[0-9a-f]{12}$/, "an unguessable nonce is issued");
+  // The correct answer echoes the nonce from the same sender/channel.
+  assert.equal(
+    q.settle({ channelId: "c1", from: "alice", content: `yes ${req.nonce}` }),
+    true,
+    "consumed",
+  );
+  assert.equal(await req.promise, true);
+  assert.equal(q.size, 0);
+});
 
-  // Unaddressed reply → the OLDEST outstanding request on that channel.
-  assert.equal(q.settle({ channelId: "c1", content: "yes" }), true, "message consumed");
-  assert.equal(await first.promise, true, "the first call got the approval");
+test("an answer with trailing punctuation is still accepted", async () => {
+  const q = new ApprovalQueue(60_000);
+  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  assert.match(req.nonce, /^[0-9a-f]{12}$/, "an unguessable nonce is issued (regression pin)");
+  // Phone keyboards append "." or "!"; that must not turn a valid answer into
+  // a non-answer.
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `yes ${req.nonce}.` }), true);
+  assert.equal(await req.promise, true);
+});
+
+test("an approval answer from a different sender is not consumed (forwarded)", async () => {
+  const q = new ApprovalQueue(60_000);
+  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  // A different participant on the same channel, even with the right nonce,
+  // cannot authorise — the message is forwarded to the agent, not consumed.
+  assert.equal(
+    q.settle({ channelId: "c1", from: "bob", content: `yes ${req.nonce}` }),
+    false,
+    "forwarded",
+  );
+  assert.equal(q.size, 1, "still pending");
+  // A different channel cannot answer it either.
+  assert.equal(
+    q.settle({ channelId: "c2", from: "alice", content: `yes ${req.nonce}` }),
+    false,
+    "forwarded (wrong channel)",
+  );
+  assert.equal(q.size, 1, "still pending");
+  // The originating sender can still answer.
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `yes ${req.nonce}` }), true);
+  assert.equal(await req.promise, true);
+});
+
+test("a malformed or nonce-less answer is not consent", async () => {
+  const q = new ApprovalQueue(60_000);
+  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  // Old-style answers (no nonce) never count.
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: "yes" }), false);
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: "ok" }), false);
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: "do it" }), false);
+  // A wrong nonce is not an answer either.
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: "yes deadbeef" }), false);
+  assert.equal(q.size, 1, "still pending after non-answers");
+  // "no <nonce>" denies.
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `no ${req.nonce}` }), true);
+  assert.equal(await req.promise, false);
+});
+
+test("two concurrent approvals resolve separately via their own nonces", async () => {
+  const q = new ApprovalQueue(60_000);
+  const first = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  const second = q.add({ channelId: "c1", from: "alice", toolName: "edit" });
+  assert.equal(q.size, 2);
+  assert.notEqual(first.nonce, second.nonce, "distinct nonces");
+
+  // Answer the SECOND first — the nonce disambiguates, no oldest-first rule.
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `no ${second.nonce}` }), true);
+  assert.equal(await second.promise, false);
   assert.equal(q.size, 1, "only the answered request was settled");
 
-  // Addressed reply → the request it names, even though it is not the oldest.
-  assert.equal(q.settle({ channelId: "c1", content: `#${second.ref} no` }), true);
-  assert.equal(await second.promise, false, "the second call got its own (denied) decision");
-  assert.equal(q.size, 0, "no request left behind");
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `yes ${first.nonce}` }), true);
+  assert.equal(await first.promise, true);
+  assert.equal(q.size, 0);
 });
 
 test("each approval request times out independently", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const logs: string[] = [];
   const q = new ApprovalQueue(60_000, (m) => logs.push(m));
-  const first = q.add({ channelId: "c1", toolName: "bash" });
+  const first = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
   t.mock.timers.tick(30_000);
-  const second = q.add({ channelId: "c1", toolName: "edit" });
+  const second = q.add({ channelId: "c1", from: "alice", toolName: "edit" });
+  assert.match(second.nonce, /^[0-9a-f]{12}$/, "the nonce is issued (regression pin)");
+  assert.notEqual(first.nonce, second.nonce, "distinct nonces");
 
   t.mock.timers.tick(30_000); // first reaches 60s; second is only 30s old
   assert.equal(await first.promise, false, "the older request auto-denied on its own timeout");
   assert.equal(q.size, 1, "the younger request was NOT wiped by the older one's timeout");
 
-  // …and the younger one is still answerable afterwards.
-  assert.equal(q.settle({ channelId: "c1", content: "yes" }), true);
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `yes ${second.nonce}` }), true);
   assert.equal(await second.promise, true, "the surviving request still gets its answer");
   assert.equal(q.size, 0);
-});
-
-test("approval replies are routed by channel and by reference", async () => {
-  const q = new ApprovalQueue(60_000);
-  const a = q.add({ channelId: "c1", toolName: "bash" });
-  const b = q.add({ channelId: "c2", toolName: "bash" });
-
-  // Another channel's message answers nothing here and must be forwarded.
-  assert.equal(q.settle({ channelId: "c3", content: "yes" }), false, "not consumed");
-  assert.equal(q.size, 2, "no request resolved by an unrelated channel");
-
-  // An explicit reference resolves that request, not the oldest.
-  assert.equal(q.settle({ channelId: "c2", content: `#${b.ref} yes` }), true);
-  assert.equal(await b.promise, true);
-  assert.equal(q.size, 1, "the c1 request is still waiting");
-
-  // A reference to nothing pending is consumed but resolves nothing.
-  assert.equal(q.settle({ channelId: "c1", content: "#999 yes" }), true, "consumed");
-  assert.equal(q.size, 1, "an unknown reference must not settle a real request");
-  assert.equal(q.settle({ channelId: "c1", content: "yes" }), true);
-  assert.equal(await a.promise, true, "the real request still settles normally");
 });
 
 test("cancel() drops a request that never reached the user", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const q = new ApprovalQueue(60_000);
-  const dropped = q.add({ channelId: "c1", toolName: "bash" });
+  const dropped = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  assert.match(dropped.nonce, /^[0-9a-f]{12}$/, "the nonce is issued (regression pin)");
   dropped.cancel();
   assert.equal(q.size, 0, "the entry is gone");
   assert.equal(
-    q.settle({ channelId: "c1", content: "yes" }),
+    q.settle({ channelId: "c1", from: "alice", content: `yes ${dropped.nonce}` }),
     false,
     "a message no longer answers a cancelled request (it is forwarded to the agent)",
   );
   // Its timer cannot fire later and deny a different request.
-  const live = q.add({ channelId: "c1", toolName: "edit" });
+  const live = q.add({ channelId: "c1", from: "alice", toolName: "edit" });
   t.mock.timers.tick(120_000);
   assert.equal(q.size, 0);
   assert.equal(await live.promise, false, "the live request timed out on its own timer");
@@ -1336,25 +1379,36 @@ test("an approval reference followed by punctuation still counts as an answer", 
   const q = new ApprovalQueue(60_000);
   // '#1: yes' and '#1 - yes' used to be read as DENIALS: the ref regex left
   // ': yes' / ' - yes' for the yes/no test, which does not match.
-  const a = q.add({ channelId: "c1", toolName: "bash" });
-  assert.equal(q.settle({ channelId: "c1", content: `#${a.ref}: yes` }), true);
+  const a = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `#${a.ref}: yes` }), true);
   assert.equal(await a.promise, true, "'#N: yes' approves");
 
-  const b = q.add({ channelId: "c1", toolName: "edit" });
-  assert.equal(q.settle({ channelId: "c1", content: `#${b.ref} - yes` }), true);
+  const b = q.add({ channelId: "c1", from: "alice", toolName: "edit" });
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `#${b.ref} - yes` }), true);
   assert.equal(await b.promise, true, "'#N - yes' approves");
 
-  const c = q.add({ channelId: "c1", toolName: "write" });
-  assert.equal(q.settle({ channelId: "c1", content: `#${c.ref}, no` }), true);
+  const c = q.add({ channelId: "c1", from: "alice", toolName: "write" });
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `#${c.ref}, no` }), true);
   assert.equal(await c.promise, false, "'#N, no' denies");
 
-  const d = q.add({ channelId: "c1", toolName: "bash" });
-  assert.equal(q.settle({ channelId: "c1", content: `#${d.ref} yes` }), true);
+  const d = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `#${d.ref} yes` }), true);
   assert.equal(await d.promise, true, "the documented '#N yes' still works");
 
-  const e = q.add({ channelId: "c1", toolName: "bash" });
-  assert.equal(q.settle({ channelId: "c1", content: `#${e.ref}    yes` }), true);
+  const e = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `#${e.ref}    yes` }), true);
   assert.equal(await e.promise, true, "extra whitespace still works");
+
+  // A reference from a DIFFERENT sender is not an answer: it is forwarded (not
+  // swallowed), and the request keeps waiting for the sender who was asked.
+  const f = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  assert.equal(
+    q.settle({ channelId: "c1", from: "bob", content: `#${f.ref}: yes` }),
+    false,
+    "another sender's reference is forwarded, not consumed",
+  );
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `#${f.ref}: yes` }), true);
+  assert.equal(await f.promise, true, "the sender who was asked can still answer by reference");
 });
 
 // ── pi-chaos-relay-8ni: pid 0, and a future mtime, are not "held by a live peer"
@@ -1477,12 +1531,12 @@ test("an approval reference followed by an em dash still counts as an answer", a
   const q = new ApprovalQueue(60_000);
   // iOS QuickType turns a typed '--' into U+2014 (em dash); the reference class
   // covered ':' '-' en-dash and ',' but not the em dash, so this denied.
-  const a = q.add({ channelId: "c1", toolName: "bash" });
-  assert.equal(q.settle({ channelId: "c1", content: `#${a.ref} — yes` }), true);
+  const a = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `#${a.ref} — yes` }), true);
   assert.equal(await a.promise, true, "'#N — yes' (em dash U+2014) approves");
 
-  const b = q.add({ channelId: "c1", toolName: "edit" });
-  assert.equal(q.settle({ channelId: "c1", content: `#${b.ref}\u2014no` }), true, "no space needed either");
+  const b = q.add({ channelId: "c1", from: "alice", toolName: "edit" });
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `#${b.ref}\u2014no` }), true, "no space needed either");
   assert.equal(await b.promise, false, "'#N—no' denies");
 });
 
@@ -1573,4 +1627,488 @@ test("durable log never records pairing codes or channel identifiers", () => {
   for (const secret of secrets) {
     assert.ok(!logRaw.includes(secret), `written log must not leak "${secret}": ${logRaw}`);
   }
+});
+
+
+test("a mid-turn message from another channel does not re-point the approval", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak", approvalMode: "all" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+
+  let messagesServed = 0;
+  const replyDests: string[] = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown, init?: unknown) => {
+    const u = String(url);
+    if (u.includes("/messages")) {
+      messagesServed++;
+      const msg =
+        messagesServed === 1
+          ? { id: "mt1", channelType: "telegram", channelId: "chanA", from: "alice", content: "hello A", timestamp: "2026-01-01T00:00:01Z" }
+          : { id: "mt2", channelType: "telegram", channelId: "chanB", from: "bob", content: "hello B", timestamp: "2026-01-01T00:00:02Z" };
+      return new Response(JSON.stringify({ messages: [msg], since: "2026-01-01T00:00:02Z" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (u.includes("/reply")) {
+      const body = JSON.parse(String((init as { body?: string })?.body ?? "{}"));
+      replyDests.push(body.channelId);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+
+  // setImmediate is not mocked, so it drains the async message-delivery chain
+  // (fetch → poll → deliver) after each mocked timer tick.
+  const flushAsync = async () => {
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+  };
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-turn", fake.notifications));
+
+  // Channel A's message arrives via the safety poll.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+  // The turn begins: snapshot the origin (channel A).
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-turn", fake.notifications));
+  // Mid-turn: channel B's message arrives, re-pointing the live lastChannel.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+  // The agent calls a gated tool. Fire it without awaiting: the send happens
+  // before the wait, and the wait is resolved below by the approval timeout.
+  const toolHandlers = fake.handlers.get("tool_call");
+  assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
+  const toolCall = toolHandlers![0](
+    { toolName: "bash", input: { command: "x" } },
+    makeCtx("sess-turn", fake.notifications),
+  );
+  await flushAsync();
+  // Resolve the pending approval via its own 5-minute timeout.
+  t.mock.timers.tick(300_000);
+  await toolCall;
+
+  await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-turn", fake.notifications));
+  t.mock.timers.reset();
+  if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+  else process.env.CHAOS_RELAY_URL = prevUrl;
+  globalThis.fetch = origFetch;
+
+  assert.deepEqual(
+    replyDests,
+    ["chanA"],
+    "the approval was asked over the originating channel, not the mid-turn message's channel",
+  );
+});
+
+test("a message delivered mid-turn produces a gated follow-up turn", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak", approvalMode: "all" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  let messagesServed = 0;
+  const replyDests: string[] = [];
+  globalThis.fetch = (async (url: unknown, init?: unknown) => {
+    const u = String(url);
+    if (u.includes("/messages")) {
+      messagesServed++;
+      const msg =
+        messagesServed === 1
+          ? { id: "f1", channelType: "telegram", channelId: "chanA", from: "alice", content: "hello A", timestamp: "2026-01-01T00:00:01Z" }
+          : { id: "f2", channelType: "telegram", channelId: "chanB", from: "bob", content: "hello B", timestamp: "2026-01-01T00:00:02Z" };
+      return new Response(JSON.stringify({ messages: [msg], since: "2026-01-01T00:00:02Z" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (u.includes("/reply")) {
+      const body = JSON.parse(String((init as { body?: string })?.body ?? "{}"));
+      replyDests.push(body.channelId);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+
+  // setTimeout is NOT mocked here, so this is a real delay that lets the async
+  // delivery chain (fetch -> poll -> deliver) settle.
+  const flushAsync = async () => {
+    await new Promise((r) => setTimeout(r, 60));
+  };
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-follow", fake.notifications));
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-follow", fake.notifications)));
+
+  // Turn A: message A arrives and the turn starts.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-follow", fake.notifications));
+  // Mid-turn A: message B arrives (its origin is queued, not dropped).
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+  // Turn A ends, then the queued follow-up (B) becomes turn B.
+  await callHandler(fake.handlers, "agent_end", {}, makeCtx("sess-follow", fake.notifications));
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-follow", fake.notifications));
+
+  // Turn B's gated tool call must be asked over B's channel. Fire it without
+  // awaiting the approval answer; the prompt send happens before the wait.
+  const toolHandlers = fake.handlers.get("tool_call");
+  assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
+  toolHandlers![0]({ toolName: "bash", input: { command: "x" } }, makeCtx("sess-follow", fake.notifications));
+  await flushAsync();
+
+  assert.deepEqual(
+    replyDests,
+    ["chanB"],
+    "the follow-up turn was gated and asked over its own message's channel",
+  );
+});
+
+test("a batch mixing senders is attributed to the earliest message's origin", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak", approvalMode: "all" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  let messagesServed = 0;
+  const replyDests: string[] = [];
+  globalThis.fetch = (async (url: unknown, init?: unknown) => {
+    const u = String(url);
+    if (u.includes("/messages")) {
+      messagesServed++;
+      // ONE poll returns a MIXED batch: alice on chanA (earliest) then bob on chanB.
+      return new Response(
+        JSON.stringify({
+          messages: [
+            { id: "mix1", channelType: "telegram", channelId: "chanA", from: "alice", content: "hello A", timestamp: "2026-01-01T00:00:01Z" },
+            { id: "mix2", channelType: "telegram", channelId: "chanB", from: "bob", content: "hello B", timestamp: "2026-01-01T00:00:02Z" },
+          ],
+          since: "2026-01-01T00:00:02Z",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (u.includes("/reply")) {
+      const body = JSON.parse(String((init as { body?: string })?.body ?? "{}"));
+      replyDests.push(body.channelId);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+
+  const flushAsync = async () => {
+    await new Promise((r) => setTimeout(r, 60));
+  };
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-mixed", fake.notifications));
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-mixed", fake.notifications)));
+
+  t.mock.timers.tick(120_000); // mixed batch delivered
+  await flushAsync();
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-mixed", fake.notifications));
+
+  const toolHandlers = fake.handlers.get("tool_call");
+  assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
+  toolHandlers![0]({ toolName: "bash", input: { command: "x" } }, makeCtx("sess-mixed", fake.notifications));
+  await flushAsync();
+
+  assert.deepEqual(
+    replyDests,
+    ["chanA"],
+    "a mixed batch is attributed to the earliest message's origin (first-wins, documented)",
+  );
+});
+
+test("a turn that starts during slow attachment hydration does not consume the not-yet-delivered origin", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak", approvalMode: "all" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  // Hold the attachment download open so hydration stays in-flight while we
+  // start another turn.
+  let releaseDownload!: () => void;
+  const downloadGate = new Promise<void>((resolve) => {
+    releaseDownload = resolve;
+  });
+
+  const replyDests: string[] = [];
+  globalThis.fetch = (async (url: unknown, init?: unknown) => {
+    const u = String(url);
+    if (u.includes("/attachments/")) {
+      await downloadGate;
+      return new Response("attachment-bytes", {
+        status: 200,
+        headers: { "Content-Type": "text/plain", "Content-Length": "16" },
+      });
+    }
+    if (u.includes("/messages")) {
+      return new Response(
+        JSON.stringify({
+          messages: [
+            {
+              id: "slow1",
+              channelType: "telegram",
+              channelId: "chanA",
+              from: "alice",
+              content: "hello with an attachment",
+              timestamp: "2026-01-01T00:00:01Z",
+              attachments: [{ id: "att1", filename: "f.txt", mimeType: "text/plain", size: 16 }],
+            },
+          ],
+          since: "2026-01-01T00:00:01Z",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (u.includes("/reply")) {
+      const body = JSON.parse(String((init as { body?: string })?.body ?? "{}"));
+      replyDests.push(body.channelId);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+
+  const flushAsync = async () => {
+    await new Promise((r) => setTimeout(r, 30));
+  };
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-slow", fake.notifications));
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-slow", fake.notifications)));
+
+  // The safety poll delivers the attachment-bearing message; hydration blocks on
+  // the download gate above.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+
+  // Another turn starts and ends while hydration is still pending. It must not
+  // consume the origin that has not actually been delivered.
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-slow", fake.notifications));
+  await callHandler(fake.handlers, "agent_end", {}, makeCtx("sess-slow", fake.notifications));
+
+  // Let hydration finish; the followUp is now actually delivered.
+  releaseDownload();
+  await flushAsync();
+
+  // The relay message's own turn starts and must carry chanA's origin.
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-slow", fake.notifications));
+
+  const toolHandlers = fake.handlers.get("tool_call");
+  assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
+  toolHandlers![0]({ toolName: "bash", input: { command: "x" } }, makeCtx("sess-slow", fake.notifications));
+  await flushAsync();
+
+  assert.deepEqual(
+    replyDests,
+    ["chanA"],
+    "the slow-hydrated relay turn is gated and asked over its own channel",
+  );
+});
+
+test("a hydration failure enqueues no origin and leaves the next turn aligned", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak", approvalMode: "all" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  let messagesServed = 0;
+  const replyDests: string[] = [];
+  globalThis.fetch = (async (url: unknown, init?: unknown) => {
+    const u = String(url);
+    if (u.includes("/messages")) {
+      messagesServed++;
+      const msg =
+        messagesServed === 1
+          ? {
+              id: "bad1",
+              channelType: "telegram",
+              channelId: "chanA",
+              from: "alice",
+              content: "broken hydration",
+              timestamp: "2026-01-01T00:00:01Z",
+              // Force materializeInboundAttachments to throw: `.slice` on a
+              // string yields a string, and `attachments.map` is not a function.
+              attachments: "not-an-array",
+            }
+          : {
+              id: "ok1",
+              channelType: "telegram",
+              channelId: "chanB",
+              from: "bob",
+              content: "clean message",
+              timestamp: "2026-01-01T00:00:02Z",
+            };
+      return new Response(JSON.stringify({ messages: [msg], since: "2026-01-01T00:00:02Z" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (u.includes("/reply")) {
+      const body = JSON.parse(String((init as { body?: string })?.body ?? "{}"));
+      replyDests.push(body.channelId);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+
+  const flushAsync = async () => {
+    await new Promise((r) => setTimeout(r, 60));
+  };
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-hydfail", fake.notifications));
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-hydfail", fake.notifications)));
+
+  // First delivery fails during hydration: nothing is sent and nothing enqueued.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+
+  // Second delivery succeeds; its origin must be the only one in the queue.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-hydfail", fake.notifications));
+
+  const toolHandlers = fake.handlers.get("tool_call");
+  assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
+  toolHandlers![0]({ toolName: "bash", input: { command: "x" } }, makeCtx("sess-hydfail", fake.notifications));
+  await flushAsync();
+
+  assert.deepEqual(
+    replyDests,
+    ["chanB"],
+    "the clean turn is gated over its own channel, not desynced by the failed hydration",
+  );
+});
+
+test("session shutdown and start clear pending origins so a new session cannot inherit them", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak", approvalMode: "all" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  const replyDests: string[] = [];
+  globalThis.fetch = (async (url: unknown, init?: unknown) => {
+    const u = String(url);
+    if (u.includes("/messages")) {
+      return new Response(
+        JSON.stringify({
+          messages: [
+            {
+              id: "stale1",
+              channelType: "telegram",
+              channelId: "chanA",
+              from: "alice",
+              content: "queued then session ends",
+              timestamp: "2026-01-01T00:00:01Z",
+            },
+          ],
+          since: "2026-01-01T00:00:01Z",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (u.includes("/reply")) {
+      const body = JSON.parse(String((init as { body?: string })?.body ?? "{}"));
+      replyDests.push(body.channelId);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+
+  const flushAsync = async () => {
+    await new Promise((r) => setTimeout(r, 60));
+  };
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-reset", fake.notifications));
+
+  // A relay message arrives and its origin is queued, but the turn never starts
+  // before the session ends.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+
+  await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-reset", fake.notifications));
+  await callHandler(fake.handlers, "session_start", { reason: "resume" }, makeCtx("sess-reset2", fake.notifications));
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-reset2", fake.notifications)));
+
+  // A terminal/local turn in the new session must be ungated: the stale origin
+  // from the previous session must already be gone.
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-reset2", fake.notifications));
+
+  const toolHandlers = fake.handlers.get("tool_call");
+  assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
+  toolHandlers![0]({ toolName: "bash", input: { command: "x" } }, makeCtx("sess-reset2", fake.notifications));
+  await flushAsync();
+
+  assert.deepEqual(
+    replyDests,
+    [],
+    "no stale origin leaks across the session boundary into a terminal turn",
+  );
 });
