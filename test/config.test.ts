@@ -275,14 +275,15 @@ test("resolveConfig falls back to defaults with empty persisted + no env", () =>
   );
 });
 
-test("approvalMode defaults off, persists, and respects env override", () => {
+test("approvalMode defaults to writes, persists, and respects env override", () => {
   withEnv({ CHAOS_RELAY_APPROVAL_MODE: undefined }, () => {
-    assert.equal(resolveConfig({}).approvalMode, "off");
+    assert.equal(resolveConfig({}).approvalMode, "writes");
     assert.equal(resolveConfig({ approvalMode: "writes" }).approvalMode, "writes");
-    // Invalid persisted value falls back to off.
+    assert.equal(resolveConfig({ approvalMode: "off" }).approvalMode, "off");
+    // Invalid persisted value falls back to the gated default, not off.
     assert.equal(
       resolveConfig({ approvalMode: "bogus" as never }).approvalMode,
-      "off",
+      "writes",
     );
   });
   withEnv({ CHAOS_RELAY_APPROVAL_MODE: "all" }, () => {
@@ -291,12 +292,12 @@ test("approvalMode defaults off, persists, and respects env override", () => {
   });
 });
 
-test("normalizeApprovalMode coerces invalid values to off", () => {
+test("normalizeApprovalMode coerces invalid values to writes (off is explicit only)", () => {
   assert.equal(normalizeApprovalMode("all"), "all");
   assert.equal(normalizeApprovalMode("writes"), "writes");
   assert.equal(normalizeApprovalMode("off"), "off");
-  assert.equal(normalizeApprovalMode("nonsense"), "off");
-  assert.equal(normalizeApprovalMode(undefined), "off");
+  assert.equal(normalizeApprovalMode("nonsense"), "writes");
+  assert.equal(normalizeApprovalMode(undefined), "writes");
 });
 
 test("env vars override persisted config", () => {

@@ -76,6 +76,7 @@ import {
 import { RelayWebSocket } from "./ws-client.ts";
 import { parseConnectInput } from "./connect.ts";
 import { safeUrlOrigin, redactUrlSecretsFromMessage } from "./url-redact.ts";
+import { approvalDecision } from "./approval-policy.ts";
 
 /**
  * Slow safety poll. The WebSocket is the primary transport (instant push);
@@ -1170,20 +1171,16 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // request is sent to the active channel; the NEXT message from that channel
   // is consumed as the yes/no answer (it is not forwarded to the agent).
   const APPROVAL_TIMEOUT_MS = 5 * 60 * 1000;
-  const RISKY_WRITE_TOOLS = new Set(["bash", "edit", "write"]);
   // One entry per outstanding request, each with its own timer and resolver.
   // (A single global slot let a second gated call overwrite the first, let any
   // entry's timeout resolve the wrong promise, and could leave one request
   // hanging forever — see the ApprovalQueue doc comment.)
   const approvals = new ApprovalQueue(APPROVAL_TIMEOUT_MS, (m) => log(m));
 
-  function approvalNeeded(toolName: string): boolean {
-    if (cfg.approvalMode === "off") return false;
-    // Never gate the relay's own plumbing (relay_reply etc.) — gating it would
-    // deadlock the very channel we ask over.
-    if (toolName.startsWith("relay_")) return false;
-    if (cfg.approvalMode === "all") return true;
-    return RISKY_WRITE_TOOLS.has(toolName); // "writes"
+  function approvalNeeded(toolName: string, input?: Record<string, unknown>): boolean {
+    // Delegate to the pure per-tool policy (approval-policy.ts) — the single
+    // source of truth for the mode x tool matrix, unit-tested in full.
+    return approvalDecision(cfg.approvalMode, toolName, input);
   }
 
   function summarizeToolCall(toolName: string, input: Record<string, unknown>): string {
@@ -1399,7 +1396,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // Tool approval: when enabled and the turn came from a channel, pause risky
   // tools and ask the user over that channel before they run.
   pi.on("tool_call", async (event) => {
-    if (!approvalNeeded(event.toolName)) return; // allow
+    if (!approvalNeeded(event.toolName, event.input as Record<string, unknown> | undefined)) return; // allow
     // Only gate turns driven from a channel — terminal/local use is unaffected.
     if (!activeTurn) return;
     // Pause the typing indicator while we wait on the human.

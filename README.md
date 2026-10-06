@@ -73,7 +73,7 @@ file > default**. The saved config file is `~/.pi/chaos-relay.json` (written wit
 | `CHAOS_RELAY_URL` | `https://chaos-relay.com` | Relay base URL |
 | `CHAOS_RELAY_API_KEY` | — | Bearer API key from `POST /auth/register` (secret) |
 | `CHAOS_RELAY_AGENT_ID` | `pi` | Connection/session label channels are tagged with |
-| `CHAOS_RELAY_APPROVAL_MODE` | `off` | Tool-approval policy: `off` / `writes` / `all` (see Tool approvals) |
+| `CHAOS_RELAY_APPROVAL_MODE` | `writes` | Tool-approval policy: `off` / `writes` / `all` (see Tool approvals) |
 | `CHAOS_RELAY_PROFILE` | `default` | Names a separate config file (`~/.pi/chaos-relay.<profile>.json`) — see Multiple instances |
 | `CHAOS_RELAY_CONFIG` | — | Absolute path to the config file (overrides `CHAOS_RELAY_PROFILE`) |
 
@@ -368,11 +368,14 @@ channel before risky tools run:
 
 | Mode | Behaviour |
 |------|-----------|
-| `off` *(default)* | Fully autonomous — run every tool. Best paired with a sandbox/container. |
-| `writes` | Ask before `bash`, `edit`, and `write`; reads/searches run freely. |
-| `all` | Ask before **every** tool (the `relay_*` plumbing is never gated). |
+| `writes` *(default)* | Ask before `bash`, `edit`, and `write`; reads/searches run freely. `relay_reply` is gated only when it ships a file attachment; the other relay plumbing is ungated. |
+| `all` | Ask before **every** tool except the read-only relay plumbing (`relay_check_messages`, `relay_list_profiles`). |
+| `off` | Fully autonomous — run every tool. Best paired with a sandbox/container. |
 
-Set with `/chaos-relay approvals writes` or the `CHAOS_RELAY_APPROVAL_MODE` env var.
+`writes` is the default so a channel-driven session is NOT ungated out of the
+box; choose `off` (or `/chaos-relay approvals off`) for the old fully-autonomous
+posture. Set with `/chaos-relay approvals <off|writes|all>` or the
+`CHAOS_RELAY_APPROVAL_MODE` env var.
 When a tool is gated, the agent pauses and sends an approval request to the active
 channel; **reply `yes <code>` to allow or `no <code>` to deny** — the prompt shows a
 short code, and only the originating sender's reply counts (auto-denies after 5 minutes).
