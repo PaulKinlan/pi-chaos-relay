@@ -387,17 +387,20 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // only show "typing" in the channel when the agent is actually working on a
   // message from it, not on terminal-driven turns).
   let typingTimer: ReturnType<typeof setInterval> | undefined;
-  let lastChannel:
-    | { channelType: ChannelMessage["channelType"]; channelId: string; from: string }
-    | undefined;
-  /** The turn's ORIGINATING channel+sender, snapshotted at turn start. Unlike
-   *  `lastChannel` (overwritten by every inbound delivery, including a mid-turn
-   *  followUp from another channel), this is fixed for the whole turn so a
-   *  gated tool call asks — and is answered by — the right channel. */
+  /** FIFO of relay turn origins, one per delivered relay turn. The agent can be
+   *  busy when a message arrives — its followUp becomes a LATER turn that must
+   *  still carry the origin — so a boolean "relay input since idle" cannot
+   *  represent queued turns. */
+  let pendingOrigins: {
+    channelType: ChannelMessage["channelType"];
+    channelId: string;
+    from: string;
+  }[] = [];
+  /** The CURRENT turn's origin, shifted from the queue at turn start and dropped
+   *  at turn end. A gated tool call asks — and is answered by — this. */
   let activeTurn:
     | { channelType: ChannelMessage["channelType"]; channelId: string; from: string }
     | undefined;
-  let relayInputSinceIdle = false;
 
   /**
    * Re-register with the persisted keypair to recover a working apiKey after a
@@ -771,12 +774,23 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
    * examples (reload-runtime, git-merge-and-resolve).
    */
   async function deliverToAgent(messages: ChannelMessage[]): Promise<void> {
-    // Remember where the latest message came from so we can show a typing
-    // indicator there while the agent works on it.
-    const last = messages[messages.length - 1];
-    if (last) {
-      lastChannel = { channelType: last.channelType, channelId: last.channelId, from: last.from };
-      relayInputSinceIdle = true;
+    // Enqueue this turn's origin. A batch can mix channels/senders; attribute it
+    // to the FIRST (earliest) message — the one that initiated the turn — and
+    // warn so a mixed batch is never silently attributed to the last message.
+    const first = messages[0];
+    if (first) {
+      pendingOrigins.push({
+        channelType: first.channelType,
+        channelId: first.channelId,
+        from: first.from,
+      });
+      const distinct = new Set(messages.map((m) => `${m.channelId}\u0000${m.from}`));
+      if (distinct.size > 1) {
+        log(
+          `WARN: a delivery batch mixes ${distinct.size} channel/sender origins — ` +
+            `attributing the turn to the earliest (${first.from} on ${first.channelId})`,
+        );
+      }
     }
     const c = ensureClient();
     const hydrated = c
@@ -811,10 +825,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   /** Repeatedly send a "typing" indicator to the active channel until stopped. */
   function startTyping(): void {
     stopTyping();
-    if (!relayInputSinceIdle || !lastChannel) return;
+    if (!activeTurn) return;
     const c = ensureClient();
     if (!c) return;
-    const ch = lastChannel;
+    const ch = activeTurn;
     const ping = () => void c.sendTyping(ch.channelType, ch.channelId);
     ping(); // immediate, then refresh before Telegram's ~5s expiry
     typingTimer = setInterval(ping, 4000);
@@ -1042,15 +1056,12 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // Show a "typing" indicator in the active channel while the agent works on a
   // relay-delivered message, and clear it when the run finishes.
   pi.on("agent_start", () => {
+    // Shift this turn's origin off the queue (a terminal/local turn has none).
+    activeTurn = pendingOrigins.shift() ?? undefined;
     startTyping();
-    // Snapshot the turn's origin: lastChannel is overwritten by every inbound
-    // delivery (including a followUp from another channel mid-turn), so the
-    // approval must bind to this snapshot, not the live value.
-    activeTurn = relayInputSinceIdle ? lastChannel : undefined;
   });
   pi.on("agent_end", () => {
     stopTyping();
-    relayInputSinceIdle = false;
     activeTurn = undefined;
   });
 

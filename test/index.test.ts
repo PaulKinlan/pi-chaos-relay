@@ -990,6 +990,7 @@ test("an approval is answered only by its nonce from the originating sender", as
 test("an answer with trailing punctuation is still accepted", async () => {
   const q = new ApprovalQueue(60_000);
   const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  assert.match(req.nonce, /^[0-9a-f]{12}$/, "an unguessable nonce is issued (regression pin)");
   // Phone keyboards append "." or "!"; that must not turn a valid answer into
   // a non-answer.
   assert.equal(q.settle({ channelId: "c1", from: "alice", content: `yes ${req.nonce}.` }), true);
@@ -1109,8 +1110,8 @@ test("a mid-turn message from another channel does not re-point the approval", a
       messagesServed++;
       const msg =
         messagesServed === 1
-          ? { id: "m1", channelType: "telegram", channelId: "chanA", from: "alice", content: "hello A", timestamp: "2026-01-01T00:00:01Z" }
-          : { id: "m2", channelType: "telegram", channelId: "chanB", from: "bob", content: "hello B", timestamp: "2026-01-01T00:00:02Z" };
+          ? { id: "mt1", channelType: "telegram", channelId: "chanA", from: "alice", content: "hello A", timestamp: "2026-01-01T00:00:01Z" }
+          : { id: "mt2", channelType: "telegram", channelId: "chanB", from: "bob", content: "hello B", timestamp: "2026-01-01T00:00:02Z" };
       return new Response(JSON.stringify({ messages: [msg], since: "2026-01-01T00:00:02Z" }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -1165,5 +1166,147 @@ test("a mid-turn message from another channel does not re-point the approval", a
     replyDests,
     ["chanA"],
     "the approval was asked over the originating channel, not the mid-turn message's channel",
+  );
+});
+
+test("a message delivered mid-turn produces a gated follow-up turn", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak", approvalMode: "all" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  let messagesServed = 0;
+  const replyDests: string[] = [];
+  globalThis.fetch = (async (url: unknown, init?: unknown) => {
+    const u = String(url);
+    if (u.includes("/messages")) {
+      messagesServed++;
+      const msg =
+        messagesServed === 1
+          ? { id: "f1", channelType: "telegram", channelId: "chanA", from: "alice", content: "hello A", timestamp: "2026-01-01T00:00:01Z" }
+          : { id: "f2", channelType: "telegram", channelId: "chanB", from: "bob", content: "hello B", timestamp: "2026-01-01T00:00:02Z" };
+      return new Response(JSON.stringify({ messages: [msg], since: "2026-01-01T00:00:02Z" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (u.includes("/reply")) {
+      const body = JSON.parse(String((init as { body?: string })?.body ?? "{}"));
+      replyDests.push(body.channelId);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+
+  // setTimeout is NOT mocked here, so this is a real delay that lets the async
+  // delivery chain (fetch -> poll -> deliver) settle.
+  const flushAsync = async () => {
+    await new Promise((r) => setTimeout(r, 60));
+  };
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-follow", fake.notifications));
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-follow", fake.notifications)));
+
+  // Turn A: message A arrives and the turn starts.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-follow", fake.notifications));
+  // Mid-turn A: message B arrives (its origin is queued, not dropped).
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+  // Turn A ends, then the queued follow-up (B) becomes turn B.
+  await callHandler(fake.handlers, "agent_end", {}, makeCtx("sess-follow", fake.notifications));
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-follow", fake.notifications));
+
+  // Turn B's gated tool call must be asked over B's channel. Fire it without
+  // awaiting the approval answer; the prompt send happens before the wait.
+  const toolHandlers = fake.handlers.get("tool_call");
+  assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
+  toolHandlers![0]({ toolName: "bash", input: { command: "x" } }, makeCtx("sess-follow", fake.notifications));
+  await flushAsync();
+
+  assert.deepEqual(
+    replyDests,
+    ["chanB"],
+    "the follow-up turn was gated and asked over its own message's channel",
+  );
+});
+
+test("a batch mixing senders is attributed to the earliest message's origin", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak", approvalMode: "all" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  let messagesServed = 0;
+  const replyDests: string[] = [];
+  globalThis.fetch = (async (url: unknown, init?: unknown) => {
+    const u = String(url);
+    if (u.includes("/messages")) {
+      messagesServed++;
+      // ONE poll returns a MIXED batch: alice on chanA (earliest) then bob on chanB.
+      return new Response(
+        JSON.stringify({
+          messages: [
+            { id: "mix1", channelType: "telegram", channelId: "chanA", from: "alice", content: "hello A", timestamp: "2026-01-01T00:00:01Z" },
+            { id: "mix2", channelType: "telegram", channelId: "chanB", from: "bob", content: "hello B", timestamp: "2026-01-01T00:00:02Z" },
+          ],
+          since: "2026-01-01T00:00:02Z",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (u.includes("/reply")) {
+      const body = JSON.parse(String((init as { body?: string })?.body ?? "{}"));
+      replyDests.push(body.channelId);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+
+  const flushAsync = async () => {
+    await new Promise((r) => setTimeout(r, 60));
+  };
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-mixed", fake.notifications));
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-mixed", fake.notifications)));
+
+  t.mock.timers.tick(120_000); // mixed batch delivered
+  await flushAsync();
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-mixed", fake.notifications));
+
+  const toolHandlers = fake.handlers.get("tool_call");
+  assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
+  toolHandlers![0]({ toolName: "bash", input: { command: "x" } }, makeCtx("sess-mixed", fake.notifications));
+  await flushAsync();
+
+  assert.deepEqual(
+    replyDests,
+    ["chanA"],
+    "a mixed batch is attributed to the earliest message's origin (first-wins, documented)",
   );
 });
