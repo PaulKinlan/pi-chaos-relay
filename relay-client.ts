@@ -17,6 +17,7 @@
  */
 
 import { buildSignatureHeaders, generateKeyPair, type KeyPairJwk } from "./crypto.ts";
+import { safeUrlOrigin } from "./url-redact.ts";
 
 /**
  * Default per-request timeout. A bare `fetch` has NO timeout, so an unreachable
@@ -250,7 +251,7 @@ export async function registerSessionWithKey(
   } catch (err) {
     if (isTimeoutError(err)) {
       throw new RelayError(
-        `Relay did not respond within ${ms}ms (POST ${base}/auth/register) — ` +
+        `Relay did not respond within ${ms}ms (POST ${safeUrlOrigin(base)}/auth/register) — ` +
           `check the relay URL is correct and reachable.`,
         0,
       );
@@ -340,7 +341,7 @@ export class RelayClient {
     } catch (err) {
       if (isTimeoutError(err)) {
         throw new RelayError(
-          `Relay did not respond within ${this.timeoutMs}ms (${method} ${path}) — ` +
+          `Relay did not respond within ${this.timeoutMs}ms (${method} ${pathname}) — ` +
             `check the relay URL is correct and reachable.`,
           0,
         );
@@ -352,7 +353,7 @@ export class RelayClient {
     const parsed = await readBody(res);
     if (!res.ok) {
       throw new RelayError(
-        `Relay request failed (${method} ${path}): ${describeError(parsed, res.status)}`,
+        `Relay request failed (${method} ${pathname}): ${describeError(parsed, res.status)}`,
         res.status,
         parsed,
       );
@@ -370,7 +371,7 @@ export class RelayClient {
       if (isTimeoutError(err)) {
         throw new RelayError(
           `Relay health check timed out after ${this.timeoutMs}ms — ` +
-            `the relay at ${this.base} is not responding.`,
+            `the relay at ${safeUrlOrigin(this.base)} is not responding.`,
           0,
         );
       }

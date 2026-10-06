@@ -28,6 +28,18 @@ function mockFetch(
   return { fn: fn as unknown as typeof fetch, calls };
 }
 
+/** A fetch that never resolves on its own — it only settles when the request's
+ * AbortSignal fires (so the caller's timeout produces a TimeoutError). */
+function hangingFetch(): typeof fetch {
+  return ((_url: string | URL | Request, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () =>
+        reject((init.signal as AbortSignal).reason ??
+          new DOMException("Aborted", "AbortError")),
+      );
+    })) as unknown as typeof fetch;
+}
+
 test("normalizeRelayUrl strips trailing slashes", () => {
   assert.equal(normalizeRelayUrl("http://x/"), "http://x");
   assert.equal(normalizeRelayUrl("http://x///"), "http://x");
@@ -388,4 +400,45 @@ test("downloadAttachment rejects declared responses over 5MB before buffering", 
     /exceeds 5MB/,
   );
   assert.equal(cancelled, true);
+});
+
+test("health timeout redacts the relay URL to its origin", async () => {
+  const client = new RelayClient({
+    relayUrl: "http://user:supersecret@example.com/secret?token=tok#frag",
+    apiKey: "k",
+    fetchImpl: hangingFetch(),
+    timeoutMs: 20,
+  });
+  await assert.rejects(
+    () => client.health(),
+    (err: unknown) => {
+      assert.ok(err instanceof RelayError);
+      assert.match(err.message, /the relay at http:\/\/example\.com is not responding/);
+      assert.doesNotMatch(err.message, /supersecret/);
+      assert.doesNotMatch(err.message, /user@/);
+      assert.doesNotMatch(err.message, /\/secret/);
+      assert.doesNotMatch(err.message, /token=tok/);
+      assert.doesNotMatch(err.message, /#frag/);
+      return true;
+    },
+  );
+});
+
+test("registerSessionWithKey timeout redacts the relay URL to its origin", async () => {
+  await assert.rejects(
+    () => registerSessionWithKey("http://user:supersecret@example.com/secret?token=tok#frag", {
+      fetchImpl: hangingFetch(),
+      timeoutMs: 20,
+    }),
+    (err: unknown) => {
+      assert.ok(err instanceof RelayError);
+      assert.match(err.message, /POST http:\/\/example\.com\/auth\/register/);
+      assert.doesNotMatch(err.message, /supersecret/);
+      assert.doesNotMatch(err.message, /user@/);
+      assert.doesNotMatch(err.message, /\/secret/);
+      assert.doesNotMatch(err.message, /token=tok/);
+      assert.doesNotMatch(err.message, /#frag/);
+      return true;
+    },
+  );
 });

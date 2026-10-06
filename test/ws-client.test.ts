@@ -186,6 +186,30 @@ test("toWsUrl percent-encodes the token so query metacharacters survive", () => 
   );
 });
 
+test("a WebSocket constructor failure logs the origin, not the URL secret", () => {
+  const secret = "supersecret-ws-key";
+  const logs: string[] = [];
+  const ws = new RelayWebSocket({
+    relayUrl: "https://relay.example.com",
+    apiKey: secret,
+    onMessage: () => {},
+    log: (message) => logs.push(message),
+    maxBackoffMs: 0,
+    wsFactory: () => {
+      throw new Error(
+        `WebSocket construct failed: wss://relay.example.com/ws?token=${secret}`,
+      );
+    },
+  });
+  ws.start();
+  ws.stop();
+
+  const text = logs.join("\n");
+  assert.ok(text.includes("WebSocket construct failed"), `logs the failure: ${text}`);
+  assert.ok(!text.includes(secret), `must not leak the apiKey: ${text}`);
+  assert.ok(text.includes("wss://relay.example.com"), `keeps the origin: ${text}`);
+});
+
 // --- connecting ------------------------------------------------------------
 
 test("connected tracks the socket lifecycle and connect uses toWsUrl", () => {

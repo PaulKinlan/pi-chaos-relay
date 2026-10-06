@@ -26,6 +26,7 @@
  */
 
 import type { ChannelMessage } from "./relay-client.ts";
+import { redactUrlSecretsFromMessage } from "./url-redact.ts";
 
 /**
  * How long a socket must stay OPEN before its (rare) drop is treated as a fresh
@@ -167,7 +168,8 @@ export class RelayWebSocket {
         ? this.opts.wsFactory(url)
         : new WebSocket(url);
     } catch (err) {
-      this.log(`WebSocket construct failed: ${(err as Error).message}`);
+      const message = redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err));
+      this.log(`WebSocket construct failed: ${message}`);
       this.scheduleReconnect();
       return;
     }

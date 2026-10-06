@@ -72,6 +72,7 @@ import {
 } from "./reply-format.ts";
 import { RelayWebSocket } from "./ws-client.ts";
 import { parseConnectInput } from "./connect.ts";
+import { safeUrlOrigin, redactUrlSecretsFromMessage } from "./url-redact.ts";
 
 /**
  * Slow safety poll. The WebSocket is the primary transport (instant push);
@@ -152,35 +153,6 @@ function textResult(text: string, details: unknown = {}) {
   return { content: [{ type: "text" as const, text }], details };
 }
 
-/**
- * Render a relay URL for DISPLAY without leaking credentials: origin only
- * (scheme+host+port), never userinfo, path, query or fragment. A URL can be a
- * pasted secret or carry credentials in userinfo (https://user:pass@host), so
- * the raw string must never reach the TUI or the durable log. Returns
- * "<invalid>" for a value that does not parse as an http(s) URL.
- */
-function safeUrlOrigin(url: unknown): string {
-  if (typeof url !== "string" || url.trim() === "") return "<unset>";
-  let parsed: URL;
-  try {
-    parsed = new URL(url.trim());
-  } catch {
-    return "<invalid>";
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "<invalid>";
-  return parsed.origin === "null" ? "<invalid>" : parsed.origin;
-}
-
-/**
- * Strip userinfo from any `scheme://user:pass@host` URL embedded in a message,
- * so an error string that echoes a credential-bearing relay URL (e.g. a fetch
- * "URL that includes credentials" error) cannot write the credentials to the
- * durable log or the TUI. No-op when the message carries no such URL.
- */
-function redactUserinfoFromMessage(message: string): string {
-  return message.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/gi, "$1");
-}
-
 export default function chaosRelayExtension(pi: ExtensionAPI): void {
   let client: RelayClient | undefined;
   let poller: MessagePoller | undefined;
@@ -243,7 +215,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       }
       return reg.apiKey;
     } catch (err) {
-      log(`auth recovery failed: ${redactUserinfoFromMessage(err instanceof Error ? err.message : String(err))}`);
+      log(`auth recovery failed: ${redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err))}`);
       return null;
     }
   }
@@ -296,7 +268,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           });
           updated.push({ ...rec, channelId: res.channelId });
           notes.push(
-            `Webhook ${rec.label ?? rec.channelId}: re-registered. URL unchanged — ${res.webhookUrl}`,
+            `Webhook ${rec.label ?? rec.channelId}: re-registered. URL unchanged — ${safeUrlOrigin(res.webhookUrl)}`,
           );
         } else {
           updated.push(rec); // no re-bind material — keep the record, note it
@@ -307,7 +279,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       } catch (err) {
         updated.push(rec);
         notes.push(
-          `${rec.type} channel ${rec.label ?? rec.channelId}: re-bind failed — ${err instanceof Error ? err.message : String(err)}`,
+          `${rec.type} channel ${rec.label ?? rec.channelId}: re-bind failed — ${redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err))}`,
         );
       }
     }
@@ -487,7 +459,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       log(`auto-provisioned relay session userId=${reg.userId} at ${safeUrlOrigin(relayUrl)}`);
       return ensureClient();
     } catch (err) {
-      log(`auto-provision failed: ${redactUserinfoFromMessage(err instanceof Error ? err.message : String(err))}`);
+      log(`auto-provision failed: ${redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err))}`);
       return undefined;
     }
   }
@@ -683,7 +655,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         await c.reply({ channelType: ch.channelType, channelId: ch.channelId, content: question });
       }
     } catch (err) {
-      log(`approval: failed to send request, allowing by default: ${redactUserinfoFromMessage(err instanceof Error ? err.message : String(err))}`);
+      log(`approval: failed to send request, allowing by default: ${redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err))}`);
       return true;
     }
     log(`approval: requested for ${toolName} via ${ch.channelType}; waiting for reply`);
@@ -730,7 +702,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       log(`delivering ${messages.length} new message(s) to the agent`);
       await queueDelivery(messages);
     } catch (err) {
-      const msg = redactUserinfoFromMessage(err instanceof Error ? err.message : String(err));
+      const msg = redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err));
       log(`poll failed: ${msg}`);
     }
   }
@@ -1009,7 +981,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
             res,
           );
         } catch (err) {
-          log(`relay_reply: WS reply failed, falling back to HTTP: ${redactUserinfoFromMessage(err instanceof Error ? err.message : String(err))}`);
+          log(`relay_reply: WS reply failed, falling back to HTTP: ${redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err))}`);
         }
       }
       try {
@@ -1039,7 +1011,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
             { ok: false, error: err.message },
           );
         }
-        log(`relay_reply: HTTP reply failed: ${redactUserinfoFromMessage(err instanceof Error ? err.message : String(err))}`);
+        log(`relay_reply: HTTP reply failed: ${redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err))}`);
         throw toFriendly(err);
       }
     },
@@ -1213,7 +1185,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       }
     } catch (err) {
       ctx.ui.notify(
-        `Channel registration failed: ${redactUserinfoFromMessage(err instanceof Error ? err.message : String(err))}`,
+        `Channel registration failed: ${redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err))}`,
         "error",
       );
     }
@@ -1553,7 +1525,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
             );
         }
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err));
         ctx.ui.notify(`chaos-relay error: ${message}`, "error");
       }
     },
@@ -1728,7 +1700,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       const h = await verify.health();
       ctx.ui.notify(`Relay reachable (status=${h.status}). Credentials saved.`, "info");
     } catch (err) {
-      const message = redactUserinfoFromMessage(err instanceof Error ? err.message : String(err));
+      const message = redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err));
       ctx.ui.notify(`Saved, but health check failed: ${message}`, "warning");
     }
 
@@ -1865,11 +1837,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
             );
           }
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
+          const message = redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err));
           lines.push(`relay channels: unavailable — ${message}`);
         }
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err));
         lines.push(`relay health:  unreachable — ${message}`);
       }
     }
@@ -1939,7 +1911,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         "info",
       );
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err));
       ctx.ui.notify(
         `Couldn't create a configure link: ${message}. Check the relay connection with /chaos-relay status.`,
         "warning",
@@ -2046,7 +2018,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           detail: `health=${h.status}${h.version ? ` (v${h.version})` : ""}`,
         });
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err));
         checks.push({
           ok: false,
           label: "relay reachable",
