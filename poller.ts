@@ -7,7 +7,8 @@
  * `relay_check_messages` tool — they share one cursor via this instance.
  */
 
-import type { ChannelMessage, RelayClient } from "./relay-client.ts";
+import type { ChannelMessage, RelayClient, ReplyReference } from "./relay-client.ts";
+import { resolveReplyTo } from "./relay-client.ts";
 
 const SEEN_MAX = 1000; // hard cap before trimming
 const SEEN_KEEP = 500; // how many to retain when trimming
@@ -124,6 +125,23 @@ export class MessagePoller {
   }
 }
 
+/**
+ * One prompt line describing the message this one answered. `JSON.stringify`
+ * quotes the values so embedded quotes and newlines in a quoted question can
+ * never break the line out into the prompt.
+ */
+export function formatReplyContext(reference: ReplyReference): string {
+  const parts: string[] = [];
+  if (reference.id) parts.push(`message id=${JSON.stringify(reference.id)}`);
+  if (reference.from) parts.push(`from ${JSON.stringify(reference.from)}`);
+  const attribution = parts.length
+    ? `In reply to ${parts.join(" ")}`
+    : "In reply to";
+  return reference.text
+    ? `[${attribution}: ${JSON.stringify(reference.text)}]`
+    : `[${attribution}]`;
+}
+
 /** Format a batch of channel messages for injection into the pi agent. */
 export function formatMessagesForAgent(messages: ChannelMessage[]): string {
   if (messages.length === 0) return "No new messages from chaos-relay.";
@@ -136,6 +154,11 @@ export function formatMessagesForAgent(messages: ChannelMessage[]): string {
     lines.push(
       `--- message id=${m.id} channel=${m.channelType} channelId=${m.channelId} from="${m.from}" at=${m.timestamp} ---`,
     );
+    // A one-word answer (e.g. "Drop") is only resolvable if the quoted message
+    // it answered travels with it. Emit the reply context BEFORE the content so
+    // the agent reads what was asked before what was answered.
+    const replyTo = resolveReplyTo(m);
+    if (replyTo) lines.push(formatReplyContext(replyTo));
     lines.push(m.content);
     lines.push("");
   }

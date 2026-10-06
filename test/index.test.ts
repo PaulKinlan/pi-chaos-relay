@@ -1570,6 +1570,55 @@ test("attachment-delivery failure log redacts URL secrets from the injected mess
   }
 });
 
+// pi-chaos-relay-lv9: a reply-threaded inbound message must reach the agent with
+// the message it answered, otherwise a one-word answer like "Drop" arrives with
+// nothing to resolve it against.
+test("a reply-threaded push is injected with its quoted context before the content", async () => {
+  resetState();
+  writeProfileConfig("default", "ak_replyto");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origWs = globalThis.WebSocket;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+
+  try {
+    const fake = makeFakePi();
+    const injected: string[] = [];
+    fake.pi.sendUserMessage = (content: unknown) => {
+      injected.push(typeof content === "string" ? content : JSON.stringify(content));
+    };
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-replyto", fake.notifications));
+    assert.ok(PushWebSocket.instances.length >= 1, "WS constructed");
+
+    PushWebSocket.instances[0].pushFrame(JSON.stringify({
+      type: "message",
+      message: {
+        id: "m2",
+        channelType: "telegram",
+        channelId: "ch-reply",
+        from: "paul",
+        content: "Drop",
+        timestamp: new Date().toISOString(),
+        metadata: { replyTo: { id: "m1", text: "Should I drop the booking?", from: "hub" } },
+      },
+    }));
+
+    await waitFor(() => injected.length > 0);
+    assert.match(
+      injected[0],
+      /\[In reply to message id="m1" from "hub": "Should I drop the booking\?"\]\nDrop/,
+      `the quoted question must precede the terse answer:\n${injected[0]}`,
+    );
+    await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-replyto", fake.notifications));
+  } finally {
+    globalThis.WebSocket = origWs;
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+  }
+});
+
 
 // ── pi-chaos-relay-bxa: the profile lock is claimed atomically, pre-connect ──
 //

@@ -1577,7 +1577,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       "Poll the chaos-relay server for new inbound Telegram/email messages. " +
       "Returns any messages received since the last check. Each message includes " +
       "an id, channelType, channelId, sender, content, and private local paths for " +
-      "downloaded attachments; supported images are returned as image content. Use relay_reply to respond.",
+      "downloaded attachments; supported images are returned as image content. " +
+      "A message sent as a reply also carries an [In reply to ...] line naming the " +
+      "message it answered. Use relay_reply to respond.",
     promptSnippet: "relay_check_messages: fetch pending Telegram/email messages from chaos-relay",
     parameters: checkParams,
     async execute(_id: string, _params: Static<typeof checkParams>, _signal, _onUpdate, ctx: ExtensionContext) {

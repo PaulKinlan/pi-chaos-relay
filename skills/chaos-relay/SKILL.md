@@ -85,6 +85,12 @@ explicitly: `telegram <token>`, `discord <token>`, `email <addr>`,
 - Attachment limits are 3 files per message and 5MB each. A failed/expired file
   is reported without losing the accompanying text. Do not claim an attachment
   was received unless its local path or image content appears in the message.
+- If an inbound message was sent as a **reply**, its prompt block carries the
+  replied-to message on an `[In reply to message id="…" from "…": "quoted
+  text"]` line **before** the content (id-only channels show
+  `[In reply to message id="…"]`). Read that line before acting: it is how a
+  terse answer like "Drop" is tied to the question it answers. Still reply to
+  the **inbound** message id, not the quoted one.
 - To answer, call `relay_reply` with the `channelType`, `channelId`, and the
   inbound message `id` (as `replyTo`), plus your `content`. An unknown or
   type-mismatched `channelId` is `REFUSED by relay` — the reason names the

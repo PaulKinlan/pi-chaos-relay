@@ -120,6 +120,18 @@ export interface DownloadedAttachment {
   mimeType: string;
 }
 
+/**
+ * The message an inbound message was sent in reply to (Telegram reply-threading
+ * and any other channel that quotes). Only `id` is load-bearing for resolving a
+ * terse answer to the question it answers; `text`/`from` are echoed when the
+ * channel (or the relay) includes them.
+ */
+export interface ReplyReference {
+  id?: string;
+  text?: string;
+  from?: string;
+}
+
 export interface ChannelMessage {
   id: string;
   channelType: "webhook" | "telegram" | "discord" | "email" | "slack";
@@ -129,6 +141,82 @@ export interface ChannelMessage {
   timestamp: string;
   attachments?: InboundAttachment[];
   metadata?: Record<string, unknown>;
+  /**
+   * The replied-to message, when this one was sent as a reply. A bare string is
+   * the replied-to message id. Read it through {@link resolveReplyTo}, which
+   * also covers the snake_case (`reply_to`) and `metadata` spellings the relay
+   * uses for different channels.
+   */
+  replyTo?: ReplyReference | string;
+  /** snake_case alias of {@link replyTo}. */
+  reply_to?: ReplyReference | string;
+}
+
+function firstString(record: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return undefined;
+}
+
+/** Message ids may arrive as numbers (Telegram `message_id`); normalise to text. */
+function firstId(record: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value;
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return undefined;
+}
+
+/** Keys under which a channel may nest the replied-to message one level down. */
+const REPLY_NESTED_KEYS = ["message", "replyToMessage", "reply_to_message"];
+
+/** Normalise any reply payload spelling into a {@link ReplyReference}. */
+function replyReferenceFrom(value: unknown): ReplyReference | undefined {
+  if (typeof value === "string") return value.trim() ? { id: value } : undefined;
+  if (typeof value === "number") return Number.isFinite(value) ? { id: String(value) } : undefined;
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const id = firstId(record, ["id", "messageId", "message_id"]);
+  const text = firstString(record, ["text", "quotedText", "quoted_text"]);
+  const from = firstString(record, ["from", "sender"]);
+  if (id || text || from) {
+    return {
+      ...(id ? { id } : {}),
+      ...(text ? { text } : {}),
+      ...(from ? { from } : {}),
+    };
+  }
+  // Telegram-shaped payloads carry the quoted message as a nested object
+  // (`reply_to_message: { message_id, text }`) rather than flat fields.
+  for (const key of REPLY_NESTED_KEYS) {
+    const nested = replyReferenceFrom(record[key]);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+/**
+ * Resolve the replied-to message for an inbound message, wherever the relay put
+ * it: top-level `replyTo`/`reply_to`, or `metadata.replyTo`/`metadata.reply_to`
+ * (plus the Telegram-shaped `reply_to_message` variants). Returns undefined when
+ * the message is not a reply — callers must treat that as "no reply context"
+ * and format the bare message as before.
+ */
+export function resolveReplyTo(message: ChannelMessage): ReplyReference | undefined {
+  // Read through an index signature: the WebSocket transport forwards channel
+  // payloads as-is, so a snake_case `reply_to_message` can sit at the top level
+  // even though it is not part of the interface.
+  const raw = message as unknown as Record<string, unknown>;
+  for (const key of ["replyTo", "reply_to", "replyToMessage", "reply_to_message"]) {
+    for (const source of [raw[key], message.metadata?.[key]]) {
+      const reference = replyReferenceFrom(source);
+      if (reference) return reference;
+    }
+  }
+  return undefined;
 }
 
 export interface GetMessagesResult {

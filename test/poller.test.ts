@@ -180,3 +180,99 @@ test("formatMessagesForAgent handles empty and non-empty", () => {
   assert.match(out, /hello world/);
   assert.match(out, /relay_reply/);
 });
+
+test("formatMessagesForAgent surfaces a top-level replyTo object before the content", () => {
+  const out = formatMessagesForAgent([
+    {
+      ...msg("m2", "Drop"),
+      replyTo: { id: "m1", text: "Should I drop the booking?", from: "hub" },
+    },
+  ]);
+  assert.match(
+    out,
+    /\[In reply to message id="m1" from "hub": "Should I drop the booking\?"\]/,
+  );
+  // Order matters: quoted question first, terse answer second.
+  assert.ok(
+    out.indexOf("Should I drop the booking?") < out.indexOf("Drop"),
+    `reply context must precede the content:\n${out}`,
+  );
+  assert.match(out, /--- message id=m2 /);
+});
+
+test("formatMessagesForAgent renders a bare-string replyTo as a message id", () => {
+  const out = formatMessagesForAgent([{ ...msg("m2", "Drop"), replyTo: "m1" }]);
+  assert.match(out, /^\[In reply to message id="m1"\]$/m);
+  assert.doesNotMatch(out, /In reply to: "/);
+});
+
+test("formatMessagesForAgent renders a top-level snake_case reply_to string", () => {
+  const out = formatMessagesForAgent([{ ...msg("m2", "Drop"), reply_to: "m1" }]);
+  assert.match(out, /^\[In reply to message id="m1"\]$/m);
+});
+
+test("formatMessagesForAgent reads reply context out of metadata", () => {
+  const out = formatMessagesForAgent([
+    {
+      ...msg("m2", "Drop"),
+      metadata: { replyTo: { messageId: "m1", quotedText: "Drop the booking?", sender: "hub" } },
+    },
+  ]);
+  assert.match(
+    out,
+    /\[In reply to message id="m1" from "hub": "Drop the booking\?"\]/,
+  );
+});
+
+test("formatMessagesForAgent reads snake_case reply_to out of metadata", () => {
+  const out = formatMessagesForAgent([
+    { ...msg("m2", "Drop"), metadata: { reply_to: { id: "m1", text: "Drop it?" } } },
+  ]);
+  assert.match(out, /\[In reply to message id="m1": "Drop it\?"\]/);
+});
+
+test("formatMessagesForAgent falls back to quoted text when the id is missing", () => {
+  const out = formatMessagesForAgent([
+    { ...msg("m2", "Drop"), replyTo: { text: "Drop the booking?" } },
+  ]);
+  assert.match(out, /^\[In reply to: "Drop the booking\?"\]$/m);
+});
+
+test("formatMessagesForAgent keeps quoted text on one line, quotes escaped", () => {
+  const out = formatMessagesForAgent([
+    { ...msg("m2", "yes"), replyTo: { id: "m1", text: 'Ask "hub"\ndrop it?' } },
+  ]);
+  assert.match(out, /^\[In reply to message id="m1": "Ask \\"hub\\"\\ndrop it\?"\]$/m);
+});
+
+test("formatMessagesForAgent leaves non-reply messages unchanged", () => {
+  // Backwards compatibility pin: a message with no reply context (and metadata
+  // that is present but carries nothing reply-shaped) formats exactly as before
+  // — header, then content, with no `In reply to` line anywhere.
+  const out = formatMessagesForAgent([{ ...msg("x", "hello"), metadata: { transport: "ws" } }]);
+  assert.equal(
+    out,
+    "You have 1 new message(s) from chaos-relay. " +
+      "Reply via the relay_reply tool (pass back channelType, channelId, and the message id as replyTo).\n\n" +
+      '--- message id=x channel=telegram channelId=ch1 from="alice" at=2026-01-01T00:00:00Z ---\n' +
+      "hello\n",
+  );
+  assert.doesNotMatch(out, /In reply to/);
+});
+
+test("formatMessagesForAgent ignores a non-reply-shaped replyTo value", () => {
+  const out = formatMessagesForAgent([
+    { ...msg("x", "hello"), replyTo: { ok: true } as never },
+  ]);
+  assert.doesNotMatch(out, /In reply to/);
+});
+
+test("formatMessagesForAgent resolves a Telegram-shaped nested reply_to_message", () => {
+  const out = formatMessagesForAgent([
+    {
+      ...msg("m2", "Drop"),
+      metadata: { reply_to_message: { message_id: 41, text: "Drop the booking?" } } as never,
+    },
+  ]);
+  assert.match(out, /\[In reply to message id="41": "Drop the booking\?"\]/);
+});
