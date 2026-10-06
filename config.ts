@@ -299,6 +299,17 @@ export function resolveProfileCreate(opts: {
   existingCount: number;
   limit?: number;
 }): ProfileCreateOutcome {
+  // ACCEPTED RESIDUAL (pi-chaos-relay-icj): the count is read before an async
+  // registration writes the new config, so two SEPARATE pi processes that both
+  // start at limit-1 can both pass this check and both create, ending one over
+  // the cap. It is accepted rather than locked because the cap is a resource
+  // guard (bounding identity/keypair files in ~/.pi), not a security boundary;
+  // reaching it needs two processes to collide at exactly the limit; tool
+  // execution is already serialized within a process, so a single pi cannot
+  // race itself; and a second filesystem-locking mechanism beside the profile
+  // locks would cost more than the residual it closes pre-1.0. One file over a
+  // 100-cap bound is harmless, and the next creation attempt sees the true
+  // count. Revisit if the cap ever becomes a security control.
   const limit = opts.limit ?? MAX_PROFILE_CONFIGS;
   if (opts.exists) return { action: "allow", profile: opts.profile };
   if (opts.existingCount >= limit) {

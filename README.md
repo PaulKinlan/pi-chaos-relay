@@ -111,6 +111,13 @@ with a clear message and nothing is written**. Reuse an existing profile
 (`/chaos-relay profile <name>`) or remove unused `chaos-relay*.json` files to
 create another.
 
+The cap is a resource guard, not a security boundary, and it is enforced
+per-process: two separate pi processes that both start at 99 profiles could each
+pass the check before either writes, ending one or two over. That is an accepted
+residual (pi-chaos-relay-icj) — a single process cannot race itself, reaching it
+needs a deliberate collision at exactly the limit, and the worst case is a
+handful of extra files in `~/.pi`. The next creation attempt sees the true count.
+
 Switching re-points **this** pi instance at that profile's identity (one active
 connection at a time). To have **two connections live simultaneously**, launch
 two instances with `CHAOS_RELAY_PROFILE=<name>` as above.

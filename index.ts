@@ -134,14 +134,35 @@ function isProcessAlive(pid: number): boolean {
  */
 const LOCK_CREATE_GRACE_MS = 1_000;
 
-/** Read the pid recorded in a lock file, or null if it is missing/unparseable. */
-function readLockHolder(path: string): number | null {
+/**
+ * What a lock file's contents say:
+ *  - "ambiguous": empty, partial or unparseable. Another process's exclusive
+ *    create is visible from open(2), before its pid is written, so this may be
+ *    a live racer: the create-grace applies.
+ *  - "invalid-pid": numeric but unusable as a holder (0 or negative). Never
+ *    ambiguous — no process has pid 0, and process.kill(0, 0) signals the
+ *    caller's own process group and succeeds, which is exactly why such a file
+ *    must NOT look like a live holder.
+ *  - "pid": a usable pid.
+ */
+type LockHolder =
+  | { kind: "ambiguous" }
+  | { kind: "invalid-pid" }
+  | { kind: "pid"; pid: number };
+
+/** Read what a lock file records. Missing/unreadable files read as ambiguous. */
+function readLockHolder(path: string): LockHolder {
+  let raw: string;
   try {
-    const pid = parseInt(readFileSync(path, "utf-8").trim(), 10);
-    return Number.isNaN(pid) ? null : pid;
+    raw = readFileSync(path, "utf-8").trim();
   } catch {
-    return null;
+    return { kind: "ambiguous" };
   }
+  if (raw === "") return { kind: "ambiguous" };
+  const pid = Number.parseInt(raw, 10);
+  if (Number.isNaN(pid)) return { kind: "ambiguous" };
+  if (pid <= 0) return { kind: "invalid-pid" };
+  return { kind: "pid", pid };
 }
 
 /**
@@ -191,28 +212,33 @@ export function claimProfileLock(profile: string): {
         };
       }
       const holder = readLockHolder(path);
-      if (holder !== null && holder !== process.pid && isProcessAlive(holder)) {
-        return { claimed: false, pid: holder, path };
+      if (holder.kind === "pid" && holder.pid !== process.pid && isProcessAlive(holder.pid)) {
+        return { claimed: false, pid: holder.pid, path };
       }
-      if (holder === null) {
-        // Unparseable/empty content is AMBIGUOUS: `open(2)` creates the file
-        // before the winner writes its pid, so a racer that reads it in that
-        // microsecond window would see an empty file and (if it treated that
-        // as stale) delete a live process's lock from under it — the same
-        // double-claim this fix exists to prevent. Reclaim such a file only
-        // once it is older than the grace window; before that, treat it as
-        // held and refuse.
+      if (holder.kind === "ambiguous") {
+        // AMBIGUOUS content: `open(2)` creates the file before the winner
+        // writes its pid, so a racer that reads it in that window would see an
+        // empty (or partial) file and — treating that as stale — delete a live
+        // process's lock from under it, the very double-claim this exists to
+        // prevent. Reclaim such a file only once it is older than the grace
+        // window; before that, treat it as held and refuse.
         let ageMs = Number.POSITIVE_INFINITY;
         try {
           ageMs = Date.now() - statSync(path).mtimeMs;
         } catch {
           /* vanished between read and stat: fall through to the retry */
         }
-        if (ageMs < LOCK_CREATE_GRACE_MS) return { claimed: false, pid: null, path };
+        // Only a non-negative age inside the window is "possibly still being
+        // created". A NEGATIVE age means the file's mtime is in the future (a
+        // clock step, NTP correction), which would otherwise keep an empty
+        // lock inside the grace window until the wall clock caught up and
+        // block this profile indefinitely; treat it as stale instead.
+        if (ageMs >= 0 && ageMs < LOCK_CREATE_GRACE_MS) return { claimed: false, pid: null, path };
       }
-      // Stale (dead pid, or an old unparseable file, or our own pid) — clear it
-      // and retry the exclusive create; a racing cleaner just means we see
-      // EEXIST again.
+      // Stale: a dead holder's pid, our own pid, an invalid pid (0/negative —
+      // no process has pid 0), or an ambiguous file past the grace window.
+      // Clear it and retry the exclusive create; a racing cleaner just means we
+      // see EEXIST again.
       try {
         unlinkSync(path);
       } catch {
@@ -221,7 +247,8 @@ export function claimProfileLock(profile: string): {
     }
   }
   // Lost the retry loop: a real collision, not a stale file.
-  return { claimed: false, pid: readLockHolder(path), path };
+  const holder = readLockHolder(path);
+  return { claimed: false, pid: holder.kind === "pid" ? holder.pid : null, path };
 }
 
 /** Release the profile lock on shutdown — but only a lock this process wrote.
@@ -331,7 +358,12 @@ export class ApprovalQueue {
    */
   settle(message: { channelId: string; content: string }): boolean {
     if (this.pending.size === 0) return false;
-    const addressed = /^\s*#(\d+)\b/.exec(message.content);
+    // The reference may be followed by punctuation rather than a bare space —
+    // "#2: yes", "#2 - yes", "#2, no" are all answers. Requiring whitespace
+    // only (the original /^\s*#(\d+)\b/) sent the remainder ": yes" to the
+    // yes/no test, which read it as a denial: a real footgun for anyone who
+    // punctuates naturally.
+    const addressed = /^\s*#(\d+)\s*[:\-–,]?\s*/.exec(message.content);
     let id: string | undefined;
     let body = message.content;
     if (addressed) {
@@ -822,8 +854,12 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const previousProfile = currentProfile;
     const { isNew, connected } = await connectAsProfile(name, notify);
     if (!connected) {
-      // Keep the claim: this session selected the identity and the poller keeps
-      // retrying. Releasing it here would reopen the race we just closed.
+      // Release the profile we just left even though the switch FAILED:
+      // connectAsProfile() already re-pointed this session at the target, so
+      // holding the old profile's lock would block another session from a
+      // profile nobody is using until this process exits. Keep the new claim
+      // (the poller keeps retrying the target).
+      if (previousProfile && previousProfile !== slug) removeProfileLock(previousProfile);
       return `Switched config to profile "${slug}" but couldn't reach the relay to connect — check your network, then /chaos-relay status.`;
     }
     // Released only after the switch succeeded: this session no longer uses the
