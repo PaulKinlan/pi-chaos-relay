@@ -391,10 +391,17 @@ test("downloadAttachment rejects declared responses over 5MB before buffering", 
 });
 
 test("control-plane responses are size-capped (oversized body is rejected)", async () => {
-  // 6 MB > the 5 MB control-plane cap. A hostile relay returning this must be
-  // rejected with a clear bounded error, not buffered in full.
-  const big = "x".repeat(6 * 1024 * 1024);
-  const fn = (async () => new Response(big, { status: 200 })) as unknown as typeof fetch;
+  // Stream the oversized body instead of pre-allocating it, and spy on cancel
+  // so a regression back to buffering-then-checking cannot silently pass.
+  let cancelled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(3 * 1024 * 1024));
+      controller.enqueue(new Uint8Array(3 * 1024 * 1024));
+    },
+    cancel() { cancelled = true; },
+  });
+  const fn = (async () => new Response(stream, { status: 200 })) as unknown as typeof fetch;
   const client = new RelayClient({ relayUrl: "http://relay", apiKey: "k", fetchImpl: fn });
   await assert.rejects(
     client.getMessages(),
@@ -403,6 +410,7 @@ test("control-plane responses are size-capped (oversized body is rejected)", asy
       err.status === 413 &&
       /exceeds 5MB limit/.test(err.message),
   );
+  assert.equal(cancelled, true);
 });
 
 test("control-plane responses within the cap still round-trip", async () => {
