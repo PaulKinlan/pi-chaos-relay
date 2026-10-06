@@ -27,7 +27,7 @@ import {
   mimeForFile,
   type ReplyAttachment,
 } from "./relay-client.ts";
-import { readFileSync, appendFileSync, mkdirSync, existsSync, writeFileSync, unlinkSync } from "node:fs";
+import { readFileSync, appendFileSync, mkdirSync, existsSync, writeFileSync, unlinkSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -125,7 +125,14 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-/** Check if another live pi process holds the lock for this profile. */
+/**
+ * How long an unparseable/empty lock file must be untouched before it is
+ * treated as a crashed leftover rather than another process's in-flight
+ * exclusive create (see claimProfileLock).
+ */
+const LOCK_CREATE_GRACE_MS = 1_000;
+
+/** Read the pid recorded in a lock file, or null if it is missing/unparseable. */
 function readLockHolder(path: string): number | null {
   try {
     const pid = parseInt(readFileSync(path, "utf-8").trim(), 10);
@@ -185,8 +192,25 @@ export function claimProfileLock(profile: string): {
       if (holder !== null && holder !== process.pid && isProcessAlive(holder)) {
         return { claimed: false, pid: holder, path };
       }
-      // Stale (dead pid, garbage, or our own pid) — clear it and retry the
-      // exclusive create; a racing cleaner just means we see EEXIST again.
+      if (holder === null) {
+        // Unparseable/empty content is AMBIGUOUS: `open(2)` creates the file
+        // before the winner writes its pid, so a racer that reads it in that
+        // microsecond window would see an empty file and (if it treated that
+        // as stale) delete a live process's lock from under it — the same
+        // double-claim this fix exists to prevent. Reclaim such a file only
+        // once it is older than the grace window; before that, treat it as
+        // held and refuse.
+        let ageMs = Number.POSITIVE_INFINITY;
+        try {
+          ageMs = Date.now() - statSync(path).mtimeMs;
+        } catch {
+          /* vanished between read and stat: fall through to the retry */
+        }
+        if (ageMs < LOCK_CREATE_GRACE_MS) return { claimed: false, pid: null, path };
+      }
+      // Stale (dead pid, or an old unparseable file, or our own pid) — clear it
+      // and retry the exclusive create; a racing cleaner just means we see
+      // EEXIST again.
       try {
         unlinkSync(path);
       } catch {
@@ -733,10 +757,40 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     if (profilePathForName(name) === getConfigPath()) {
       return `Already on profile "${slug}".`;
     }
+    // Claim the target profile ATOMICALLY and BEFORE connectAsProfile() — the
+    // same TOCTOU the session_start path had. connectAsProfile() can perform a
+    // live relay registration, so checking (or writing) the lock after it
+    // would let two sessions switching to one profile concurrently both
+    // connect and share the identity.
+    const claim = claimProfileLock(slug);
+    if (claim.lockError) {
+      log(
+        `profile switch: could not create the lock for "${slug}" (${claim.lockError}) — ` +
+          `continuing without one; concurrent sessions on this profile cannot be detected`,
+      );
+    }
+    const decision = resolveProfileLockCollision({
+      profile: slug,
+      locked: !claim.claimed,
+      pid: claim.pid,
+      lockPath: claim.path,
+    });
+    if (decision.action === "refuse") {
+      log(`profile switch: ${decision.message}`);
+      return decision.message;
+    }
+    const previousProfile = currentProfile;
     const { isNew, connected } = await connectAsProfile(name, notify);
     if (!connected) {
+      // Keep the claim: this session selected the identity and the poller keeps
+      // retrying. Releasing it here would reopen the race we just closed.
       return `Switched config to profile "${slug}" but couldn't reach the relay to connect — check your network, then /chaos-relay status.`;
     }
+    // Released only after the switch succeeded: this session no longer uses the
+    // previous profile, and holding its lock would block another session from
+    // taking it for as long as we live. removeProfileLock is pid-guarded, so a
+    // profile that is not ours (or not locked) is left alone.
+    if (previousProfile && previousProfile !== slug) removeProfileLock(previousProfile);
     const channelCount = cfg.channels.length;
     return isNew
       ? `Created and connected new profile "${slug}" (fresh identity). ` +
