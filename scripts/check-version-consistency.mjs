@@ -276,10 +276,20 @@ function main() {
 function isEntryPoint() {
   const invoked = process.argv[1];
   if (!invoked) return false;
+  const raw = pathToFileURL(invoked).href;
+  // Test the RAW url FIRST. Under --preserve-symlinks-main (or
+  // --preserve-symlinks via NODE_OPTIONS) import.meta.url keeps the SYMLINK
+  // url while realpathSync(invoked) returns the target, so a canonicalize-only
+  // comparison is false and main() is skipped — exit 0, the same silent gate
+  // bypass reached through a different flag.
+  if (import.meta.url === raw) return true;
   try {
     return import.meta.url === pathToFileURL(realpathSync(invoked)).href;
   } catch {
-    return import.meta.url === pathToFileURL(invoked).href;
+    // realpath unavailable (path deleted mid-run, exotic mount): the raw
+    // comparison above has already been tried, so there is nothing else to
+    // match against. Refuse to run rather than skipping the check silently.
+    return false;
   }
 }
 

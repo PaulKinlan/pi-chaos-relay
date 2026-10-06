@@ -1440,3 +1440,46 @@ test("a switch whose connect fails releases the previous profile's lock", async 
   );
   t.diagnostic(`notifications: ${JSON.stringify(fake.notifications.map((n) => n.message))}`);
 });
+
+// ── pi-chaos-relay-vut: same-millisecond mtime skew must not unlink a fresh lock
+
+test("an empty lock read in the same millisecond it was created is still held", () => {
+  resetState();
+  const lock = lockPath("same-ms");
+  writeFileSync(lock, "");
+  // Deterministically reproduce the skew the reviewer found: Date.now() is
+  // integer ms while mtimeMs is fractional, so a lock created and read inside
+  // one millisecond yields ageMs ≈ -0.8. The old `ageMs >= 0` test treated that
+  // as a future mtime and UNLINKED a mid-create lock — the window the grace
+  // exists to protect (and it made the sibling test pass only by timing luck).
+  // 20ms ahead: inside the 50ms tolerance with room for the few ms of drift
+  // between setting the mtime and reading it (a 1ms probe drifts to ~0 and
+  // stops discriminating). The real skew is sub-millisecond; this pins the
+  // tolerance band itself.
+  const slightlyAhead = Date.now() / 1000 + 0.02;
+  utimesSync(lock, slightlyAhead, slightlyAhead);
+  const claimed = claimProfileLock("same-ms");
+  assert.equal(claimed.claimed, false, "same-millisecond skew is inside the grace window");
+  assert.equal(readFileSync(lock, "utf-8"), "", "and the file was not unlinked");
+
+  // The tolerance is bounded: a REAL future mtime stays stale and reclaimable.
+  const future = Date.now() / 1000 + 5;
+  utimesSync(lock, future, future);
+  const reclaimed = claimProfileLock("same-ms");
+  assert.equal(reclaimed.claimed, true, "a genuinely future-dated lock is stale, not in grace");
+});
+
+// ── pi-chaos-relay-nz5: the em dash iOS QuickType inserts for '--'
+
+test("an approval reference followed by an em dash still counts as an answer", async () => {
+  const q = new ApprovalQueue(60_000);
+  // iOS QuickType turns a typed '--' into U+2014 (em dash); the reference class
+  // covered ':' '-' en-dash and ',' but not the em dash, so this denied.
+  const a = q.add({ channelId: "c1", toolName: "bash" });
+  assert.equal(q.settle({ channelId: "c1", content: `#${a.ref} — yes` }), true);
+  assert.equal(await a.promise, true, "'#N — yes' (em dash U+2014) approves");
+
+  const b = q.add({ channelId: "c1", toolName: "edit" });
+  assert.equal(q.settle({ channelId: "c1", content: `#${b.ref}\u2014no` }), true, "no space needed either");
+  assert.equal(await b.promise, false, "'#N—no' denies");
+});

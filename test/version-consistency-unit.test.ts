@@ -22,8 +22,11 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const SCRIPT = new URL("../scripts/check-version-consistency.mjs", import.meta.url);
+// fileURLToPath, not URL.pathname: pathname percent-encodes and is not a path.
+const SCRIPT_PATH = fileURLToPath(SCRIPT);
 
 const { compareVersions } = (await import(SCRIPT.href)) as {
   compareVersions: (a: string, b: string) => number;
@@ -135,7 +138,7 @@ test("the entry-point guard survives being invoked through a SYMLINK", () => {
     writeFileSync(join(dir, "package-lock.json"), JSON.stringify({ name: "x", version: "0.9.0", packages: { "": { version: "0.9.0" } } }) + "\n");
 
     const link = join(dir, "gate-link.mjs");
-    symlinkSync(SCRIPT.pathname, link);
+    symlinkSync(SCRIPT_PATH, link);
 
     const result = spawnSync(process.execPath, [link, "--base", "HEAD", "--dir", dir], {
       cwd: dir,
@@ -150,11 +153,50 @@ test("the entry-point guard survives being invoked through a SYMLINK", () => {
     assert.match(result.stderr, /!= package-lock\.json/, `it reported the disagreement: ${result.stderr}`);
 
     // …and the same invocation NOT through a symlink behaves identically.
-    const direct = spawnSync(process.execPath, [SCRIPT.pathname, "--base", "HEAD", "--dir", dir], {
+    const direct = spawnSync(process.execPath, [SCRIPT_PATH, "--base", "HEAD", "--dir", dir], {
       cwd: dir,
       encoding: "utf8",
     });
     assert.equal(direct.status, 1, "direct invocation also fails the bad fixture");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the guard also holds under --preserve-symlinks-main (import.meta.url keeps the symlink)", () => {
+  // Under --preserve-symlinks-main / --preserve-symlinks, import.meta.url stays
+  // the SYMLINK url while realpathSync(argv[1]) resolves to the target, so a
+  // canonicalize-only comparison was false, main() was skipped and the process
+  // exited 0 — the silent bypass again, reached through a flag instead of a
+  // plain symlink. The guard now tests the raw url first.
+  const dir = mkdtempSync(join(tmpdir(), "version-gate-preserve-"));
+  try {
+    const gitEnv = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
+    const run = (args: string[]) => spawnSync("git", args, { cwd: dir, env: gitEnv, encoding: "utf8" });
+    run(["init", "-q"]);
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "x", version: "1.0.0" }) + "\n");
+    writeFileSync(join(dir, "package-lock.json"), JSON.stringify({ name: "x", version: "1.0.0", packages: { "": { version: "1.0.0" } } }) + "\n");
+    run(["add", "-A"]);
+    run(["commit", "-q", "-m", "fixture"]);
+    // Disagree with itself so a real check must fail.
+    writeFileSync(join(dir, "package-lock.json"), JSON.stringify({ name: "x", version: "0.9.0", packages: { "": { version: "0.9.0" } } }) + "\n");
+
+    const link = join(dir, "gate-preserve.mjs");
+    symlinkSync(SCRIPT_PATH, link);
+
+    for (const flag of ["--preserve-symlinks-main", "--preserve-symlinks"]) {
+      const result = spawnSync(process.execPath, [flag, link, "--base", "HEAD", "--dir", dir], {
+        cwd: dir,
+        encoding: "utf8",
+      });
+      assert.equal(
+        result.status,
+        1,
+        `${flag}: the gate must still CHECK through a symlink (exit 1, not a silent 0): ` +
+          `status=${result.status} stdout=${result.stdout} stderr=${result.stderr}`,
+      );
+      assert.match(result.stderr, /!= package-lock\.json/, `${flag}: reported the disagreement`);
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

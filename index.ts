@@ -135,6 +135,16 @@ function isProcessAlive(pid: number): boolean {
 const LOCK_CREATE_GRACE_MS = 1_000;
 
 /**
+ * Tolerance below zero for the create-grace age check: Date.now() is integer
+ * milliseconds while statSync().mtimeMs is fractional, so a lock created and
+ * read within the SAME millisecond has a legitimately negative age of well
+ * under 1 ms. Rejecting that unlinked a mid-create lock — the exact window the
+ * grace exists to protect. Anything beyond this tolerance is a real future
+ * mtime (a clock step), which stays stale.
+ */
+const LOCK_CREATE_SKEW_TOLERANCE_MS = 50;
+
+/**
  * What a lock file's contents say:
  *  - "ambiguous": empty, partial or unparseable. Another process's exclusive
  *    create is visible from open(2), before its pid is written, so this may be
@@ -228,12 +238,12 @@ export function claimProfileLock(profile: string): {
         } catch {
           /* vanished between read and stat: fall through to the retry */
         }
-        // Only a non-negative age inside the window is "possibly still being
-        // created". A NEGATIVE age means the file's mtime is in the future (a
-        // clock step, NTP correction), which would otherwise keep an empty
-        // lock inside the grace window until the wall clock caught up and
-        // block this profile indefinitely; treat it as stale instead.
-        if (ageMs >= 0 && ageMs < LOCK_CREATE_GRACE_MS) return { claimed: false, pid: null, path };
+        // Only an age inside the window is "possibly still being created".
+        // The window extends slightly BELOW zero for same-millisecond skew (see
+        // LOCK_CREATE_SKEW_TOLERANCE_MS); a real clock step is far outside it.
+        if (ageMs >= -LOCK_CREATE_SKEW_TOLERANCE_MS && ageMs < LOCK_CREATE_GRACE_MS) {
+          return { claimed: false, pid: null, path };
+        }
       }
       // Stale: a dead holder's pid, our own pid, an invalid pid (0/negative —
       // no process has pid 0), or an ambiguous file past the grace window.
@@ -363,7 +373,7 @@ export class ApprovalQueue {
     // only (the original /^\s*#(\d+)\b/) sent the remainder ": yes" to the
     // yes/no test, which read it as a denial: a real footgun for anyone who
     // punctuates naturally.
-    const addressed = /^\s*#(\d+)\s*[:\-–,]?\s*/.exec(message.content);
+    const addressed = /^\s*#(\d+)\s*[:\-–—,]?\s*/.exec(message.content);
     let id: string | undefined;
     let body = message.content;
     if (addressed) {
