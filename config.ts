@@ -225,9 +225,12 @@ export function listProfiles(): { name: string; active: boolean }[] {
 export type ApprovalMode = "off" | "writes" | "all";
 export const APPROVAL_MODES: ApprovalMode[] = ["off", "writes", "all"];
 
-/** Coerce an arbitrary value to a valid ApprovalMode, defaulting to "off". */
+/** Coerce an arbitrary value to a valid ApprovalMode, defaulting to "writes" so a
+ *  channel-driven session is NOT ungated out of the box. "off" remains an
+ *  explicit opt-out; an absent or malformed value falls back to the gated
+ *  default rather than silently disabling the gate. */
 export function normalizeApprovalMode(v: unknown): ApprovalMode {
-  return APPROVAL_MODES.includes(v as ApprovalMode) ? (v as ApprovalMode) : "off";
+  return APPROVAL_MODES.includes(v as ApprovalMode) ? (v as ApprovalMode) : "writes";
 }
 
 /**
@@ -266,9 +269,10 @@ export interface PersistedConfig {
   channels?: RegisteredChannelRecord[];
   /**
    * Tool-approval policy for channel-driven turns:
-   *  - "off"    (default) — run every tool autonomously (sandbox the agent).
-   *  - "writes" — ask over the channel before shell/edit/write tools run.
-   *  - "all"    — ask before EVERY tool (except the relay_* plumbing).
+   *  - "writes" (default) — ask over the channel before shell/edit/write tools
+   *    run (and before relay_reply ships a file attachment).
+   *  - "off"    — run every tool autonomously (explicit opt-out; sandbox the agent).
+   *  - "all"    — ask before EVERY tool (except the read-only relay plumbing).
    */
   approvalMode?: ApprovalMode;
   /**

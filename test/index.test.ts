@@ -1372,7 +1372,9 @@ test("a turn that starts during slow attachment hydration does not consume the n
   }) as unknown as typeof fetch;
 
   const flushAsync = async () => {
-    await new Promise((r) => setTimeout(r, 30));
+    // Poll a few real ticks so a slow hydration (or a congested event loop under
+    // the full suite) cannot make the turn-origin timing flaky.
+    for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 5));
   };
 
   const fake = makeFakePi();

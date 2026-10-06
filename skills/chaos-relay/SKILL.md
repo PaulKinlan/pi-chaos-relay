@@ -142,6 +142,8 @@ and persists across restarts (resuming a session reconnects as the same identity
 ## Tool approvals
 
 When the agent acts on an inbound channel message, you can gate destructive
-tools: `off` = fully autonomous (default), `writes` = ask over the channel
-before shell/edit/write, `all` = ask before every tool. Set with
-`/chaos-relay approvals writes` or the `CHAOS_RELAY_APPROVAL_MODE` env var.
+tools: `writes` = ask over the channel before shell/edit/write (the default),
+`all` = ask before every tool except the read-only relay plumbing, `off` =
+fully autonomous (explicit opt-out). Set with
+`/chaos-relay approvals <off|writes|all>` or the `CHAOS_RELAY_APPROVAL_MODE`
+env var.
