@@ -30,8 +30,8 @@ test("writes: relay_reply is gated only with outbound files", () => {
   );
 });
 
-test("writes: a text-only relay_reply is gated once the turn has read local files", () => {
-  // Fresh turn (no local-file read yet): the conversation still flows freely.
+test("writes: a text-only relay_reply is gated once the session has read local files", () => {
+  // Fresh session (no local-file read yet): the conversation still flows freely.
   assert.equal(
     approvalDecision("writes", "relay_reply", {}, { hasReadLocalFile: false }),
     false,
@@ -40,14 +40,14 @@ test("writes: a text-only relay_reply is gated once the turn has read local file
     approvalDecision("writes", "relay_reply", { content: "hi" }),
     false,
   );
-  // After a read/grep in this turn, a plain-text reply can carry file contents
-  // out — gate it.
+  // After a read/grep in the session (possibly an earlier turn), a plain-text
+  // reply can carry file contents out — gate it.
   assert.equal(
     approvalDecision("writes", "relay_reply", { content: "secret" }, { hasReadLocalFile: true }),
     true,
     "read -> text reply is the exfiltration path and must be gated",
   );
-  // File attachments stay gated regardless of turn state.
+  // File attachments stay gated regardless of session state.
   assert.equal(
     approvalDecision("writes", "relay_reply", { files: ["/x"] }, { hasReadLocalFile: false }),
     true,
@@ -65,7 +65,7 @@ test("LOCAL_FILE_READ_TOOLS names the content-returning local-file tools", () =>
   assert.equal(LOCAL_FILE_READ_TOOLS.has("bash"), false, "bash is gated separately as write-class");
 });
 
-test("off: turn read state does not gate anything (explicit opt-out)", () => {
+test("off: session read state does not gate anything (explicit opt-out)", () => {
   assert.equal(approvalDecision("off", "relay_reply", { content: "x" }, { hasReadLocalFile: true }), false);
   assert.equal(approvalDecision("off", "read", {}, { hasReadLocalFile: true }), false);
 });

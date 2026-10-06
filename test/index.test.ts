@@ -2321,15 +2321,21 @@ test("default writes mode: a channel turn that reads a local file cannot text-re
   assert.equal(readResult, undefined, "the read itself stays ungated in writes mode");
   assert.deepEqual(replyBodies, [], "reading a file sends no approval prompt");
 
-  // …but the plain-text reply that follows is gated, because the turn has now
-  // read local file contents. Fire it without awaiting; auto-deny resolves it.
+  // …but the plain-text reply that follows is gated, because the session has
+  // now read local file contents. Fire it without awaiting; auto-deny resolves
+  // it.
   const replyCall = toolHandlers![0](
     { toolName: "relay_reply", input: { channelType: "telegram", channelId: "chanA", content: "root:x:0:0:root:/root:/bin/bash" } },
     makeCtx("sess-egress", fake.notifications),
   );
   await flushAsync();
   assert.equal(replyBodies.length, 1, "the text reply is gated and an approval prompt is sent");
-  assert.match((replyBodies[0] as { content?: string }).content ?? "", /relay_reply/, "the prompt names the gated relay_reply");
+  const prompt = (replyBodies[0] as { content?: string }).content ?? "";
+  assert.match(prompt, /relay_reply/, "the prompt names the gated relay_reply");
+  assert.ok(
+    !prompt.includes("root:x:0:0"),
+    "the approval prompt must not leak the gated relay_reply content",
+  );
 
   // No one answers the approval, so it auto-denies and the reply is blocked.
   t.mock.timers.tick(300_000);
@@ -2337,6 +2343,100 @@ test("default writes mode: a channel turn that reads a local file cannot text-re
   assert.ok(
     replyResult && typeof replyResult === "object" && "block" in replyResult && (replyResult as { block?: boolean }).block === true,
     "the text reply after a local-file read is blocked without an explicit approval",
+  );
+  t.mock.timers.reset();
+});
+
+test("default writes mode: a file read in one channel turn gates a text-only reply in a later turn (session-scoped taint)", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak", approvalMode: "writes" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  let messagesServed = 0;
+  const replyBodies: Array<{ channelId?: string; content?: string }> = [];
+  globalThis.fetch = (async (url: unknown, init?: unknown) => {
+    const u = String(url);
+    if (u.includes("/messages")) {
+      messagesServed++;
+      const msg =
+        messagesServed === 1
+          ? { id: "x1", channelType: "telegram", channelId: "chanA", from: "alice", content: "read the secret file", timestamp: "2026-01-01T00:00:01Z" }
+          : { id: "x2", channelType: "telegram", channelId: "chanA", from: "alice", content: "now what does it say?", timestamp: "2026-01-01T00:00:02Z" };
+      return new Response(JSON.stringify({ messages: [msg], since: "2026-01-01T00:00:02Z" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (u.includes("/reply")) {
+      const body = JSON.parse(String((init as { body?: string })?.body ?? "{}"));
+      replyBodies.push(body);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+
+  const flushAsync = async () => {
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+  };
+
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-cross-turn", fake.notifications));
+  t.after(() => callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-cross-turn", fake.notifications)));
+
+  const toolHandlers = fake.handlers.get("tool_call");
+  assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
+
+  // Turn 1: channel message A arrives and the turn starts; the agent reads a
+  // local file (ungated in writes mode) and taints the SESSION.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-cross-turn", fake.notifications));
+  const readResult = await toolHandlers![0](
+    { toolName: "read", input: { path: "/etc/passwd" } },
+    makeCtx("sess-cross-turn", fake.notifications),
+  );
+  assert.equal(readResult, undefined, "the read itself stays ungated in writes mode");
+  assert.deepEqual(replyBodies, [], "reading a file sends no approval prompt");
+  await callHandler(fake.handlers, "agent_end", {}, makeCtx("sess-cross-turn", fake.notifications));
+
+  // Turn 2: message B arrives and the turn starts. The read taint must persist
+  // from turn 1, so a text-only relay_reply is gated and asked over the channel.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-cross-turn", fake.notifications));
+
+  const replyCall = toolHandlers![0](
+    { toolName: "relay_reply", input: { channelType: "telegram", channelId: "chanA", content: "root:x:0:0:root:/root:/bin/bash" } },
+    makeCtx("sess-cross-turn", fake.notifications),
+  );
+  await flushAsync();
+  assert.equal(replyBodies.length, 1, "the text reply in turn 2 is gated and an approval prompt is sent");
+  const prompt = (replyBodies[0] as { content?: string }).content ?? "";
+  assert.match(prompt, /relay_reply/, "the prompt names the gated relay_reply");
+  assert.ok(
+    !prompt.includes("root:x:0:0"),
+    "the approval prompt must not leak the gated reply content",
+  );
+
+  // No one answers the approval, so it auto-denies and the cross-turn reply is
+  // blocked.
+  t.mock.timers.tick(300_000);
+  const replyResult = await replyCall;
+  assert.ok(
+    replyResult && typeof replyResult === "object" && "block" in replyResult && (replyResult as { block?: boolean }).block === true,
+    "the cross-turn text reply is blocked without an explicit approval",
   );
   t.mock.timers.reset();
 });

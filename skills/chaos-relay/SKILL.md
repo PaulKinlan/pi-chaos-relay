@@ -147,9 +147,11 @@ and persists across restarts (resuming a session reconnects as the same identity
 
 When the agent acts on an inbound channel message, you can gate destructive
 tools: `writes` = ask over the channel before shell/edit/write (the default),
-plus gate a text-only `relay_reply` once the current turn has read a local file
+plus gate a text-only `relay_reply` once the session has read a local file
 (`read`/`grep`) — a channel turn can't read a file and then reply its contents
-without approval. `all` = ask before every tool except the read-only relay
+without approval, and the read is remembered for the rest of the session (not
+just the current turn), so a secret read in one turn can't be text-replied out
+in a later turn. `all` = ask before every tool except the read-only relay
 plumbing, `off` = fully autonomous (explicit opt-out). Set with
 `/chaos-relay approvals <off|writes|all>` or the `CHAOS_RELAY_APPROVAL_MODE`
 env var.

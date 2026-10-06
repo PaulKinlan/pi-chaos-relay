@@ -636,10 +636,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   let activeTurn:
     | { channelType: ChannelMessage["channelType"]; channelId: string; from: string }
     | undefined;
-  /** True once the CURRENT channel-driven turn has read local file contents
-   *  (read/grep). Cleared at turn start/end. Used by the approval gate so a
-   *  text-only relay_reply cannot exfiltrate what a read just pulled in. */
-  let turnReadLocalFile = false;
+  /** True once THIS SESSION has read local file contents (read/grep) — from any
+   *  turn, channel-driven or terminal/local. Cleared only at session start and
+   *  shutdown, never at turn boundaries, so a channel turn cannot text-reply a
+   *  secret read in an earlier turn without approval. Used by the approval gate. */
+  let sessionReadLocalFile = false;
 
   /**
    * Re-register with the persisted keypair to recover a working apiKey after a
@@ -1184,20 +1185,45 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   function approvalNeeded(toolName: string, input?: Record<string, unknown>): boolean {
     // Delegate to the pure per-tool policy (approval-policy.ts) — the single
     // source of truth for the mode x tool matrix, unit-tested in full. The
-    // turn state carries whether this turn has read local files, so a
-    // text-only reply after a read is gated under the default "writes" mode.
+    // session state carries whether this session has read local files, so a
+    // text-only reply after a read (in this or an earlier turn) is gated under
+    // the default "writes" mode.
     return approvalDecision(cfg.approvalMode, toolName, input, {
-      hasReadLocalFile: turnReadLocalFile,
+      hasReadLocalFile: sessionReadLocalFile,
     });
   }
 
+  /** One-line, payload-free description of a gated tool call for the approval
+   * question. The question is sent TO the channel driving the turn, so it must
+   * never echo a raw input value: a gated `relay_reply`/`write`/`edit`/`bash`
+   * can carry local file contents (or other secrets) the agent read earlier,
+   * and echoing them would ship the secret out before anyone approved. Field
+   * names (path, content, command, …) are not secret; their VALUES are. */
   function summarizeToolCall(toolName: string, input: Record<string, unknown>): string {
-    if (toolName === "bash") return `bash: ${String(input.command ?? "").slice(0, 300)}`;
-    if (toolName === "edit" || toolName === "write") {
-      return `${toolName}: ${String(input.path ?? input.file_path ?? "")}`;
+    if (toolName === "relay_reply") {
+      const channelType = typeof input.channelType === "string" ? input.channelType : "?";
+      const channelId = typeof input.channelId === "string" ? input.channelId : "";
+      const content = typeof input.content === "string" ? input.content : "";
+      const files = Array.isArray(input.files) ? input.files.length : 0;
+      const parts: Array<string | null> = [
+        `channel ${channelType}`,
+        channelId ? `#${shortId(channelId)}` : null,
+        `${content.length} chars / ${Buffer.byteLength(content, "utf8")} bytes`,
+      ];
+      if (files > 0) parts.push(`${files} attachment(s)`);
+      return `relay_reply: ${parts.filter((p): p is string => p !== null).join(", ")}`;
     }
-    const j = JSON.stringify(input ?? {});
-    return `${toolName}: ${j.length > 300 ? j.slice(0, 300) + "…" : j}`;
+    const entries = Object.entries(input ?? {});
+    const parts = entries.map(([key, value]) => {
+      if ((key === "path" || key === "file_path") && typeof value === "string") {
+        return `${key}#${shortId(value)}`;
+      }
+      if (typeof value === "string") return `${key}:${value.length} chars`;
+      if (Array.isArray(value)) return `${key}:${value.length} item(s)`;
+      if (value === null || value === undefined) return key;
+      return `${key}:object`;
+    });
+    return `${toolName}${parts.length ? ": " + parts.join(", ") : ""}`;
   }
 
   /** Ask the channel to approve a tool call; resolves true=allow, false=deny. */
@@ -1318,7 +1344,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // concurrent turn cannot shift a stale origin into a fresh session.
     pendingOrigins = [];
     activeTurn = undefined;
-    turnReadLocalFile = false;
+    sessionReadLocalFile = false;
     if (poller) poller.reset();
     if (attachmentCleanupTimer) clearInterval(attachmentCleanupTimer);
     await cleanupStaleInboundAttachments();
@@ -1376,10 +1402,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => {
     stopPolling();
     stopTyping();
-    // Drop any undelivered turn origins so the next session starts clean.
+    // Drop any undelivered turn origins and the session read taint so the
+    // next session starts clean.
     pendingOrigins = [];
     activeTurn = undefined;
-    turnReadLocalFile = false;
+    sessionReadLocalFile = false;
     if (attachmentCleanupTimer) {
       clearInterval(attachmentCleanupTimer);
       attachmentCleanupTimer = undefined;
@@ -1395,16 +1422,16 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // relay-delivered message, and clear it when the run finishes.
   pi.on("agent_start", () => {
     // Shift this turn's origin off the queue (a terminal/local turn has none).
+    // The session read taint is intentionally NOT cleared here: the LLM
+    // conversation context persists across turns, so a file read in turn 1 can
+    // still be text-replied out in turn 2 and must stay gated until the session
+    // ends.
     activeTurn = pendingOrigins.shift() ?? undefined;
-    // A fresh turn starts untainted: local-file reads from a previous turn
-    // must not gate this turn's text replies.
-    turnReadLocalFile = false;
     startTyping();
   });
   pi.on("agent_end", () => {
     stopTyping();
     activeTurn = undefined;
-    turnReadLocalFile = false;
   });
 
   // Tool approval: when enabled and the turn came from a channel, pause risky
@@ -1413,16 +1440,24 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const input = event.input as Record<string, unknown> | undefined;
     const gated = approvalNeeded(event.toolName, input);
     if (!gated) {
-      // Allowed to run. If this is a channel-driven turn running a local-file
-      // read/search, mark the turn so a later text-only relay_reply is gated
-      // (read -> plain-text reply would otherwise exfiltrate file contents).
-      if (activeTurn && LOCAL_FILE_READ_TOOLS.has(event.toolName)) {
-        turnReadLocalFile = true;
+      // Runs ungated. A local-file read/search — from a channel turn OR a
+      // terminal/local turn — taints the session so a later channel-driven
+      // text-only relay_reply is gated (read -> plain-text reply would
+      // otherwise exfiltrate file contents across turns).
+      if (LOCAL_FILE_READ_TOOLS.has(event.toolName)) {
+        sessionReadLocalFile = true;
       }
       return;
     }
-    // Only gate turns driven from a channel — terminal/local use is unaffected.
-    if (!activeTurn) return;
+    // Only turns driven from a channel require approval. A terminal/local turn
+    // still runs the gated tool (no channel to ask), but a local-file read there
+    // must also taint the session for later channel turns.
+    if (!activeTurn) {
+      if (LOCAL_FILE_READ_TOOLS.has(event.toolName)) {
+        sessionReadLocalFile = true;
+      }
+      return;
+    }
     // Pause the typing indicator while we wait on the human.
     stopTyping();
     const approved = await requestApproval(
@@ -1438,9 +1473,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
           `Do not retry it; ask them what to do instead.`,
       };
     }
-    // The gated tool was approved and will run: taint the turn if it reads files.
+    // The gated tool was approved and will run: taint the session if it reads
+    // files, so a later channel turn still cannot text-reply them out freely.
     if (LOCAL_FILE_READ_TOOLS.has(event.toolName)) {
-      turnReadLocalFile = true;
+      sessionReadLocalFile = true;
     }
   });
 
