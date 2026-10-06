@@ -451,6 +451,14 @@ are removed after 24 hours. You can force an immediate pull with
 - **Bearer-only** mode is kept as a fallback for legacy sessions registered
   without a public key (e.g. a pasted API key). The relay still accepts unsigned
   requests for those; signed is preferred and automatic when a keypair exists.
+- **The relay's public key is pinned (TOFU).** Registration returns the relay's
+  public key and the client persists it (`serverPublicKey`). A later
+  re-registration that returns a DIFFERENT key is refused — the client fails
+  closed rather than silently adopting a new key — which closes the
+  "impersonate the relay after first contact" path at registration time. The
+  pin does NOT yet authenticate the *content* of WebSocket frames or HTTP
+  responses: that requires server-side response/frame signing, which is not
+  implemented (see *Known limitations*).
 - Bot tokens are sent only to the relay's register endpoint over HTTPS; the relay
   encrypts them at rest. They are not persisted by this extension.
 - The durable relay log (`~/.pi/agent/logs/chaos-relay.log`) is kept owner-only
@@ -505,10 +513,13 @@ Integration testing against a local relay: run the CHAOS relay server
   *stored, not delivered* (`index.ts:879`); the HTTP fallback logs a bare `ok=`
   (`index.ts:900`) and the tool text says "will forward it". One shared sentence
   in all three places would stop the client from implying more than it knows.
-- **Server response signing / TOFU pinning.** The relay returns its public key
-  at registration and we persist it (`serverPublicKey`), but the client does not
-  yet verify server signatures on inbound messages. Outbound request signing (the
-  key threat: someone spending your API key) is fully implemented.
+- **Server response signing.** The client enforces the TOFU pin on the relay's
+  public key (a re-registration returning a different key fails closed), but it
+  does not yet verify server signatures on the *content* of WebSocket frames or
+  HTTP responses — the relay does not sign them. Authenticating frame/response
+  content requires a server-side change (sign frames/responses with the pinned
+  server key). Outbound request signing (the key threat: someone spending your
+  API key) is fully implemented.
 - Email registration depends on relay-side `CHAOS_EMAIL_DOMAIN` + provider config.
 
 ## License

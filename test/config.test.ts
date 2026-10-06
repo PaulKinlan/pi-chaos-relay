@@ -27,7 +27,64 @@ import {
   savePersisted,
   loadMessageState,
   saveMessageState,
+  resolveServerKeyPin,
 } from "../config.ts";
+
+// --- resolveServerKeyPin (TOFU server key pinning) --------------------------
+
+const SERVER_KEY_A: JsonWebKey = { kty: "EC", crv: "P-256", x: "base64url-x", y: "base64url-y" };
+const SERVER_KEY_B: JsonWebKey = { kty: "EC", crv: "P-256", x: "base64url-x", y: "base64url-y-OTHER" };
+
+test("resolveServerKeyPin adopts the first key seen (TOFU)", () => {
+  assert.deepEqual(resolveServerKeyPin({ fresh: SERVER_KEY_A }), {
+    action: "adopt",
+    serverPublicKey: SERVER_KEY_A,
+  });
+});
+
+test("resolveServerKeyPin keeps the pin when the relay returns no key", () => {
+  assert.deepEqual(resolveServerKeyPin({ pinned: SERVER_KEY_A }), {
+    action: "adopt",
+    serverPublicKey: SERVER_KEY_A,
+  });
+});
+
+test("resolveServerKeyPin accepts the same key on re-registration", () => {
+  assert.deepEqual(
+    resolveServerKeyPin({ pinned: SERVER_KEY_A, fresh: { ...SERVER_KEY_A } }),
+    { action: "adopt", serverPublicKey: { ...SERVER_KEY_A } },
+  );
+});
+
+test("resolveServerKeyPin refuses a different key on re-registration", () => {
+  const outcome = resolveServerKeyPin({ pinned: SERVER_KEY_A, fresh: SERVER_KEY_B });
+  assert.equal(outcome.action, "refuse");
+  assert.ok((outcome as { message: string }).message.includes("different"));
+});
+
+test("resolveServerKeyPin refuses an unparseable fresh key over a usable pin", () => {
+  const malformed = { kty: "EC", crv: "P-256" } as JsonWebKey; // no x/y
+  const outcome = resolveServerKeyPin({ pinned: SERVER_KEY_A, fresh: malformed });
+  assert.equal(outcome.action, "refuse");
+});
+
+test("resolveServerKeyPin ignores non-identity JWK metadata when comparing", () => {
+  // alg/key_ops/use/ext may legitimately differ across re-serializations; only
+  // kty/crv/x/y identify the key.
+  const withMetadata = { ...SERVER_KEY_A, alg: "ES256", key_ops: ["verify"], ext: true };
+  assert.deepEqual(
+    resolveServerKeyPin({ pinned: SERVER_KEY_A, fresh: withMetadata }),
+    { action: "adopt", serverPublicKey: withMetadata },
+  );
+});
+
+test("resolveServerKeyPin cannot enforce against a malformed pin", () => {
+  const malformedPin = { kty: "RSA" } as JsonWebKey;
+  assert.deepEqual(
+    resolveServerKeyPin({ pinned: malformedPin, fresh: SERVER_KEY_A }),
+    { action: "adopt", serverPublicKey: SERVER_KEY_A },
+  );
+});
 
 test("configPathFor: default profile uses chaos-relay.json", () => {
   assert.equal(configPathFor({}, "/cfg"), "/cfg/chaos-relay.json");

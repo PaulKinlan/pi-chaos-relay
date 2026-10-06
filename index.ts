@@ -65,6 +65,7 @@ import {
   setSessionProfile,
   chooseProfile,
   resolveProfileLockCollision,
+  resolveServerKeyPin,
   type ResolvedConfig,
   type RegisteredChannelRecord,
 } from "./config.ts";
@@ -653,11 +654,19 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const oldUserId = persisted.userId;
     try {
       const reg = await registerSessionWithKey(cfg.relayUrl, { keyPair: persisted.keyPair });
+      const pin = resolveServerKeyPin({
+        pinned: persisted.serverPublicKey,
+        fresh: reg.serverPublicKey,
+      });
+      if (pin.action === "refuse") {
+        log(`auth recovery aborted: ${pin.message}`);
+        return null;
+      }
       savePersisted({
         apiKey: reg.apiKey,
         userId: reg.userId,
         keyPair: reg.keyPair,
-        serverPublicKey: reg.serverPublicKey ?? persisted.serverPublicKey,
+        serverPublicKey: pin.serverPublicKey,
       });
       cfg = resolveConfig();
       // Rebuild the HTTP client so catch-up polls use the new key too.
@@ -911,13 +920,23 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     try {
       // Reuse any existing keypair so the identity (and its channels) stay stable.
       const reg = await registerSessionWithKey(relayUrl, { keyPair: persisted.keyPair });
+      const pin = resolveServerKeyPin({
+        pinned: persisted.serverPublicKey,
+        fresh: reg.serverPublicKey,
+      });
+      if (pin.action === "refuse") {
+        const warning = pin.message;
+        log(`WARN: ${warning}`);
+        notify?.(warning);
+        return undefined;
+      }
       savePersisted({
         relayUrl,
         agentId: persisted.agentId ?? "pi",
         apiKey: reg.apiKey,
         userId: reg.userId,
         keyPair: reg.keyPair,
-        serverPublicKey: reg.serverPublicKey ?? persisted.serverPublicKey,
+        serverPublicKey: pin.serverPublicKey,
       });
       cfg = resolveConfig();
       client = undefined;
@@ -2253,10 +2272,15 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       if (action === "Register a new session (ECDSA)") {
         ctx.ui.notify("Generating ECDSA keypair and registering session...", "info");
         const reg = await registerSessionWithKey(relayUrl, { keyPair });
+        const pin = resolveServerKeyPin({ pinned: serverPublicKey, fresh: reg.serverPublicKey });
+        if (pin.action === "refuse") {
+          ctx.ui.notify(pin.message, "warning");
+          return;
+        }
         apiKey = reg.apiKey;
         userId = reg.userId;
         keyPair = reg.keyPair;
-        serverPublicKey = reg.serverPublicKey ?? serverPublicKey;
+        serverPublicKey = pin.serverPublicKey;
         ctx.ui.notify(`Registered with ECDSA identity. userId=${userId}`, "info");
       } else if (action === "Paste an existing API key") {
         const pasted = await ctx.ui.input("Paste relay API key", "");
@@ -2270,10 +2294,15 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       // default here rather than refusing — the user sees the result on screen.
       ctx.ui.notify("Setting up your private relay connection…", "info");
       const reg = await registerSessionWithKey(relayUrl, { keyPair });
+      const pin = resolveServerKeyPin({ pinned: serverPublicKey, fresh: reg.serverPublicKey });
+      if (pin.action === "refuse") {
+        ctx.ui.notify(pin.message, "warning");
+        return;
+      }
       apiKey = reg.apiKey;
       userId = reg.userId;
       keyPair = reg.keyPair;
-      serverPublicKey = reg.serverPublicKey ?? serverPublicKey;
+      serverPublicKey = pin.serverPublicKey;
     }
 
     if (!apiKey) {

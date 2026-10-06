@@ -135,11 +135,7 @@ export class RelayWebSocket {
     this.reconnectTimer = undefined;
     this.clearStabilityTimer();
     this.clearPing();
-    for (const [, p] of this.pending) {
-      clearTimeout(p.timer);
-      p.reject(new Error("WebSocket closed"));
-    }
-    this.pending.clear();
+    this.rejectPending(new Error("WebSocket closed"));
     try {
       this.socket?.close();
     } catch {
@@ -151,6 +147,20 @@ export class RelayWebSocket {
   private clearPing(): void {
     if (this.pingTimer) clearInterval(this.pingTimer);
     this.pingTimer = undefined;
+  }
+
+  /**
+   * Reject and clear every in-flight reply. Called on stop() and on an
+   * unexpected close so a pending reply can only ever be settled by an ack
+   * arriving on the SAME socket it was sent on (acks carry no echo id, so the
+   * FIFO correlation is only safe when the pending set is per-socket).
+   */
+  private rejectPending(err: Error): void {
+    for (const [, p] of this.pending) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+    this.pending.clear();
   }
 
   private clearStabilityTimer(): void {
@@ -207,6 +217,9 @@ export class RelayWebSocket {
     socket.onclose = (event: CloseEvent) => {
       this.clearPing();
       this.clearStabilityTimer();
+      // Replies sent on this socket can no longer be acked by it; reject them
+      // so a later socket's ack can't settle (and mis-attribute) them.
+      this.rejectPending(new Error("WebSocket closed"));
       if (!this.openedSinceAttempt) this.failedHandshakes++;
       if (this.closedByUs) return;
       this.log(
@@ -253,7 +266,17 @@ export class RelayWebSocket {
     if (!raw) return;
     let data: Record<string, unknown>;
     try {
-      data = JSON.parse(raw);
+      const parsed: unknown = JSON.parse(raw);
+      // `JSON.parse` can return any JSON value, but a frame must be a JSON
+      // object before we can read its `type`. The literal `null` (and any other
+      // non-object: a number, a string, a boolean, an array) must be dropped
+      // rather than dereferenced — otherwise `data.type` throws an uncaught
+      // TypeError out of the onmessage handler.
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        this.log("dropping non-object relay frame");
+        return;
+      }
+      data = parsed as Record<string, unknown>;
     } catch {
       return;
     }
@@ -264,7 +287,10 @@ export class RelayWebSocket {
         break;
       }
       case "reply_ack": {
-        // Resolve the oldest pending reply (the relay ack carries no echo id).
+        // Resolve the oldest pending reply. The relay ack carries no echo id,
+        // so correlation is FIFO; that is only safe because rejectPending()
+        // clears `pending` on every unexpected close, so the oldest entry here
+        // is always a reply sent on THIS socket.
         const first = this.pending.keys().next().value as string | undefined;
         if (first) {
           const p = this.pending.get(first)!;
