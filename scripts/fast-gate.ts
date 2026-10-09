@@ -60,8 +60,9 @@ export const INTEGRATION_TEST = "test/index.test.ts";
  */
 export const MODULE_TESTS: Record<string, string[]> = {
   "approval-policy.ts": ["test/approval-policy.test.ts"],
+  "approvals.ts": ["test/approvals.test.ts"],
   "config.ts": ["test/approval-policy.test.ts", "test/config.test.ts"],
-  "connect.ts": ["test/connect.test.ts"],
+  "connect.ts": ["test/approvals.test.ts", "test/connect.test.ts"],
   "crypto.ts": [
     "test/approval-policy.test.ts",
     "test/config.test.ts",
@@ -73,6 +74,7 @@ export const MODULE_TESTS: Record<string, string[]> = {
   ],
   "inbound-attachments.ts": ["test/inbound-attachments.test.ts"],
   "poller.ts": ["test/poller.test.ts"],
+  "profile-lock.ts": ["test/profile-lock.test.ts"],
   "relay-client.ts": [
     "test/inbound-attachments.test.ts",
     "test/poller.test.ts",
@@ -81,6 +83,7 @@ export const MODULE_TESTS: Record<string, string[]> = {
   ],
   "reply-format.ts": ["test/reply-format.test.ts"],
   "url-redact.ts": [
+    "test/approvals.test.ts",
     "test/inbound-attachments.test.ts",
     "test/poller.test.ts",
     "test/relay-client.test.ts",
