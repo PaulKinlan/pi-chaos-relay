@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync, copyFileSync, mkdirSync, rmSync, rmdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync, copyFileSync, mkdirSync, rmSync, rmdirSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -698,6 +698,49 @@ test("savePersisted onto a truncated file still lands the update", () => {
     assert.equal(after.relayUrl, "https://x.example.com");
     assert.equal(after.apiKey, "k");
   });
+});
+
+// ── Atomic writes: the temp file is never group/other readable ────────────
+
+test("regression pin: atomicWriteSync creates its temp file 0600, not umask-default", () => {
+  // The temp file exists only inside one synchronous call, and the chmod that
+  // follows it would mask its creation mode, so a test process cannot observe
+  // the mode it was CREATED with without syscall interposition. Pin the call
+  // site instead: passing `mode` to writeFileSync is what closes the window in
+  // which the apiKey / private identity sits at 0644 under the common umask
+  // 022. Deleting the option leaves every end-state test green, so this is the
+  // only guard that fails with it; `mode: 0o600` may not be reworded away.
+  const source = readFileSync(new URL("../config.ts", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /writeFileSync\(tmp, contents, \{ mode: 0o600 \}\)/,
+    "atomicWriteSync must create the temp file owner-only, not rely on the later chmod",
+  );
+});
+
+test("the config and the message-state side-car are 0600 under a fully permissive umask", () => {
+  // End-state guard, NOT a pin on either mechanism: this test passes on the
+  // pre-fix code (the chmod lands 0600) and would also pass with the chmod
+  // removed, because under umask 000 the creation mode alone yields 0600. It
+  // asserts the property the operator depends on — config and side-car are
+  // owner-only whatever the umask — and the creation-mode window itself is
+  // pinned by the call-site test above.
+  const previousUmask = process.umask(0o000);
+  try {
+    withTempConfig((path) => {
+      savePersisted({ relayUrl: "https://umask.example.com", apiKey: "k" });
+      assert.equal(statSync(path).mode & 0o777, 0o600, "config must be owner-only");
+
+      saveMessageState({ cursor: "2026-10-05T00:00:00Z", seenIds: ["a"] });
+      assert.equal(
+        statSync(`${path}.state`).mode & 0o777,
+        0o600,
+        "side-car must be owner-only",
+      );
+    });
+  } finally {
+    process.umask(previousUmask);
+  }
 });
 
 test("savePersisted writes atomically and leaves no temp files behind on normal completion", () => {
