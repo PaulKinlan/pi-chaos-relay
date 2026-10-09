@@ -70,10 +70,16 @@ test("off: session read state does not gate anything (explicit opt-out)", () => 
   assert.equal(approvalDecision("off", "read", {}, { hasReadLocalFile: true }), false);
 });
 
-test("writes: other relay tools stay ungated", () => {
+test("writes: read-only relay plumbing stays ungated (the question's own channel)", () => {
+  assert.equal(approvalDecision("writes", "relay_check_messages"), false);
+  assert.equal(approvalDecision("writes", "relay_list_profiles"), false);
+});
+
+test("writes: control-plane relay tools are gated (the session-takeover chain)", () => {
+  // Registering the attacker's own channel, or switching to a profile whose
+  // gate is off, takes the session over AND self-approves the gate: the next
+  // approval question is delivered to the attacker's channel.
   for (const tool of [
-    "relay_check_messages",
-    "relay_list_profiles",
     "relay_connect",
     "relay_register_telegram",
     "relay_register_discord",
@@ -81,8 +87,16 @@ test("writes: other relay tools stay ungated", () => {
     "relay_register_webhook",
     "relay_switch_profile",
   ]) {
-    assert.equal(approvalDecision("writes", tool), false, `${tool} ungated in writes`);
+    assert.equal(approvalDecision("writes", tool), true, `${tool} must be gated in writes`);
   }
+});
+
+test("writes: a brand-new relay_* name is gated (default-deny for the namespace)", () => {
+  assert.equal(
+    approvalDecision("writes", "relay_some_future_tool"),
+    true,
+    "a future relay tool must not silently bypass the write-mode gate",
+  );
 });
 
 test("all: read-only relay plumbing is ungated", () => {

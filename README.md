@@ -368,7 +368,7 @@ channel before risky tools run:
 
 | Mode | Behaviour |
 |------|-----------|
-| `writes` *(default)* | Ask before `bash`, `edit`, and `write`; reads/searches run freely. `relay_reply` is gated when it ships a file attachment, **and a text-only `relay_reply` is gated once the session has inspected local content (`read`/`grep`/`bash`)** — this closes the read → text-reply exfiltration path without prompting on every read. The other relay plumbing is ungated. |
+| `writes` *(default)* | Ask before `bash`, `edit`, and `write`; reads/searches run freely. `relay_reply` is gated when it ships a file attachment, **and a text-only `relay_reply` is gated once the session has inspected local content (`read`/`grep`/`bash`)** — this closes the read → text-reply exfiltration path without prompting on every read. The **control-plane** relay tools — `relay_connect`, `relay_register_telegram`/`_discord`/`_email`/`_webhook`, `relay_switch_profile` — are gated too, and any future `relay_*` name is gated by default. Only the read-only plumbing (`relay_check_messages`, `relay_list_profiles`) stays open. |
 | `all` | Ask before **every** tool except the read-only relay plumbing (`relay_check_messages`, `relay_list_profiles`). |
 | `off` | Fully autonomous — run every tool. Best paired with a sandbox/container. |
 
@@ -391,14 +391,26 @@ reply).
 box; choose `off` (or `/chaos-relay approvals off`) for the old fully-autonomous
 posture. Set with `/chaos-relay approvals <off|writes|all>` or the
 `CHAOS_RELAY_APPROVAL_MODE` env var.
+
+The control-plane gate matters even when you never touch `relay_connect`
+yourself: `relay_register_*` would otherwise let a channel-borne prompt injection
+register **the attacker's own channel**, and `relay_switch_profile` would let it
+move the session to a profile whose approval mode is `off`. Either one takes the
+session over *and* self-approves the gate, because the next approval question is
+then delivered to the attacker's channel. In `writes` and `all` modes those
+calls pause for your approval like any other gated tool.
 When a tool is gated, the agent pauses and sends an approval request to the active
 channel; **reply `yes <code>` to allow or `no <code>` to deny** — the prompt shows a
 short code, and only the originating sender's reply counts (auto-denies after 5 minutes).
 The prompt describes the tool without echoing its payload: a `relay_reply` shows only
-its channel type, a short channel fingerprint, and a character/byte count; a `bash`
+its channel type, a short channel fingerprint, and a character/byte count (plus the
+name and size of each attachment); a `bash`
 approval shows a **REDACTED command string** (secret-shaped values are masked) so the
 operator can judge benign vs destructive; `write`/`edit` show the **target path and
-size**; and other tools show field sizes or path fingerprints — never their contents.
+size**; a control-plane call names the target it would use (profile name, channel
+name/id/type, a `relay_connect` keyword, an email domain) while its credential fields
+(`botToken`, `password`, `secret`, and `relay_connect`'s token/address input) show only a
+length; and other tools show field sizes or path fingerprints — never their contents.
 Terminal/local turns are never gated.
 
 ## Telegram setup — end to end

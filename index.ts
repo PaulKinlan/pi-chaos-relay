@@ -657,6 +657,9 @@ export function summarizeToolCall(toolName: string, input: Record<string, unknow
     }
     return `edit: ${target} (${edits.length} edit(s), ${bytes} bytes)`;
   }
+  if (CONTROL_PLANE_RELAY_TOOLS.has(toolName)) {
+    return `${toolName}: ${summarizeControlPlaneInput(input)}`;
+  }
   // Any other gated tool: never echo raw values, only shapes.
   const entries = Object.entries(input ?? {});
   const parts = entries.map(([key, value]) => {
@@ -669,6 +672,70 @@ export function summarizeToolCall(toolName: string, input: Record<string, unknow
     return `${key}:object`;
   });
   return `${toolName}${parts.length ? ": " + parts.join(", ") : ""}`;
+}
+
+/**
+ * Control-plane relay tools (gated in "writes" mode, always gated in "all").
+ * The approval question must name the TARGET or the human cannot judge it: an
+ * injected `relay_switch_profile` summarised as `name:9 chars` is unanswerable.
+ */
+const CONTROL_PLANE_RELAY_TOOLS = new Set([
+  "relay_connect",
+  "relay_register_telegram",
+  "relay_register_discord",
+  "relay_register_email",
+  "relay_register_webhook",
+  "relay_switch_profile",
+]);
+
+/** Input fields that name a target without being a credential. */
+const SAFE_TARGET_FIELDS = new Set(["name", "channelName", "channelType", "channelId"]);
+
+/** The leading word of `relay_connect`'s one-shot input, when it names a
+ *  channel kind ("webhook my-hook"): a KIND is not a credential, the rest of a
+ *  token/address is. */
+const CONNECT_KINDS = new Set(["webhook", "telegram", "discord", "email"]);
+
+/**
+ * One line naming what a control-plane call would do, for the approval
+ * question. Non-secret targets are echoed (profile name, channel name/id/type,
+ * a connect KEYWORD, an email DOMAIN); credential-bearing values never are —
+ * `botToken`, `password`, `secret` and `relay_connect`'s `input` render as a
+ * length, and an email address keeps only its domain. The question travels to
+ * the channel driving the turn, so echoing a live credential here would leak it
+ * to whoever is listening. */
+function summarizeControlPlaneInput(input: Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(input ?? {})) {
+    if (typeof value !== "string") continue;
+    if (SAFE_TARGET_FIELDS.has(key)) {
+      const shown = key === "channelId" ? shortId(value) : truncateForDisplay(value);
+      parts.push(`${key}=${shown}`);
+      continue;
+    }
+    if (key === "userEmail") {
+      const at = value.lastIndexOf("@");
+      // Domain only: enough for the operator to recognise their own mailbox,
+      // never the local part.
+      parts.push(at > 0 ? `userEmail=***${value.slice(at)}` : `userEmail:${value.length} chars`);
+      continue;
+    }
+    if (key === "input") {
+      const [kind = "", ...rest] = value.trim().split(/\s+/);
+      if (!CONNECT_KINDS.has(kind.toLowerCase())) {
+        parts.push(`input=<redacted, ${value.length} chars>`);
+      } else if (kind.toLowerCase() === "webhook") {
+        // addWebhook takes a NAME after the keyword; a name is not a credential.
+        const name = rest.length ? ` ${rest.join(" ")}` : "";
+        parts.push(`input=${kind}${name}`);
+      } else {
+        parts.push(`input=${kind} <redacted>`);
+      }
+      continue;
+    }
+    parts.push(`${key}:${value.length} chars`);
+  }
+  return parts.length ? parts.join(", ") : "no inputs";
 }
 
 /** Render a file path for DISPLAY: relative to the working directory when
