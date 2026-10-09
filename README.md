@@ -446,7 +446,12 @@ replay (a 5-minute lookback it sends every time the WebSocket connects) never
 re-processes a message already handled before a restart. Fresh messages are
 injected into the agent as a user message that includes each message's `id`,
 `channelType`, `channelId`, sender, and content — everything the agent needs to
-call `relay_reply`. When a message was sent as a **reply** (Telegram
+call `relay_reply`. Each message's block is fenced by an identical
+`--- chaos-relay message <random-token> ---` line before and after it, and the
+envelope fields on the line after the opening fence are JSON-quoted: a sender
+controls both their display name and their content, so the per-delivery random
+boundary (plus escaping) is what stops either from forging a second envelope or
+a different sender in the agent's prompt. When a message was sent as a **reply** (Telegram
 reply-threading, e.g. tapping reply on a question and answering "Drop"), the
 replied-to message travels with it as an
 `[In reply to message id="…" from "…": "…quoted text…"]` line **before** the
