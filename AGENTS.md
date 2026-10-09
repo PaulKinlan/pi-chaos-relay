@@ -119,6 +119,12 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
 - `relay-client.ts` — signed HTTP client for the relay (ECDSA P-256 identity).
 - `ws-client.ts` — WebSocket transport (push delivery + reconnect/backoff).
 - `poller.ts` — cursor + dedup; HTTP catch-up and safety poll.
+- `profile-lock.ts` — the profile lock protocol: exclusive claim, refuse a live
+  holder, reclaim a stale/ambiguous file after the create grace. index.ts keeps
+  the policy around it (when to claim, what to tell the user, shutdown release).
+- `approvals.ts` — the outstanding-approval queue (one entry per request, nonce
+  and sender/channel binding, independent timeouts) and `summarizeToolCall`, the
+  payload-safe one-liner shown in the approval question.
 - `config.ts` — resolves config from env + `~/.pi/chaos-relay.json` (0600).
 - `crypto.ts` — keypair generation + request signing.
 
