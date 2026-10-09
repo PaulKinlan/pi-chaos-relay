@@ -719,9 +719,12 @@ test("regression pin: atomicWriteSync creates its temp file 0600, not umask-defa
 });
 
 test("the config and the message-state side-car are 0600 under a fully permissive umask", () => {
-  // End-state guard (passes on the pre-fix code too, because the chmod lands
-  // 0600): what it protects is that the chmod can never be dropped without a
-  // failure. The creation-mode window itself is pinned by the test above.
+  // End-state guard, NOT a pin on either mechanism: this test passes on the
+  // pre-fix code (the chmod lands 0600) and would also pass with the chmod
+  // removed, because under umask 000 the creation mode alone yields 0600. It
+  // asserts the property the operator depends on — config and side-car are
+  // owner-only whatever the umask — and the creation-mode window itself is
+  // pinned by the call-site test above.
   const previousUmask = process.umask(0o000);
   try {
     withTempConfig((path) => {

@@ -552,11 +552,16 @@ let tmpCounter = 0;
  * and the PREVIOUS complete file survives at the target, if one existed (on a
  * first-ever write there is no previous file, so the target is simply absent
  * and a later batch may replay after restart — the de-dup log's job). The
- * temp file is CREATED owner-only (mode 0600 at open(2) time), so there is no
- * window in which the API key / ECDSA identity in it is readable by group or
- * other; the chmod after it is harmless belt-and-braces for a pre-existing
- * orphan (see below) and the only thing that helps on filesystems that reject
- * the mode argument. Neither residual affects a concurrent reader.
+ * temp file is CREATED owner-only: `mode: 0o600` is passed to open(2), which
+ * applies it when it creates the file, so on the normal path there is no window
+ * in which the API key / ECDSA identity in it is group/other readable. Residual,
+ * stated rather than glossed: a mode only applies at CREATION, so if an orphan
+ * from a crashed process already sits at this exact temp path (its pid recycled
+ * into ours) the write inherits that file's mode and the chmod after it can
+ * only shorten the window, not remove it; a filesystem with no POSIX
+ * permissions ignores both. Closing that residual (an exclusive `flag: "wx"`
+ * create, retried on a fresh name) is follow-up pi-chaos-relay-a68. Neither
+ * residual affects a concurrent reader.
  */
 function atomicWriteSync(path: string, contents: string): void {
   // Ensure the target's directory exists (the config may live outside ~/.pi
@@ -567,13 +572,16 @@ function atomicWriteSync(path: string, contents: string): void {
   // `mode` here is load-bearing, not decoration: this file holds the apiKey and
   // the private identity, and a plain `writeFileSync(tmp, contents)` lets the
   // process umask decide — 0644 under the common umask 022 — so the secret is
-  // world-readable until the chmod below runs. open(2) applies `mode` at
-  // creation, so passing it removes the window entirely.
+  // group/other readable until the chmod below runs. open(2) applies `mode` at
+  // creation, so passing it removes that window on the normal path.
   writeFileSync(tmp, contents, { mode: 0o600 });
-  // Best effort, kept because open(2) applies `mode` only when it CREATES the
-  // file: if a stale `<target>.tmp.<pid>.<n>` orphan already exists (a crashed
-  // process whose pid was later recycled), the write above would inherit its
-  // old mode. The side-car is not secret but stays 0600 for consistency.
+  // Best effort, and only a partial mitigation for the one path the mode above
+  // does not cover: open(2) applies `mode` only when it CREATES the file, so a
+  // stale orphan already sitting at this exact name (a crashed process whose
+  // pid was recycled into ours) was written with ITS old mode, and this chmod
+  // can only shorten the exposure before the rename — not remove it. See
+  // pi-chaos-relay-a68 for the exclusive-create fix. The side-car is not secret
+  // but stays 0600 for consistency.
   try {
     chmodSync(tmp, 0o600);
   } catch {
