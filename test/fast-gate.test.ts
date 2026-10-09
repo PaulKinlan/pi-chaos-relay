@@ -10,7 +10,8 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { join, posix } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -155,14 +156,7 @@ test("the map is a SUPERSET of the real import closure (the guard that matters)"
     for (const dep of relativeImportsOf(file)) closureOf(dep, seen);
     return seen;
   };
-  const missing: string[] = [];
-  for (const module of modules) {
-    if (!(module in MODULE_TESTS)) continue; // unmapped modules fall back to the full suite
-    for (const test of tests) {
-      if (!closureOf(test).has(module)) continue;
-      if (!MODULE_TESTS[module].includes(test)) missing.push(`${module} <- ${test}`);
-    }
-  }
+  const missing = findMissingMapEdges(modules, tests, closureOf, MODULE_TESTS);
   assert.deepEqual(
     missing,
     [],
@@ -171,15 +165,60 @@ test("the map is a SUPERSET of the real import closure (the guard that matters)"
   );
 });
 
-test("every test file that exists is either mapped or covered by the harness rule", () => {
-  const mapped = new Set(Object.values(MODULE_TESTS).flat());
-  for (const test of discoverTestFiles()) {
-    if (test === INTEGRATION_TEST) continue; // runs in the full tier by contract
-    assert.ok(
-      mapped.has(test) || test.startsWith("test/"),
-      `${test} would never be selected by the affected tier`,
-    );
+test("every test file that exists is accounted for by the affected tier", () => {
+  // The real condition: no test file may be an unaccounted hole. Either some
+  // mapped module selects it, or it is one of the files only the full tier runs.
+  const selected = new Set(Object.values(MODULE_TESTS).flat());
+  const unaccounted = discoverTestFiles().filter(
+    (test) => !selected.has(test) && !FULL_TIER_ONLY_TESTS.includes(test),
+  );
+  assert.deepEqual(
+    unaccounted,
+    [],
+    `add each to a MODULE_TESTS entry, or to FULL_TIER_ONLY_TESTS with a reason: ${unaccounted.join(", ")}`,
+  );
+  // …and the full-tier-only list is not a dumping ground: those files must exist.
+  for (const test of FULL_TIER_ONLY_TESTS) {
+    assert.ok(discoverTestFiles().includes(test), `full-tier-only test is missing: ${test}`);
   }
+});
+
+test("the import parser understands every form the guard claims to cover", () => {
+  const source = [
+    'import { a } from "./binding.ts";',
+    'import "./side-effect.ts";',
+    'const c = await import("./dynamic.ts");',
+    "const d = await import(`./template.ts`);",
+    'const e = await import(`./interpolated-${x}.ts`);',
+    'import { fs } from "node:fs";',
+    'import { z } from "../outside.ts";',
+  ].join("\n");
+  // Order follows the three patterns (binding/from first, then side-effect, then
+  // dynamic); the guard only ever asks set membership.
+  assert.deepEqual(importSpecifiersFrom(source), [
+    "./binding.ts",
+    "../outside.ts",
+    "./side-effect.ts",
+    "./dynamic.ts",
+    "./template.ts",
+    "./interpolated-${x}.ts",
+  ]);
+  // A side-effect edge is a real edge: the guard must fail when a module's map
+  // entry exists (so its changes NARROW) but omits a test that imports it — the
+  // exact shape of the round-1 coverage miss.
+  const modules = ["a.ts", "side-effect.ts"];
+  const closureOf = (file: string) => new Set(file === "test/a.test.ts" ? modules : []);
+  const underCovering = { "a.ts": ["test/a.test.ts"], "side-effect.ts": ["test/b.test.ts"] };
+  assert.deepEqual(findMissingMapEdges(modules, ["test/a.test.ts"], closureOf, underCovering), [
+    "side-effect.ts <- test/a.test.ts",
+  ]);
+  assert.deepEqual(
+    findMissingMapEdges(modules, ["test/a.test.ts"], closureOf, {
+      "a.ts": ["test/a.test.ts"],
+      "side-effect.ts": ["test/a.test.ts"],
+    }),
+    [],
+  );
 });
 
 test("the affected tier never runs the integration suite, and the full tier does", () => {
@@ -226,6 +265,28 @@ test("the base resolution names what it used, and the change list is real", () =
   assert.equal(head.mergeBase, thisCommit);
 });
 
+/**
+ * Every relative module specifier in a source string. Three forms, because the
+ * round-2 review pointed out that a guard which only understands `from "…"`
+ * cannot honour the claim that a new edge cannot escape it:
+ *   import x from "./a.ts"      — binding import
+ *   import "./b.ts"             — side-effect import
+ *   import("./c.ts") / import(`./d.ts`) — dynamic import
+ * `import(`./${x}.ts`)` matches too, and is then dropped because the path does
+ * not exist, which is the conservative direction.
+ */
+function importSpecifiersFrom(source: string): string[] {
+  const specs: string[] = [];
+  for (const re of [
+    /\bfrom\s*["'](\.[^"']+)["']/g,
+    /\bimport\s*["'](\.[^"']+)["']/g,
+    /\bimport\s*\(\s*["'`](\.\/[^"'`]+)["'`]/g,
+  ]) {
+    for (const m of source.matchAll(re)) specs.push(m[1]);
+  }
+  return specs;
+}
+
 /** Every root .ts module and every scripts/*.ts|mjs, repo-relative. */
 function discoverSourcePaths(): string[] {
   const roots = (readdirSync(ROOT) as string[]).filter((f: string) => f.endsWith(".ts"));
@@ -240,14 +301,36 @@ function discoverSourcePaths(): string[] {
 /** Relative .ts imports of a repo-relative file, keeping only real files (tests
  *  name fake modules in string fixtures). */
 function relativeImportsOf(file: string): string[] {
-  const source = readFileSync(join(ROOT, file), "utf8");
-  const specs: string[] = [];
-  for (const m of source.matchAll(/\bfrom\s*["'](\.[^"']+)["']/g)) specs.push(m[1]);
-  for (const m of source.matchAll(/\bimport\s*\(\s*["'](\.[^"']+)["']/g)) specs.push(m[1]);
-  return specs
+  return importSpecifiersFrom(readFileSync(join(ROOT, file), "utf8"))
     .map((spec) => posix.normalize(posix.join(posix.dirname(file), spec)))
     .filter((path) => path.endsWith(".ts") && existsSync(join(ROOT, path)));
 }
+
+/** The guard itself, as a pure function so it can be tested against synthetic
+ *  graphs (a guard whose only test is "the real map happens to pass" is not a
+ *  guard). Returns every `<module> <- <test>` edge the map fails to cover. */
+function findMissingMapEdges(
+  modules: string[],
+  tests: string[],
+  closureOf: (file: string) => Set<string>,
+  map: Record<string, string[]>,
+): string[] {
+  const missing: string[] = [];
+  for (const module of modules) {
+    if (!(module in map)) continue; // unmapped modules fall back to the full suite
+    for (const test of tests) {
+      if (closureOf(test).has(module) && !map[module].includes(test)) {
+        missing.push(`${module} <- ${test}`);
+      }
+    }
+  }
+  return missing;
+}
+
+/** Test files that only the FULL tier runs, and why. `pack-files.test.ts` guards
+ *  the published file list in package.json, and the manifest is a full-tier
+ *  trigger, so it has no module to hang off. */
+const FULL_TIER_ONLY_TESTS = [INTEGRATION_TEST, "test/pack-files.test.ts"];
 
 test("an explicit --base that does not resolve is fatal, never a silent fallback", () => {
   const result = resolveBase("definitely-not-a-ref-in-this-repo");
@@ -262,17 +345,34 @@ test("an explicit --base that does not resolve is fatal, never a silent fallback
   assert.match(cli.stderr, /does not resolve/);
 });
 
-test("a default base that cannot be established fails closed to the full suite", () => {
-  // Simulated: the resolution object main() consumes when no branch resolves. It
-  // must never produce a narrowed run, because in a clean checkout diffing
-  // against nothing reports "no changes" while knowing nothing.
-  const selection = selectTests([]);
-  assert.deepEqual(selection.changed, []);
-  assert.deepEqual(selection.tests, [], "an empty change list narrows to nothing");
-  // …and the CLI prints the full tier for that case (checked end-to-end in the
-  // dry-run test below, which uses a resolvable base).
-  const full = selectTests(["README.md"]);
-  assert.equal(full.mode, "full");
+test("without a default branch the CLI fails closed to the full suite", () => {
+  // End to end in a real checkout that HAS no origin/master, origin/main or
+  // master branch: resolveBase must report failure and main() must run the full
+  // suite rather than diffing against HEAD (which in a clean checkout would
+  // report "no changes" while knowing nothing).
+  const dir = mkdtempSync(join(tmpdir(), "fast-gate-nobase-"));
+  try {
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    copyFileSync(SCRIPT_PATH, join(dir, "scripts", "fast-gate.ts"));
+    const gitIn = (args: string[]) =>
+      spawnSync("git", ["-c", "user.email=t@example.com", "-c", "user.name=t", ...args], {
+        cwd: dir,
+        encoding: "utf8",
+      });
+    gitIn(["init", "-q", "-b", "work"]);
+    gitIn(["add", "."]);
+    gitIn(["commit", "-q", "-m", "init"]);
+    const result = spawnSync(process.execPath, ["scripts/fast-gate.ts", "--dry-run"], {
+      cwd: dir,
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /no default branch resolves in this checkout/);
+    assert.match(result.stdout, /mode: full/);
+    assert.match(result.stdout, /tests \(full suite\): node --test/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("an unreadable change list is never read as an empty one", () => {
