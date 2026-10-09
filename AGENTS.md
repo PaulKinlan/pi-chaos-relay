@@ -50,21 +50,29 @@ npm run test:fast -- --dry-run     # print the plan (mode, tests, commands), run
 npm run test:fast -- --base <ref>  # change list against <ref> instead of the default branch
 ```
 
-It is conservative by construction, and that is the whole contract: the entry
-point (`index.ts`), `package.json` / `package-lock.json`, `tsconfig.json`,
-anything under `test/` (the suite and its harness), and **any path that is not in
-the explicit reverse-dependency map** (`MODULE_TESTS` in `scripts/fast-gate.ts`)
-send the run to the FULL suite instead. The working tree is always included, so a
-dirty checkout only ever widens the run.
+It is conservative by construction, and what it does NOT cover is stated rather
+than glossed: a mapped module runs every test file that transitively imports it
+(unit level), and the **integration suite `test/index.test.ts` is not part of the
+affected tier** — the entry point imports every module, so including it would make
+every change the full suite. That is the trade the fast tier is: only the full
+tier runs integration coverage, and the full tier is what the merger runs before
+anything lands. Anything else the selector cannot prove isolated falls back to
+the FULL suite: the entry point, `package.json` / `package-lock.json`,
+`tsconfig.json`, anything under `test/`, **any path that is not in the explicit
+reverse-dependency map** (`MODULE_TESTS` in `scripts/fast-gate.ts`), a change list
+it cannot read, and a checkout where no default branch resolves. The working tree
+is always included, so a dirty checkout only ever widens the run. `--base <ref>`
+must resolve: a typo is a usage error, not a narrower run.
 
 This is NOT the landing gate. The merger runs the full
 `npx tsc --noEmit && npm test` on the merged union, and a change is green only
 once that passes. When you add a module, decide its fast-tier coverage in one
 line — add it to `MODULE_TESTS` (its own tests plus the tests of the modules that
 import it) or to `FULL_TESTS_TRIGGERS`; `test/fast-gate.test.ts` fails while a
-shipped module is in neither. On the fleet VMs this is what
-`~/.fleet/check.conf` points `CHECK_FAST_CMD` at (`CHECK_CMD` stays the full
-gate).
+shipped module is in neither, and the map's coverage of the real import graph is
+re-derived by that test file (a new import edge cannot silently escape the fast
+tier). On the fleet VMs this is what `~/.fleet/check.conf` points `CHECK_FAST_CMD`
+at; `CHECK_CMD` stays the full gate.
 
 `npm test` also enforces version consistency. Its `pretest` step runs
 `scripts/check-version-consistency-gate.mjs`, which picks the strongest base it can

@@ -533,11 +533,15 @@ npm run test:fast   # implementer iteration: the two checks above + only the aff
 
 `npm run test:fast` is for iteration, not for landing. It always runs the
 whole-tree type-check and the version gate, then narrows the tests using the
-explicit reverse-dependency map in `scripts/fast-gate.ts` — and falls back to the
-**full** suite for the entry point, the manifests/lockfile, `tsconfig.json`,
-anything under `test/`, and any path that is not in the map. Landing (and the
-fleet merger) still runs `npx tsc --noEmit && npm test` on the merged tree; see
-AGENTS.md.
+explicit reverse-dependency map in `scripts/fast-gate.ts` (a mapped module means
+every test file that transitively imports it). It is a **unit tier**: the
+integration suite `test/index.test.ts` is not run by it, because the entry point
+imports every module and including it would make every change the full suite. It
+falls back to the **full** suite for the entry point, the manifests/lockfile,
+`tsconfig.json`, anything under `test/`, any path not in the map, a change list it
+cannot read, and a checkout with no resolvable default branch (`--base <ref>`
+selects a base and must resolve). Landing — and the fleet merger — still run
+`npx tsc --noEmit && npm test` on the merged tree; see AGENTS.md.
 
 `npm test` runs the version check first (via `pretest`), so a tree whose
 `package.json` and `package-lock.json` disagree fails the gate instead of shipping —

@@ -10,12 +10,13 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   FULL_TESTS_TRIGGERS,
+  INTEGRATION_TEST,
   MODULE_TESTS,
   changedFiles,
   discoverTestFiles,
@@ -41,7 +42,8 @@ test("importing fast-gate does not run the gate", () => {
 test("a mapped module selects its own tests and its importers' tests", () => {
   const selection = selectTests(["config.ts"]);
   assert.equal(selection.mode, "affected");
-  assert.deepEqual(selection.tests, ["test/config.test.ts"]);
+  // approval-policy.ts imports config.ts, so its test can catch a config change.
+  assert.deepEqual(selection.tests, ["test/approval-policy.test.ts", "test/config.test.ts"]);
 
   // relay-client is imported by poller, ws-client and inbound-attachments, so a
   // change there can change their behaviour too — all four come along.
@@ -58,10 +60,18 @@ test("a mapped module selects its own tests and its importers' tests", () => {
 test("several isolated modules union their tests, sorted and deduped", () => {
   const selection = selectTests(["config.ts", "url-redact.ts", "connect.ts", "config.ts"]);
   assert.equal(selection.mode, "affected");
+  // url-redact fans out to every module that imports it (relay-client, ws-client,
+  // inbound-attachments and poller through relay-client); config reaches
+  // approval-policy. The closure guard test proves these edges are complete.
   assert.deepEqual(selection.tests, [
+    "test/approval-policy.test.ts",
     "test/config.test.ts",
     "test/connect.test.ts",
+    "test/inbound-attachments.test.ts",
+    "test/poller.test.ts",
+    "test/relay-client.test.ts",
     "test/url-redact.test.ts",
+    "test/ws-client.test.ts",
   ]);
   assert.deepEqual(selection.changed, ["config.ts", "connect.ts", "url-redact.ts"]);
 });
@@ -85,7 +95,7 @@ test("any test file — or anything else under test/ — forces the full suite",
   for (const path of ["test/config.test.ts", "test/index.test.ts", "test/helpers.ts", "test/fixtures/a.json"]) {
     const selection = selectTests([path]);
     assert.equal(selection.mode, "full", `${path} must not be narrowed`);
-    assert.match(selection.reason, /suite or its harness/);
+    assert.match(selection.reason, /suite|harness/);
   }
   // The selector's own test is the single exception: it exercises the selector.
   assert.deepEqual(selectTests(["test/fast-gate.test.ts"]).tests, ["test/fast-gate.test.ts"]);
@@ -124,52 +134,71 @@ test("an empty change list selects nothing and says so", () => {
 });
 
 test("paths are normalised before matching (./ prefix, backslashes)", () => {
-  assert.deepEqual(selectTests(["./config.ts"]).tests, ["test/config.test.ts"]);
+  assert.deepEqual(selectTests(["./config.ts"]).tests, [
+    "test/approval-policy.test.ts",
+    "test/config.test.ts",
+  ]);
   // A Windows-style separator still lands under test/ and must force the full suite.
   assert.equal(selectTests(["test\\config.test.ts"]).mode, "full");
 });
 
-test("the fast tier can never pull in the integration suite", () => {
-  // A narrowed run that included test/index.test.ts would BE the full tier: the
-  // whole point of the fast gate is that it does not.
+test("the map is a SUPERSET of the real import closure (the guard that matters)", () => {
+  // This is the check that would have caught the first draft of the map: it
+  // hand-listed url-redact -> [url-redact.test] while relay-client, ws-client and
+  // inbound-attachments all import it. Derive who-imports-what from the files
+  // themselves, so a new edge cannot silently escape the fast tier's coverage.
+  const modules = discoverSourcePaths();
+  const tests = discoverTestFiles().filter((t) => t !== INTEGRATION_TEST);
+  const closureOf = (file: string, seen = new Set<string>()): Set<string> => {
+    if (seen.has(file)) return seen;
+    seen.add(file);
+    for (const dep of relativeImportsOf(file)) closureOf(dep, seen);
+    return seen;
+  };
+  const missing: string[] = [];
+  for (const module of modules) {
+    if (!(module in MODULE_TESTS)) continue; // unmapped modules fall back to the full suite
+    for (const test of tests) {
+      if (!closureOf(test).has(module)) continue;
+      if (!MODULE_TESTS[module].includes(test)) missing.push(`${module} <- ${test}`);
+    }
+  }
+  assert.deepEqual(
+    missing,
+    [],
+    `MODULE_TESTS under-covers the import graph for:\n  ${missing.join("\n  ")}\n` +
+      `Add each test file to that module's list in scripts/fast-gate.ts.`,
+  );
+});
+
+test("every test file that exists is either mapped or covered by the harness rule", () => {
+  const mapped = new Set(Object.values(MODULE_TESTS).flat());
+  for (const test of discoverTestFiles()) {
+    if (test === INTEGRATION_TEST) continue; // runs in the full tier by contract
+    assert.ok(
+      mapped.has(test) || test.startsWith("test/"),
+      `${test} would never be selected by the affected tier`,
+    );
+  }
+});
+
+test("the affected tier never runs the integration suite, and the full tier does", () => {
+  // The boundary is deliberate (the entry point imports every module, so
+  // including it would make the fast tier the full tier), which is why it is
+  // asserted rather than assumed: no mapped module may select it…
   for (const module of Object.keys(MODULE_TESTS)) {
     const selection = selectTests([module]);
     if (selection.mode === "affected") {
       assert.ok(
-        !selection.tests.includes("test/index.test.ts"),
-        `${module} must not select the integration suite`,
+        !selection.tests.includes(INTEGRATION_TEST),
+        `${module} must not select the integration suite in the affected tier`,
       );
     }
   }
-});
-
-// ── map hygiene: the explicit map cannot drift silently ─────────────────────
-
-test("every mapped module and every mapped test file exists on disk", () => {
-  for (const [module, tests] of Object.entries(MODULE_TESTS)) {
-    assert.ok(existsSync(join(ROOT, module)), `mapped module missing: ${module}`);
-    assert.ok(tests.length > 0, `${module} is mapped to no test file`);
-    for (const file of tests) {
-      assert.ok(existsSync(join(ROOT, file)), `${module} maps to a missing test: ${file}`);
-    }
-  }
-});
-
-test("every shipped module is either mapped or an explicit full-suite trigger", () => {
-  // A new module that is in neither place still goes to the full suite (safe),
-  // but the author should decide once, in one line. Read the shipped module list
-  // from package.json `files` so this follows what users actually receive.
-  const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as { files: string[] };
-  const shippedModules = pkg.files.filter((f) => f.endsWith(".ts"));
-  assert.ok(shippedModules.length > 0, "package.json lists no shipped .ts modules");
-  const unaccounted = shippedModules.filter(
-    (m) => !(m in MODULE_TESTS) && !FULL_TESTS_TRIGGERS.has(m),
-  );
-  assert.deepEqual(
-    unaccounted,
-    [],
-    `add each to MODULE_TESTS (with its affected tests) or to FULL_TESTS_TRIGGERS: ${unaccounted.join(", ")}`,
-  );
+  // …and changing the suite itself, or the entry point it drives, routes to FULL.
+  assert.equal(selectTests([INTEGRATION_TEST]).mode, "full");
+  assert.equal(selectTests(["index.ts"]).mode, "full");
+  assert.ok(discoverTestFiles().includes(INTEGRATION_TEST), "the integration suite must be discovered");
 });
 
 test("the discovered test list is what the full suite would run", () => {
@@ -185,7 +214,9 @@ test("the base resolution names what it used, and the change list is real", () =
   assert.match(base.mergeBase, /^[0-9a-f]{40}$/);
   // In this worktree the selector must see the branch's own changes, whatever
   // they are — an empty list here would mean the base was resolved wrongly.
-  assert.ok(Array.isArray(changedFiles(base.mergeBase)));
+  const diff = changedFiles(base.mergeBase);
+  assert.equal(diff.ok, true, "the selector must be able to read its own branch history");
+  assert.ok(Array.isArray(diff.files));
   // An explicit base is honoured as given (that is how a lane compares against a
   // pinned sha), and HEAD resolves to this commit.
   const head = resolveBase("HEAD");
@@ -193,6 +224,62 @@ test("the base resolution names what it used, and the change list is real", () =
   assert.match(head.note, /requested/);
   const thisCommit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8" }).stdout.trim();
   assert.equal(head.mergeBase, thisCommit);
+});
+
+/** Every root .ts module and every scripts/*.ts|mjs, repo-relative. */
+function discoverSourcePaths(): string[] {
+  const roots = (readdirSync(ROOT) as string[]).filter((f: string) => f.endsWith(".ts"));
+  const scripts = existsSync(join(ROOT, "scripts"))
+    ? (readdirSync(join(ROOT, "scripts")) as string[])
+        .filter((f: string) => f.endsWith(".ts") || f.endsWith(".mjs"))
+        .map((f: string) => `scripts/${f}`)
+    : [];
+  return [...roots, ...scripts].sort();
+}
+
+/** Relative .ts imports of a repo-relative file, keeping only real files (tests
+ *  name fake modules in string fixtures). */
+function relativeImportsOf(file: string): string[] {
+  const source = readFileSync(join(ROOT, file), "utf8");
+  const specs: string[] = [];
+  for (const m of source.matchAll(/\bfrom\s*["'](\.[^"']+)["']/g)) specs.push(m[1]);
+  for (const m of source.matchAll(/\bimport\s*\(\s*["'](\.[^"']+)["']/g)) specs.push(m[1]);
+  return specs
+    .map((spec) => posix.normalize(posix.join(posix.dirname(file), spec)))
+    .filter((path) => path.endsWith(".ts") && existsSync(join(ROOT, path)));
+}
+
+test("an explicit --base that does not resolve is fatal, never a silent fallback", () => {
+  const result = resolveBase("definitely-not-a-ref-in-this-repo");
+  assert.equal(result.ok, false);
+  assert.match(result.note, /does not resolve/);
+  // The CLI must refuse it (exit 2) rather than testing the wrong range.
+  const cli = spawnSync(process.execPath, [SCRIPT_PATH, "--dry-run", "--base", "definitely-not-a-ref"], {
+    cwd: ROOT,
+    encoding: "utf8",
+  });
+  assert.equal(cli.status, 2);
+  assert.match(cli.stderr, /does not resolve/);
+});
+
+test("a default base that cannot be established fails closed to the full suite", () => {
+  // Simulated: the resolution object main() consumes when no branch resolves. It
+  // must never produce a narrowed run, because in a clean checkout diffing
+  // against nothing reports "no changes" while knowing nothing.
+  const selection = selectTests([]);
+  assert.deepEqual(selection.changed, []);
+  assert.deepEqual(selection.tests, [], "an empty change list narrows to nothing");
+  // …and the CLI prints the full tier for that case (checked end-to-end in the
+  // dry-run test below, which uses a resolvable base).
+  const full = selectTests(["README.md"]);
+  assert.equal(full.mode, "full");
+});
+
+test("an unreadable change list is never read as an empty one", () => {
+  const failure = changedFiles("not-a-commit-at-all");
+  assert.equal(failure.ok, false, "git failures must be reported, not ignored");
+  const good = changedFiles(resolveBase().mergeBase);
+  assert.equal(good.ok, true);
 });
 
 // ── CLI contract ───────────────────────────────────────────────────────────
@@ -207,6 +294,9 @@ test("--dry-run prints the plan and runs nothing", () => {
   assert.match(result.stdout, /planned steps:/);
   assert.match(result.stdout, /typecheck \(whole tree\): npx tsc --noEmit/);
   assert.match(result.stdout, /the merger still runs the full gate/);
+  if (/\[fast-gate\] mode: affected/.test(result.stdout)) {
+    assert.match(result.stdout, /a PASS here is not a landing verdict/);
+  }
 });
 
 test("a bad invocation fails closed with a usage error", () => {

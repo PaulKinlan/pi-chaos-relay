@@ -12,18 +12,28 @@
  * consistency gate — and then either the affected test files or, when anything
  * is not provably isolated, the FULL suite.
  *
- * CONSERVATIVE BY CONSTRUCTION: a changed path is only ever narrowed to a
- * mapped test set. Anything this script does not recognise — the entry point,
- * a manifest/lockfile, tsconfig, the shared test harness, a doc, a brand-new
- * module, a deleted path — falls back to the full suite. The map is explicit
- * and additive: adding a module means adding it to MODULE_TESTS, otherwise it
- * costs the full suite (a wrong answer here can only cost time, never
- * coverage).
+ * THE CONTRACT, stated exactly rather than optimistically:
+ *
+ *   - A mapped module runs every test file that transitively imports it
+ *     (MODULE_TESTS, derived from the real import graph and re-checked by
+ *     test/fast-gate.test.ts). That is unit-level coverage.
+ *   - `test/index.test.ts` is the INTEGRATION suite and is NOT run by the
+ *     affected tier. The entry point imports every module, so including it would
+ *     make every change the full suite and the fast tier would not exist. It
+ *     runs in the full tier — which the merger always runs, and which this
+ *     script runs whenever the entry point, a manifest/lockfile, tsconfig, the
+ *     test tree, or any unmapped path is touched. A fast PASS is therefore NOT a
+ *     landing verdict, and the banner says so.
+ *   - Anything this script does not recognise — a brand-new module, a doc, a
+ *     deleted path, an unreadable change list, a checkout where the default
+ *     branch cannot be resolved — falls back to the full suite. Every guard here
+ *     fails CLOSED: a wrong answer can cost time, never coverage.
  *
  * USAGE
- *   npm run test:fast                     # tsc + version gate + affected tests
- *   node scripts/fast-gate.ts --dry-run   # print the plan, run nothing
- *   node scripts/fast-gate.ts --base <ref># compare against <ref> instead
+ *   npm run test:fast                      # tsc + version gate + affected tests
+ *   node scripts/fast-gate.ts --dry-run    # print the plan, run nothing
+ *   node scripts/fast-gate.ts --base <ref> # compare against <ref> (required if
+ *                                          # no default branch resolves here)
  *   node scripts/fast-gate.ts --help
  */
 import { spawnSync } from "node:child_process";
@@ -33,29 +43,51 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 
+/** The integration suite the affected tier deliberately does not run. */
+export const INTEGRATION_TEST = "test/index.test.ts";
+
 /**
- * Explicit reverse dependency map: a source path → every test file that covers
- * it, i.e. its own direct test PLUS the tests of the modules that import it (a
- * change to an imported module can change a consumer's behaviour). Derived from
- * the real import graph, checked by test/fast-gate.test.ts so it cannot drift
- * silently — an unmapped file is never narrowed.
+ * Explicit reverse dependency map: a source path → EVERY test file that
+ * transitively imports it (a module's own test, plus the tests of the modules
+ * that import it, plus theirs). Derived from the real import graph — including
+ * the edges the first draft of this file got wrong (url-redact is imported by
+ * relay-client, ws-client and inbound-attachments; crypto reaches seven test
+ * files through config and relay-client) — and re-derived by
+ * test/fast-gate.test.ts, which FAILS if the map under-covers the graph. The
+ * integration suite is excluded here and listed under INTEGRATION_TEST instead.
+ *
+ * A path in NEITHER this map nor FULL_TESTS_TRIGGERS is never narrowed.
  */
 export const MODULE_TESTS: Record<string, string[]> = {
-  "crypto.ts": ["test/crypto.test.ts", "test/relay-client.test.ts"],
-  "relay-client.ts": [
-    "test/relay-client.test.ts",
-    "test/poller.test.ts",
+  "approval-policy.ts": ["test/approval-policy.test.ts"],
+  "config.ts": ["test/approval-policy.test.ts", "test/config.test.ts"],
+  "connect.ts": ["test/connect.test.ts"],
+  "crypto.ts": [
+    "test/approval-policy.test.ts",
+    "test/config.test.ts",
+    "test/crypto.test.ts",
     "test/inbound-attachments.test.ts",
+    "test/poller.test.ts",
+    "test/relay-client.test.ts",
     "test/ws-client.test.ts",
   ],
-  "poller.ts": ["test/poller.test.ts"],
-  "ws-client.ts": ["test/ws-client.test.ts"],
   "inbound-attachments.ts": ["test/inbound-attachments.test.ts"],
-  "config.ts": ["test/config.test.ts"],
-  "connect.ts": ["test/connect.test.ts"],
+  "poller.ts": ["test/poller.test.ts"],
+  "relay-client.ts": [
+    "test/inbound-attachments.test.ts",
+    "test/poller.test.ts",
+    "test/relay-client.test.ts",
+    "test/ws-client.test.ts",
+  ],
   "reply-format.ts": ["test/reply-format.test.ts"],
-  "url-redact.ts": ["test/url-redact.test.ts"],
-  "approval-policy.ts": ["test/approval-policy.test.ts"],
+  "url-redact.ts": [
+    "test/inbound-attachments.test.ts",
+    "test/poller.test.ts",
+    "test/relay-client.test.ts",
+    "test/url-redact.test.ts",
+    "test/ws-client.test.ts",
+  ],
+  "ws-client.ts": ["test/ws-client.test.ts"],
   "scripts/check-version-consistency.mjs": [
     "test/version-consistency.test.ts",
     "test/version-consistency-gate.test.ts",
@@ -72,9 +104,9 @@ export const MODULE_TESTS: Record<string, string[]> = {
 
 /**
  * Paths that force the FULL suite. Each one changes something global: the entry
- * point is what the integration suite drives, the manifests decide how the
- * suite is installed and run, and tsconfig decides what is type-checked. A
- * path in neither this set nor MODULE_TESTS also forces the full suite.
+ * point is what the integration suite drives, the manifests decide how the suite
+ * is installed and run, and tsconfig decides what is type-checked. A path in
+ * neither this set nor MODULE_TESTS also forces the full suite.
  */
 export const FULL_TESTS_TRIGGERS = new Set([
   "index.ts",
@@ -123,8 +155,10 @@ export function selectTests(changed: string[]): Selection {
       tests.add(SELF_TEST);
       continue;
     }
-    // The suite itself: any test file, and any other path under test/ (a shared
-    // helper or fixture a single file would not cover).
+    // The suite itself: the integration test, any other test file, and any
+    // other path under test/ (a shared helper or fixture one file would not
+    // cover).
+    if (path === INTEGRATION_TEST) return full(`${path} changed: the integration suite`);
     if (path.startsWith("test/")) return full(`${path} changed: the suite or its harness`);
     if (FULL_TESTS_TRIGGERS.has(path)) return full(`${path} changed: global`);
     const mapped = MODULE_TESTS[path];
@@ -161,36 +195,60 @@ function git(args: string[]): { ok: boolean; out: string } {
   return { ok: true, out: result.stdout };
 }
 
+export interface BaseResolution {
+  ok: boolean;
+  ref: string;
+  mergeBase: string;
+  /** One line naming the base and what it could not establish. */
+  note: string;
+}
+
 /**
- * Base for the change list. Prefers the default branch — like the version gate,
- * it says which base it used and what it could not check — then falls back to
- * HEAD so the script still works in a shallow, offline or remote-less checkout.
- * The working tree (staged, unstaged and untracked) is ALWAYS included: a dirty
- * tree is a superset, which can only widen the run.
+ * Base for the change list.
+ *
+ * An EXPLICIT `--base <ref>` must resolve: a typo would otherwise silently fall
+ * back to a base that hides the change, so an unresolvable one is a fatal error
+ * in main (review P1, a1x). With no explicit base this prefers the default
+ * branch, and if none resolves it FAILS CLOSED (`ok: false`) rather than
+ * diffing against HEAD — in a clean checkout that would report "no changes" and
+ * narrow the run while knowing nothing. `--base HEAD` remains the deliberate way
+ * to ask for "just my working tree".
  */
-export function resolveBase(requested?: string): { ref: string; mergeBase: string; note: string } {
-  const candidates = requested
-    ? [requested]
-    : ["refs/remotes/origin/master", "refs/remotes/origin/main", "refs/heads/master"];
-  for (const ref of candidates) {
+export function resolveBase(requested?: string): BaseResolution {
+  if (requested) {
+    const mb = git(["merge-base", requested, "HEAD"]);
+    if (!mb.ok || !mb.out.trim()) {
+      return {
+        ok: false,
+        ref: requested,
+        mergeBase: "",
+        note: `--base ${requested} does not resolve to a commit here`,
+      };
+    }
+    return { ok: true, ref: requested, mergeBase: mb.out.trim(), note: `base ${requested} (requested)` };
+  }
+  for (const ref of ["refs/remotes/origin/master", "refs/remotes/origin/main", "refs/heads/master"]) {
     const mb = git(["merge-base", ref, "HEAD"]);
     if (mb.ok && mb.out.trim()) {
-      const note = requested
-        ? `base ${ref} (requested)`
-        : `base ${ref} (default branch)`;
-      return { ref, mergeBase: mb.out.trim(), note };
+      return { ok: true, ref, mergeBase: mb.out.trim(), note: `base ${ref} (default branch)` };
     }
   }
-  const head = git(["rev-parse", "HEAD"]);
   return {
-    ref: "HEAD",
-    mergeBase: head.out.trim(),
-    note: "base HEAD — no default branch resolved here, so only worktree changes and this commit are considered",
+    ok: false,
+    ref: "",
+    mergeBase: "",
+    note:
+      "no default branch resolves in this checkout (pass --base <ref> to enable narrowing); " +
+      "the change list cannot be established, so the full suite runs",
   };
 }
 
-/** Every path that differs from `mergeBase`, plus the dirty worktree. */
-export function changedFiles(mergeBase: string): string[] {
+/**
+ * Every path that differs from `mergeBase`, plus the dirty worktree. `ok: false`
+ * means git could not answer (not a repository, missing objects) — the caller
+ * must treat the change list as UNKNOWN and fail closed, never as empty.
+ */
+export function changedFiles(mergeBase: string): { ok: boolean; files: string[] } {
   const sets: string[][] = [];
   for (const args of [
     ["diff", "--name-only", `${mergeBase}...HEAD`],
@@ -199,11 +257,12 @@ export function changedFiles(mergeBase: string): string[] {
     ["ls-files", "--others", "--exclude-standard"],
   ]) {
     const result = git(args);
-    if (result.ok) sets.push(result.out.split("\n").filter((l) => l.trim() !== ""));
+    if (!result.ok) return { ok: false, files: [] };
+    sets.push(result.out.split("\n").filter((l) => l.trim() !== ""));
   }
   const all = new Set<string>();
   for (const set of sets) for (const path of set) all.add(normalizePath(path));
-  return [...all].sort();
+  return { ok: true, files: [...all].sort() };
 }
 
 /** Every test file the repo ships, for the "full suite" step and the guards. */
@@ -220,8 +279,8 @@ const USAGE = `usage: node scripts/fast-gate.ts [--base <ref>] [--dry-run] [--he
 
 Runs, in order: npx tsc --noEmit; the version-consistency gate; then either the
 affected test files or the full suite when the change is not provably isolated.
-This is the implementer fast tier — the merger still runs the full gate on the
-merged union.`;
+Unit level only — the integration suite (test/index.test.ts) runs in the full
+tier, and the merger still runs the full gate on the merged union.`;
 
 function parseArgs(argv: string[]): { base?: string; dryRun: boolean } {
   const opts: { base?: string; dryRun: boolean } = { dryRun: false };
@@ -251,16 +310,43 @@ function parseArgs(argv: string[]): { base?: string; dryRun: boolean } {
 function main(): void {
   const opts = parseArgs(process.argv.slice(2));
   const base = resolveBase(opts.base);
-  const changed = changedFiles(base.mergeBase);
-  const selection = selectTests(changed);
+  if (opts.base && !base.ok) {
+    // An explicit base that does not resolve is a usage error, not a reason to
+    // run something narrower: refuse instead of testing the wrong range.
+    console.error(`fast-gate: ${base.note}\n${USAGE}`);
+    process.exit(2);
+  }
+
+  let changed: string[] = [];
+  let selection: Selection;
+  if (!base.ok) {
+    changed = [];
+    selection = { mode: "full", tests: [], reason: `full suite (${base.note})`, changed: [] };
+  } else {
+    const diff = changedFiles(base.mergeBase);
+    if (!diff.ok) {
+      selection = {
+        mode: "full",
+        tests: [],
+        reason: "full suite (the change list could not be read)",
+        changed: [],
+      };
+    } else {
+      changed = diff.files;
+      selection = selectTests(changed);
+    }
+  }
 
   console.log("[fast-gate] FAST tier — the merger still runs the full gate on the merged union");
-  console.log(`[fast-gate] ${base.note}`);
+  if (base.ok) console.log(`[fast-gate] ${base.note}`);
   console.log(`[fast-gate] changed (${changed.length}): ${changed.length ? changed.join(", ") : "(none)"}`);
   console.log(`[fast-gate] mode: ${selection.mode} — ${selection.reason}`);
   if (selection.mode === "affected") {
     console.log(
       `[fast-gate] tests (${selection.tests.length} of ${discoverTestFiles().length}): ${selection.tests.join(" ") || "(none)"}`,
+    );
+    console.log(
+      `[fast-gate] NOT run by this tier: ${INTEGRATION_TEST} (integration) — a PASS here is not a landing verdict`,
     );
   }
 
@@ -271,14 +357,18 @@ function main(): void {
       command: "node",
       args: ["scripts/check-version-consistency-gate.mjs"],
     },
-    selection.mode === "full"
-      ? { label: "tests (full suite)", command: "node", args: ["--test"] }
-      : {
-          label: `tests (affected: ${selection.tests.length})`,
-          command: "node",
-          args: ["--test", ...selection.tests],
-        },
   ];
+  if (selection.mode === "full") {
+    steps.push({ label: "tests (full suite)", command: "node", args: ["--test"] });
+  } else if (selection.tests.length > 0) {
+    steps.push({
+      label: `tests (affected: ${selection.tests.length})`,
+      command: "node",
+      args: ["--test", ...selection.tests],
+    });
+  } else {
+    console.log("[fast-gate] no affected tests to run — typecheck and the version gate only");
+  }
 
   if (opts.dryRun) {
     console.log("[fast-gate] --dry-run, planned steps:");
