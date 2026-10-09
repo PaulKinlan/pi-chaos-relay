@@ -7,7 +7,8 @@
  * with 0600 permissions.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, chmodSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -539,6 +540,65 @@ export function loadPersisted(): PersistedConfig {
 // temp path (pid disambiguates across processes sharing a profile file).
 let tmpCounter = 0;
 
+/** How many fresh temp names one atomic write may try before giving up. Each
+ *  attempt uses a new random name, so reaching this bound means something is
+ *  wrong that another loop cannot fix (an uncreatable directory, a hostile writer
+ *  racing us) — failing the write is better than spinning. */
+const TMP_CREATE_ATTEMPTS = 5;
+
+/**
+ * Temp path for one attempt. The random part is the point: a name an attacker
+ * can predict (or a symlink they can plant at it) must not be enough to have
+ * this secret-bearing file written through their target — the exclusive create
+ * below refuses the name and the next attempt picks a different one.
+ */
+function tempPathFor(target: string): string {
+  return `${target}.tmp.${process.pid}.${tmpCounter++}.${randomBytes(4).toString("hex")}`;
+}
+
+/**
+ * Create the temp file with O_CREAT|O_EXCL (`flag: "wx"`): it fails if the
+ * path exists and never follows a symlink, so an orphan from a crashed process
+ * (whose pid was recycled into ours) or a planted link cannot donate its mode
+ * or its target to this file. On EEXIST a FRESH name is tried, up to
+ * `attempts`; anything else propagates. Returns the created path.
+ *
+ * `nameFor` is a test seam for the collision path: with a random name an
+ * EEXIST cannot be provoked without it.
+ */
+export function createTempFileExclusively(
+  target: string,
+  contents: string,
+  opts: { attempts?: number; nameFor?: () => string } = {},
+): string {
+  const attempts = opts.attempts ?? TMP_CREATE_ATTEMPTS;
+  const nameFor = opts.nameFor ?? (() => tempPathFor(target));
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const tmp = nameFor();
+    try {
+      // `mode` is load-bearing, not decoration: this file holds the apiKey and
+      // the private identity, and a plain `writeFileSync(tmp, contents)` lets
+      // the process umask decide — 0644 under the common umask 022. open(2)
+      // applies `mode` when it CREATES the file, and O_EXCL guarantees this call
+      // is the creator, so the secret is never group/other readable, not even
+      // briefly. (No chmod follows: with an exclusive create there is no
+      // pre-existing mode to correct.)
+      writeFileSync(tmp, contents, { mode: 0o600, flag: "wx" });
+      return tmp;
+    } catch (err) {
+      lastError = err;
+      if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
+      // Occupied (orphan or planted link): leave it alone and try a new name.
+    }
+  }
+  throw new Error(
+    `could not create a temp file beside ${target} after ${attempts} attempts: ${String(
+      (lastError as NodeJS.ErrnoException)?.code ?? lastError,
+    )}`,
+  );
+}
+
 /**
  * Atomic file replace: serialize to a unique temp file in the same directory,
  * then rename(2) over the target. The rename is atomic on POSIX, so a
@@ -548,45 +608,23 @@ let tmpCounter = 0;
  *
  * Crash residual, stated rather than glossed: this is atomic-replace, not
  * crash-without-trace. If the process dies between the temp write and the
- * rename, an inert `<target>.tmp.<pid>.<n>` orphan is left beside the target
- * and the PREVIOUS complete file survives at the target, if one existed (on a
- * first-ever write there is no previous file, so the target is simply absent
- * and a later batch may replay after restart — the de-dup log's job). The
- * temp file is CREATED owner-only: `mode: 0o600` is passed to open(2), which
- * applies it when it creates the file, so on the normal path there is no window
- * in which the API key / ECDSA identity in it is group/other readable. Residual,
- * stated rather than glossed: a mode only applies at CREATION, so if an orphan
- * from a crashed process already sits at this exact temp path (its pid recycled
- * into ours) the write inherits that file's mode and the chmod after it can
- * only shorten the window, not remove it; a filesystem with no POSIX
- * permissions ignores both. Closing that residual (an exclusive `flag: "wx"`
- * create, retried on a fresh name) is follow-up pi-chaos-relay-a68. Neither
- * residual affects a concurrent reader.
+ * rename, an inert `<target>.tmp.<pid>.<n>.<random>` orphan is left beside the
+ * target and the PREVIOUS complete file survives at the target, if one existed
+ * (on a first-ever write there is no previous file, so the target is simply
+ * absent and a later batch may replay after restart — the de-dup log's job).
+ * The temp file is created owner-only AND exclusively (see
+ * createTempFileExclusively): a pre-existing path at a candidate temp name — a
+ * crash orphan whose pid was recycled into ours, or a symlink someone planted
+ * in a shared config directory — is never written through, and the write just
+ * moves to a fresh name. A filesystem with no POSIX permissions still ignores
+ * the mode. Neither residual affects a concurrent reader.
  */
 function atomicWriteSync(path: string, contents: string): void {
   // Ensure the target's directory exists (the config may live outside ~/.pi
   // when CHAOS_RELAY_CONFIG points elsewhere; the side-car sits beside it).
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const tmp = `${path}.tmp.${process.pid}.${tmpCounter++}`;
-  // `mode` here is load-bearing, not decoration: this file holds the apiKey and
-  // the private identity, and a plain `writeFileSync(tmp, contents)` lets the
-  // process umask decide — 0644 under the common umask 022 — so the secret is
-  // group/other readable until the chmod below runs. open(2) applies `mode` at
-  // creation, so passing it removes that window on the normal path.
-  writeFileSync(tmp, contents, { mode: 0o600 });
-  // Best effort, and only a partial mitigation for the one path the mode above
-  // does not cover: open(2) applies `mode` only when it CREATES the file, so a
-  // stale orphan already sitting at this exact name (a crashed process whose
-  // pid was recycled into ours) was written with ITS old mode, and this chmod
-  // can only shorten the exposure before the rename — not remove it. See
-  // pi-chaos-relay-a68 for the exclusive-create fix. The side-car is not secret
-  // but stays 0600 for consistency.
-  try {
-    chmodSync(tmp, 0o600);
-  } catch {
-    /* non-POSIX filesystems may not support chmod */
-  }
+  const tmp = createTempFileExclusively(path, contents);
   try {
     renameSync(tmp, path);
   } catch (err) {

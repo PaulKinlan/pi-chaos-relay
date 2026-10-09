@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync, copyFileSync, mkdirSync, rmSync, rmdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync, copyFileSync, mkdirSync, rmSync, rmdirSync, statSync, symlinkSync, lstatSync, mkdtempSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -23,6 +23,7 @@ import {
   resolveProfileLockCollision,
   resolveProfileCreate,
   countProfileConfigs,
+  createTempFileExclusively,
   MAX_PROFILE_CONFIGS,
   savePersisted,
   loadMessageState,
@@ -702,28 +703,29 @@ test("savePersisted onto a truncated file still lands the update", () => {
 
 // ── Atomic writes: the temp file is never group/other readable ────────────
 
-test("regression pin: atomicWriteSync creates its temp file 0600, not umask-default", () => {
-  // The temp file exists only inside one synchronous call, and the chmod that
-  // follows it would mask its creation mode, so a test process cannot observe
-  // the mode it was CREATED with without syscall interposition. Pin the call
-  // site instead: passing `mode` to writeFileSync is what closes the window in
-  // which the apiKey / private identity sits at 0644 under the common umask
-  // 022. Deleting the option leaves every end-state test green, so this is the
-  // only guard that fails with it; `mode: 0o600` may not be reworded away.
+test("regression pin: the temp file is created 0600 AND exclusively", () => {
+  // The secret-bearing temp file exists only inside one synchronous call, so the
+  // mode it was CREATED with cannot be observed without syscall interposition
+  // (pm0's strace evidence). Pin the call site instead. Two properties matter and
+  // deleting either leaves every end-state test green:
+  //   mode: 0o600 — open(2) applies it at creation, so the apiKey / private
+  //                 identity is never group/other readable, not even briefly;
+  //   flag: "wx"  — O_CREAT|O_EXCL refuses an existing path (a crash orphan whose
+  //                 pid was recycled into ours) and never follows a symlink, so a
+  //                 planted name cannot donate its mode or its target (a68).
   const source = readFileSync(new URL("../config.ts", import.meta.url), "utf8");
   assert.match(
     source,
-    /writeFileSync\(tmp, contents, \{ mode: 0o600 \}\)/,
-    "atomicWriteSync must create the temp file owner-only, not rely on the later chmod",
+    /writeFileSync\(tmp, contents, \{ mode: 0o600, flag: "wx" \}\)/,
+    "the temp file must be created owner-only and exclusively",
   );
 });
 
 test("the config and the message-state side-car are 0600 under a fully permissive umask", () => {
-  // End-state guard, NOT a pin on either mechanism: this test passes on the
-  // pre-fix code (the chmod lands 0600) and would also pass with the chmod
-  // removed, because under umask 000 the creation mode alone yields 0600. It
-  // asserts the property the operator depends on — config and side-car are
-  // owner-only whatever the umask — and the creation-mode window itself is
+  // End-state guard, NOT a pin on the mechanism: under umask 000 the creation
+  // mode alone yields 0600, so this passes on the pre-fix code too. It asserts
+  // the property the operator depends on — config and side-car are owner-only
+  // whatever the umask — while the creation mode and the exclusive flag are
   // pinned by the call-site test above.
   const previousUmask = process.umask(0o000);
   try {
@@ -741,6 +743,106 @@ test("the config and the message-state side-car are 0600 under a fully permissiv
   } finally {
     process.umask(previousUmask);
   }
+});
+
+// ── a68: the temp file is created exclusively, never through a planted path ──
+
+/** A fresh scratch directory that the test owns (removed afterwards). */
+function withScratchDir(fn: (dir: string) => void): void {
+  const dir = mkdtempSync(join(tmpdir(), "chaos-relay-a68-"));
+  try {
+    fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("createTempFileExclusively skips an existing path instead of writing through it", () => {
+  // The pre-a68 shape opened whatever sat at the candidate name: an orphan from
+  // a crashed process whose pid was recycled into ours donated its mode, so the
+  // post-write chmod could only shorten the exposure, not remove it.
+  withScratchDir((dir) => {
+    const target = join(dir, "chaos-relay.json");
+    const orphan = `${target}.tmp.999.0`;
+    writeFileSync(orphan, "orphan-planted", { mode: 0o644 });
+    const fresh = `${target}.tmp.999.1`;
+    const names = [orphan, fresh];
+
+    const created = createTempFileExclusively(target, "secret", { nameFor: () => names.shift()! });
+
+    assert.equal(created, fresh, "the first candidate was refused and a fresh name used");
+    assert.equal(readFileSync(orphan, "utf8"), "orphan-planted", "the occupied path is left exactly as it was");
+    assert.equal(statSync(orphan).mode & 0o777, 0o644, "including its original mode");
+    assert.equal(readFileSync(fresh, "utf8"), "secret", "the secret went to the new file");
+    assert.equal(statSync(fresh).mode & 0o777, 0o600, "and that file was created owner-only");
+  });
+});
+
+test("createTempFileExclusively never follows a planted symlink", () => {
+  // Writing through a symlink would put the secret into whatever it points at
+  // (only reachable when the config lives in a directory an attacker can write,
+  // but O_EXCL refuses it outright, so it costs nothing to be sure).
+  withScratchDir((dir) => {
+    const target = join(dir, "chaos-relay.json");
+    const victim = join(dir, "victim.txt");
+    writeFileSync(victim, "VICTIM-CONTENT", { mode: 0o644 });
+    const link = `${target}.tmp.999.0`;
+    symlinkSync(victim, link);
+    const fresh = `${target}.tmp.999.1`;
+    const names = [link, fresh];
+
+    const created = createTempFileExclusively(target, "secret", { nameFor: () => names.shift()! });
+
+    assert.equal(created, fresh, "the symlink name was refused, a fresh name was used");
+    assert.equal(readFileSync(victim, "utf8"), "VICTIM-CONTENT", "the victim file is untouched");
+    assert.ok(lstatSync(link).isSymbolicLink(), "the planted link is still there and still a link");
+    assert.equal(readFileSync(fresh, "utf8"), "secret");
+  });
+});
+
+test("createTempFileExclusively gives up after its bounded attempts and fails the write", () => {
+  // A loop that can never win must not spin, and must not fall back to
+  // overwriting the occupied path.
+  withScratchDir((dir) => {
+    const target = join(dir, "chaos-relay.json");
+    const blocked = `${target}.tmp.999.0`;
+    writeFileSync(blocked, "planted", { mode: 0o644 });
+    let attempts = 0;
+
+    assert.throws(
+      () =>
+        createTempFileExclusively(target, "secret", {
+          attempts: 3,
+          nameFor: () => {
+            attempts++;
+            return blocked;
+          },
+        }),
+      /could not create a temp file .* after 3 attempts: EEXIST/,
+      "the failure names the bound and the cause",
+    );
+    assert.equal(attempts, 3, "exactly the bounded number of attempts");
+    assert.equal(readFileSync(blocked, "utf8"), "planted", "the occupied path was never written");
+    assert.equal(statSync(blocked).mode & 0o777, 0o644, "nor had its mode changed");
+  });
+});
+
+test("createTempFileExclusively creates a fresh file 0600 under umask 000", () => {
+  // umask 000 is the load-bearing part (review P3): with umask 0o077 this test
+  // passed even with `mode: 0o600` deleted, because Node's default create mode
+  // 0o666 & ~0o077 is already 0o600. Under 0o000 a dropped mode yields 0o666 and
+  // fails here. That a chmod is no longer called cannot be seen from a file mode
+  // at all — that part is shown by syscall trace (/tmp/a68-strace.txt: three
+  // O_CREAT|O_EXCL opens at 0600 and zero chmod/fchmod calls).
+  withScratchDir((dir) => {
+    const previousUmask = process.umask(0o000);
+    try {
+      const created = createTempFileExclusively(join(dir, "chaos-relay.json"), "secret");
+      assert.equal(statSync(created).mode & 0o777, 0o600);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
 });
 
 test("savePersisted writes atomically and leaves no temp files behind on normal completion", () => {
