@@ -827,12 +827,15 @@ test("createTempFileExclusively gives up after its bounded attempts and fails th
   });
 });
 
-test("createTempFileExclusively creates a fresh file 0600 without a chmod", () => {
-  // The point of the exclusive create: the mode is applied by open(2) on the one
-  // creation this call is guaranteed to be, so there is nothing to correct
-  // afterwards (pm0's strace showed `openat(..., 0600)` for the temp file).
+test("createTempFileExclusively creates a fresh file 0600 under umask 000", () => {
+  // umask 000 is the load-bearing part (review P3): with umask 0o077 this test
+  // passed even with `mode: 0o600` deleted, because Node's default create mode
+  // 0o666 & ~0o077 is already 0o600. Under 0o000 a dropped mode yields 0o666 and
+  // fails here. That a chmod is no longer called cannot be seen from a file mode
+  // at all — that part is shown by syscall trace (/tmp/a68-strace.txt: three
+  // O_CREAT|O_EXCL opens at 0600 and zero chmod/fchmod calls).
   withScratchDir((dir) => {
-    const previousUmask = process.umask(0o077);
+    const previousUmask = process.umask(0o000);
     try {
       const created = createTempFileExclusively(join(dir, "chaos-relay.json"), "secret");
       assert.equal(statSync(created).mode & 0o777, 0o600);
