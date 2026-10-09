@@ -24,17 +24,59 @@ export function safeUrlOrigin(url: unknown): string {
   return parsed.origin === "null" ? "<invalid>" : parsed.origin;
 }
 
-/** Reduce an absolute URL string to scheme://host[:port], dropping userinfo,
- * path, query and fragment. Returns the input unchanged when it cannot be
- * parsed, so surrounding prose survives untouched. */
+/** Rendered when a URL-shaped match cannot be reduced to a host at all. */
+const INVALID_ORIGIN = "<invalid>";
+
+/**
+ * Reduce an absolute URL string to scheme://host[:port], dropping userinfo,
+ * path, query and fragment.
+ *
+ * `new URL()` rejects a URL whose port is out of range (e.g.
+ * `https://user:pass@host:99999/`) or whose authority is malformed (an
+ * unclosed IPv6 literal, empty host). Those inputs MUST still be reduced:
+ * echoing the input — the pre-fix behaviour — returns the very userinfo and
+ * query secrets this function exists to hide, and they reach logs, the TUI and
+ * approval prompts. So the fallback reduces by hand: it cuts the authority at
+ * the first path/query/fragment separator, keeps only what follows the last
+ * `@` (userinfo), drops a non-numeric "port", and returns `<invalid>` rather
+ * than ever echoing a value it cannot reduce.
+ */
 function originOnly(raw: string): string {
   try {
     const u = new URL(raw);
     const port = u.port ? `:${u.port}` : "";
     return `${u.protocol}//${u.hostname}${port}`;
   } catch {
-    return raw;
+    return fallbackOrigin(raw);
   }
+}
+
+/** WHATWG treats `\` as a path separator for special schemes; the authority
+ * ends at the first of these. */
+const AUTHORITY_END_RE = /[/?#\\]/;
+/** A plain host or bracketed IPv6 literal, plus an optional numeric port. */
+const SAFE_HOST_RE = /^(?:\[[0-9A-Za-z:.%]+\]|[A-Za-z0-9._~%\-]+)(?::\d+)?$/;
+
+/** Fail-closed reduction for a URL `new URL()` refused. Never echoes `raw`. */
+function fallbackOrigin(raw: string): string {
+  const schemeEnd = raw.indexOf("://");
+  if (schemeEnd <= 0) return INVALID_ORIGIN;
+  const scheme = raw.slice(0, schemeEnd + 3);
+  const rest = raw.slice(schemeEnd + 3);
+  const end = rest.search(AUTHORITY_END_RE);
+  const authority = end === -1 ? rest : rest.slice(0, end);
+  // Only the part after the LAST `@` is host/port; everything before it is
+  // userinfo (and may be the credential).
+  const at = authority.lastIndexOf("@");
+  let host = at === -1 ? authority : authority.slice(at + 1);
+  // A non-numeric tail after `:` is not a port — it could be a mistyped secret
+  // sitting in the port position, so drop it rather than echo it. Skipped for
+  // IPv6 literals, whose colons are part of the address.
+  if (!host.startsWith("[")) {
+    const colon = host.lastIndexOf(":");
+    if (colon !== -1 && !/^\d+$/.test(host.slice(colon + 1))) host = host.slice(0, colon);
+  }
+  return host !== "" && SAFE_HOST_RE.test(host) ? `${scheme}${host}` : INVALID_ORIGIN;
 }
 
 // http(s) relay URLs and the ws(s) socket URL derived from them.
@@ -45,7 +87,9 @@ const TRAILING_PUNCTUATION = ".,;:!?)]}";
 /**
  * Strip secrets from any embedded http(s)/ws(s) URL in a message: userinfo,
  * query string and fragment are removed, leaving only scheme://host[:port].
- * Ordinary prose (including trailing punctuation) is preserved.
+ * Ordinary prose (including trailing punctuation) is preserved. A URL that
+ * cannot be parsed is reduced by hand rather than echoed, and becomes
+ * `<invalid>` when not even a host survives (see `originOnly`).
  */
 export function redactUrlSecretsFromMessage(message: string): string {
   return message.replace(EMBEDDED_URL_RE, (match) => {

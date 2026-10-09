@@ -93,6 +93,72 @@ test("redactUrlSecretsFromMessage leaves a bare host without scheme alone", () =
   assert.equal(redactUrlSecretsFromMessage(bare), bare);
 });
 
+// ── unparsable URLs: reduction must still happen (fail closed) ────────────────
+//
+// `new URL()` throws on an out-of-range port or a malformed authority. The old
+// behaviour echoed the match verbatim, which handed the userinfo/query secrets
+// straight to logs, the TUI and approval prompts.
+
+test("an out-of-range port does not leak the userinfo or query of the URL", () => {
+  const secret = "leakme-port-secret";
+  const out = redactUrlSecretsFromMessage(
+    `retrying https://user:${secret}@relay.example.com:99999/messages?token=${secret}#frag now`,
+  );
+  assert.ok(!out.includes(secret), `must not leak the credential: ${out}`);
+  assert.ok(!out.includes("token="), `must not leak the query string: ${out}`);
+  assert.ok(!out.includes("/messages"), `must not leak the path: ${out}`);
+  assert.ok(!out.includes("@"), `must not leak userinfo: ${out}`);
+  assert.ok(out.includes("https://relay.example.com:99999"), `keeps the host and bad port: ${out}`);
+  assert.ok(out.includes("now"), `keeps the surrounding prose: ${out}`);
+});
+
+test("a malformed IPv6 authority fails closed instead of echoing the URL", () => {
+  const secret = "leakme-ipv6-secret";
+  const out = redactUrlSecretsFromMessage(
+    `WebSocket construct failed: The URL 'wss://user:${secret}@[::1/ws?token=${secret}' is invalid`,
+  );
+  assert.ok(!out.includes(secret), `must not leak the credential: ${out}`);
+  assert.ok(out.includes("<invalid>"), `expected a fail-closed origin: ${out}`);
+});
+
+test("a secret sitting in the port position is dropped, not echoed", () => {
+  const out = redactUrlSecretsFromMessage(
+    "POST https://user:pw@relay.example.com:leakme-port/send failed",
+  );
+  assert.ok(!out.includes("leakme-port"), `must not echo a bogus port: ${out}`);
+  assert.ok(!out.includes("user:"), `must not leak userinfo: ${out}`);
+  assert.ok(out.includes("https://relay.example.com"), `keeps the host: ${out}`);
+});
+
+test("a URL with userinfo but no host fails closed", () => {
+  const secret = "leakme-nohost-secret";
+  const out = redactUrlSecretsFromMessage(
+    `auth recovery failed: https://user:${secret}@/refresh?token=${secret}`,
+  );
+  assert.ok(!out.includes(secret), `must not leak the credential: ${out}`);
+  assert.equal(out, "auth recovery failed: <invalid>");
+});
+
+test("userinfo is dropped at the last '@' and a backslash ends the authority", () => {
+  const out = redactUrlSecretsFromMessage(
+    "see https://a@b:leakme@relay.example.com:99999\\hook?token=leakme-q for details",
+  );
+  assert.ok(!out.includes("leakme"), `must not leak the credential: ${out}`);
+  assert.ok(out.includes("https://relay.example.com:99999"), `keeps the real host: ${out}`);
+  assert.ok(out.includes("for details"), `keeps the surrounding prose: ${out}`);
+});
+
+test("redactCommandSecrets reduces an unparsable URL in an approval prompt", () => {
+  const secret = "leakme-cmd-password-1234567890";
+  const out = redactCommandSecrets(
+    `curl "https://user:${secret}@relay.example.com:99999/hook?token=${secret}"`,
+  );
+  assert.ok(out.includes("curl"), `keeps the command: ${out}`);
+  assert.ok(!out.includes(secret), `must not leak the credential: ${out}`);
+  assert.ok(!out.includes("token="), `must not leak the query string: ${out}`);
+  assert.ok(out.includes("https://relay.example.com:99999"), `keeps the origin: ${out}`);
+});
+
 test("safeUrlOrigin marks ws:// and ftp:// invalid", () => {
   assert.equal(safeUrlOrigin("ws://example.com/socket?token=s"), "<invalid>");
   assert.equal(safeUrlOrigin("ftp://example.com/file"), "<invalid>");
