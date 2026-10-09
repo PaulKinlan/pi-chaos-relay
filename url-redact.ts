@@ -39,7 +39,9 @@ const INVALID_ORIGIN = "<invalid>";
  * approval prompts. So the fallback reduces by hand: it cuts the authority at
  * the first path/query/fragment separator, keeps only what follows the last
  * `@` (userinfo), drops a non-numeric "port", and returns `<invalid>` rather
- * than ever echoing a value it cannot reduce.
+ * than ever echoing a value it cannot reduce. A percent-encoded authority
+ * (`alice%3Apw%40host`, which hides its userinfo from the last-`@` rule) also
+ * fails closed — a host never legitimately contains a literal `%XX`.
  */
 function originOnly(raw: string): string {
   try {
@@ -54,8 +56,10 @@ function originOnly(raw: string): string {
 /** WHATWG treats `\` as a path separator for special schemes; the authority
  * ends at the first of these. */
 const AUTHORITY_END_RE = /[/?#\\]/;
-/** A plain host or bracketed IPv6 literal, plus an optional numeric port. */
-const SAFE_HOST_RE = /^(?:\[[0-9A-Za-z:.%]+\]|[A-Za-z0-9._~%\-]+)(?::\d+)?$/;
+/** A plain host or bracketed IPv6 literal, plus an optional numeric port. `%`
+ * is deliberately absent: the host parser percent-decodes, so any `%XX` here
+ * is an encoded delimiter (or an encoded secret), not part of a host. */
+const SAFE_HOST_RE = /^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._~\-]+)(?::\d+)?$/;
 
 /** Fail-closed reduction for a URL `new URL()` refused. Never echoes `raw`. */
 function fallbackOrigin(raw: string): string {
@@ -69,6 +73,11 @@ function fallbackOrigin(raw: string): string {
   // userinfo (and may be the credential).
   const at = authority.lastIndexOf("@");
   let host = at === -1 ? authority : authority.slice(at + 1);
+  // A `%XX` in the authority is invisible to the last-`@` rule (that is how
+  // `alice%3Apw%40host` hides its userinfo from it) and a host never carries a
+  // literal `%` — the parser decodes it and rejects it as a forbidden domain
+  // code point. So any `%` fails closed rather than riding out as a "host".
+  if (host.includes("%")) return INVALID_ORIGIN;
   // A non-numeric tail after `:` is not a port — it could be a mistyped secret
   // sitting in the port position, so drop it rather than echo it. Skipped for
   // IPv6 literals, whose colons are part of the address.

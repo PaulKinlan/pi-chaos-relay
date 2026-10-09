@@ -148,6 +148,22 @@ test("userinfo is dropped at the last '@' and a backslash ends the authority", (
   assert.ok(out.includes("for details"), `keeps the surrounding prose: ${out}`);
 });
 
+test("a percent-encoded authority fails closed instead of echoing encoded userinfo", () => {
+  // `alice%3Apw%40host` is `alice:pw@host` with its delimiters encoded, so the
+  // last-`@` rule cannot see the userinfo. The host parser rejects `%` in a
+  // domain, so the fallback must refuse it too.
+  for (const raw of [
+    "https://alice%3Apw%40relay.example.com:99999/p?q=1",
+    "https://alice%3Apw%40relay.example.com/p?q=1",
+  ]) {
+    const out = redactUrlSecretsFromMessage(`failed ${raw} end`);
+    assert.ok(!out.includes("%3A"), `must not echo encoded userinfo: ${out}`);
+    assert.ok(!out.includes("%40"), `must not echo an encoded delimiter: ${out}`);
+    assert.ok(!out.includes("alice"), `must not echo the credential: ${out}`);
+    assert.equal(out, "failed <invalid> end", `expected a fail-closed reduction: ${out}`);
+  }
+});
+
 test("redactCommandSecrets reduces an unparsable URL in an approval prompt", () => {
   const secret = "leakme-cmd-password-1234567890";
   const out = redactCommandSecrets(
