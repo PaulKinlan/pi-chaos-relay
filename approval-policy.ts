@@ -41,11 +41,18 @@ export interface SessionApprovalState {
  * Decide whether a tool call on a channel-driven turn needs approval.
  *
  * - `off`: nothing is gated (explicit opt-out).
- * - `writes`: non-relay write-class tools (`bash`/`edit`/`write`) are gated;
- *   among the relay tools, `relay_reply` is gated when it carries outbound
- *   file attachments (it ships local bytes out — write-class) OR when the
- *   session has already inspected local content (a text-only reply can then
- *   carry those contents out). The rest of the namespace stays ungated.
+ * - `writes`: non-relay write-class tools (`bash`/`edit`/`write`) are gated.
+ *   In the relay namespace the read-only plumbing (`relay_check_messages`,
+ *   `relay_list_profiles`) stays open, `relay_reply` follows its own rule —
+ *   gated when it carries outbound file attachments (it ships local bytes out)
+ *   or when the session has already inspected local content — and every
+ *   control-plane tool (`relay_connect`, `relay_register_*`,
+ *   `relay_switch_profile`, plus any future `relay_*` name) is gated too. The
+ *   control plane is what decides where this session talks and who may drive
+ *   it: a channel-borne injection that registers the attacker's own channel,
+ *   or switches to a profile whose gate is off, takes the session over AND
+ *   self-approves the gate itself, because the next approval question is then
+ *   delivered to the attacker's channel. Gating it keeps a human in that loop.
  * - `all`: everything is gated EXCEPT the read-only relay plumbing
  *   (`relay_check_messages`, `relay_list_profiles`). Any `relay_*` name not in
  *   that allowlist — including a FUTURE tool — is gated (default-deny for the
@@ -67,12 +74,17 @@ export function approvalDecision(
   if (mode === "all") {
     return !RELAY_READ_ONLY_TOOLS.has(toolName);
   }
-  // "writes": relay_reply is gated for outbound files, and for text-only
-  // replies once the session has inspected local content.
+  // "writes": the relay namespace is default-deny too, exactly like "all" —
+  // only the read-only plumbing is open. `relay_reply` keeps its own rule
+  // first, so the ordinary conversation stays ungated until it carries a file
+  // or the session has read local content; every other relay_* name is
+  // write-class control plane (see the doc comment above for the takeover and
+  // self-approval chain this closes).
+  if (RELAY_READ_ONLY_TOOLS.has(toolName)) return false;
   if (toolName === "relay_reply") {
     const files = input?.files;
     if (Array.isArray(files) && files.length > 0) return true;
     return session?.hasReadLocalFile === true;
   }
-  return false;
+  return true;
 }

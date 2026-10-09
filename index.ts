@@ -657,9 +657,11 @@ export function summarizeToolCall(toolName: string, input: Record<string, unknow
     }
     return `edit: ${target} (${edits.length} edit(s), ${bytes} bytes)`;
   }
+  if (CONTROL_PLANE_RELAY_TOOLS.has(toolName)) {
+    return `${toolName}: ${summarizeControlPlaneInput(input)}`;
+  }
   // Any other gated tool: never echo raw values, only shapes.
-  const entries = Object.entries(input ?? {});
-  const parts = entries.map(([key, value]) => {
+  const entries = Object.entries(input ?? {});  const parts = entries.map(([key, value]) => {
     if ((key === "path" || key === "file_path") && typeof value === "string") {
       return `${key}=${summarizePath(value)}`;
     }
@@ -669,6 +671,154 @@ export function summarizeToolCall(toolName: string, input: Record<string, unknow
     return `${key}:object`;
   });
   return `${toolName}${parts.length ? ": " + parts.join(", ") : ""}`;
+}
+
+/**
+ * Control-plane relay tools (gated in "writes" mode, always gated in "all").
+ * The approval question must name the TARGET or the human cannot judge it: an
+ * injected `relay_switch_profile` summarised as `name:9 chars` is unanswerable.
+ */
+const CONTROL_PLANE_RELAY_TOOLS = new Set([
+  "relay_connect",
+  "relay_register_telegram",
+  "relay_register_discord",
+  "relay_register_email",
+  "relay_register_webhook",
+  "relay_switch_profile",
+]);
+
+/** Literal labels for the credential-bearing inputs the relay tools take. Only
+ *  these literals are ever printed: an unknown KEY is agent-controlled text too
+ *  (a tool schema can be probed with extra properties), so an unrecognised key
+ *  is counted, never named. Values of these fields are shown as a length. */
+const CREDENTIAL_FIELD_LABELS = new Set([
+  "botToken",
+  "token",
+  "password",
+  "secret",
+  "apiKey",
+  "webhookUrl",
+  "signingKey",
+]);
+
+/** Channel kinds the relay knows; anything else is shown as a shape, because a
+ *  free-text "type" is caller-controlled text like any other. */
+const KNOWN_CHANNEL_TYPES = new Set(["telegram", "discord", "email", "webhook"]);
+
+/**
+ * A caller-chosen target (profile name, channel name, webhook name) rendered as
+ * a SHAPE: an 8-hex fingerprint of the value plus its length.
+ *
+ * The value is NOT echoed, and redaction is not enough to make echoing it safe:
+ * `relay_switch_profile {name: "correct horse battery staple"}` — or a 20-char
+ * mixed-case secret — survives every shape-based rule, so a channel-borne "read
+ * the credentials file, then switch to a profile named <its contents>" would
+ * put those contents in the question sent to that same channel before anyone
+ * approved. The fingerprint still lets an operator compare two questions about
+ * the same target; the exact value is visible locally (the profile list, the
+ * bash/TUI), never over the relay.
+ */
+function summarizeTargetShape(value: string): string {
+  return `fp:${shortId(value)}, ${value.length} chars`;
+}
+
+/**
+ * A bounded one-line rendering for the few caller-supplied values that ARE the
+ * decision (an email address: it is the routing target a verification link goes
+ * to, so hiding it hides the register-your-own-mailbox takeover this gate is for)
+ * or that the tool's own parser produced (a channel KIND). Whitespace and
+ * control characters collapse so a crafted value cannot fake question layout,
+ * secret-shaped values are redacted, and the result is capped.
+ */
+function summarizeShownValue(value: string, max = 60): string {
+  const oneLine = value.replace(/[\s\p{C}]+/gu, " ").trim();
+  const redacted = redactCommandSecrets(oneLine);
+  return redacted.length <= max ? redacted : `${redacted.slice(0, max)}… (${redacted.length} chars total)`;
+}
+
+/** The numeric bot id in a Telegram token (`123456:AA…`) is public and tells the
+ *  operator WHICH bot it is; the secret half never is. */
+function summarizeTelegramToken(value: string): string {
+  const m = value.trim().match(/^(\d{6,12}):/);
+  return m ? `${m[1]}:<redacted>` : "<redacted>";
+}
+
+/**
+ * One line naming what a control-plane call would do, for the approval question.
+ * The operator has to be able to judge it (an injected `relay_switch_profile`
+ * summarised as `name:9 chars` is unanswerable), but the inputs are
+ * caller-controlled, so the rule is: show STRUCTURE (the parsed channel kind, an
+ * address that is the routing target, a credential's length) and show a SHAPE —
+ * never the text — for free-form names. This function therefore never returns a
+ * caller-supplied name verbatim.
+ */
+function summarizeControlPlaneInput(input: Record<string, unknown>): string {
+  const parts: string[] = [];
+  let unrecognised = 0;
+  for (const [key, value] of Object.entries(input ?? {})) {
+    if (typeof value === "string") {
+      if (key === "channelId") {
+        parts.push(`${key}=${shortId(value)}`);
+        continue;
+      }
+      if (key === "channelType") {
+        const kind = value.trim().toLowerCase();
+        parts.push(`${key}=${KNOWN_CHANNEL_TYPES.has(kind) ? kind : summarizeTargetShape(value)}`);
+        continue;
+      }
+      if (key === "name" || key === "channelName") {
+        parts.push(`${key}=${summarizeTargetShape(value)}`);
+        continue;
+      }
+      if (key === "userEmail") {
+        parts.push(`userEmail=${summarizeShownValue(value)}`);
+        continue;
+      }
+      if (key === "input") {
+        parts.push(`input=${summarizeConnectInput(value)}`);
+        continue;
+      }
+      if (CREDENTIAL_FIELD_LABELS.has(key)) {
+        parts.push(`${key}:${value.length} chars`);
+        continue;
+      }
+      unrecognised++;
+      continue;
+    }
+    // Never drop a field silently, and never print a key we do not own: an
+    // object/array target still shows as a shape, an unknown key as a count.
+    if (Array.isArray(value)) {
+      unrecognised++;
+      continue;
+    }
+    if (value === null || value === undefined) continue;
+    unrecognised++;
+  }
+  if (unrecognised > 0) parts.push(`+${unrecognised} more field(s)`);
+  return parts.length ? parts.join(", ") : "no inputs";
+}
+
+/**
+ * `relay_connect`'s one-shot input, summarised with the SAME parser execution
+ * uses (`connect.ts`) so the question cannot describe a different target than
+ * the one that would run — including the `webhook:name` colon form. A parsed
+ * KIND is structure; a webhook NAME is caller text and becomes a shape; a
+ * token/address is handled per kind.
+ */
+function summarizeConnectInput(value: string): string {
+  const plan = parseConnectInput(value);
+  switch (plan.kind) {
+    case "webhook":
+      return plan.name ? `webhook name=${summarizeTargetShape(plan.name)}` : "webhook";
+    case "telegram":
+      return `telegram ${summarizeTelegramToken(plan.token)}`;
+    case "discord":
+      return "discord <redacted>";
+    case "email":
+      return `email ${summarizeShownValue(plan.email)}`;
+    default:
+      return `<redacted, ${value.length} chars>`;
+  }
 }
 
 /** Render a file path for DISPLAY: relative to the working directory when
@@ -1357,9 +1507,17 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       toolName,
     });
     const other = approvals.size - 1;
+    // A control-plane call is judged by "did I ask for this?": its target is
+    // shown as a fingerprint (never as caller-supplied text — see
+    // summarizeTargetShape), so the question says plainly what is at stake.
+    const controlPlaneHint = CONTROL_PLANE_RELAY_TOOLS.has(toolName)
+      ? `\n\nThis changes where this session connects or who can drive it. ` +
+        `The target is shown as a fingerprint; deny it if you did not ask for it.`
+      : "";
     const question = `⚠️ Approval needed — the agent wants to run:\n` +
       `${summarizeToolCall(toolName, input)}\n\n` +
       `Reply "yes ${nonce}" to allow or "no ${nonce}" to deny (auto-denies in 5 min).` +
+      controlPlaneHint +
       (other > 0
         ? `\n\n(${approvals.size} approval requests are waiting — each shows its own code; answer the one you mean.)`
         : "");
