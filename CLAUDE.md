@@ -31,6 +31,17 @@ npm test             # node --test
 
 Both must pass. Add/adjust tests for behavior changes.
 
+**While iterating**, `npm run test:fast` runs `npx tsc --noEmit` and the version
+gate as always, then only the test files affected by your change
+(`scripts/fast-gate.ts` holds the explicit map, re-derived from the real import
+graph by `test/fast-gate.test.ts`). It is a UNIT tier: the integration suite
+`test/index.test.ts` runs only in the full tier. The entry point, the
+manifests/lockfile, `tsconfig.json`, anything under `test/`, any unmapped path, an
+unreadable change list and an unresolvable default branch all fall back to the
+FULL suite, and `--base <ref>` must resolve. It never replaces the merger's full
+gate: a change is green only after `npx tsc --noEmit && npm test` passes on the
+merged union. See AGENTS.md for the map's rules.
+
 ## Keep docs in sync (same commit)
 
 Any change to a command (`/chaos-relay …`), tool (`relay_*`), env var
