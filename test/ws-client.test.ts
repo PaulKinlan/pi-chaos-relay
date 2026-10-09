@@ -1001,32 +1001,102 @@ test("a ping is not sent on a socket that is not open", (t) => {
   t.mock.timers.reset();
 });
 
-// --- KNOWN DEFECTS (reported, deliberately not asserted as correct) --------
-//
-// start() idempotency is the one remaining reported defect: it drives its
-// reproduction and skips itself, reporting what it observed. It needs its own
-// bead before anything is asserted about it.
+// --- start() idempotency ---------------------------------------------------
 
-test("KNOWN DEFECT: start() is not idempotent", (t) => {
-  // Repro: `node --test test/ws-client.test.ts`
-  //   1. start() on a socket that is already OPEN
-  //   2. count the sockets the transport constructed
-  // Observed: 2 — start() (ws-client.ts:108-111) calls connect()
-  //   unconditionally, so the second call opens a second socket and orphans the
-  //   first. The orphan keeps its handlers, so it still delivers message frames
-  //   and still schedules reconnects.
-  // Expected: the documented contract — "Open the socket (idempotent)" — i.e.
-  //   one socket per transport, and no second one.
-  // Severity: latent here. index.ts:635 constructs a fresh RelayWebSocket per
-  //   startPolling() call, so nothing in this repo calls start() twice on one
-  //   instance today; any caller that trusts the docstring would leak a socket.
-  const h = harness();
+test("start() is idempotent: one socket per transport, restart after stop()", async () => {
+  const h = harness({ maxBackoffMs: 0 });
   h.ws.start();
+  const first = h.last();
+
+  // While CONNECTING, a repeat call must not race the handshake with a second
+  // socket (the reported defect: two sockets, the first orphaned with its
+  // handlers still live).
+  h.ws.start();
+  assert.equal(h.sockets.length, 1, "no second socket while CONNECTING");
+
+  first.open();
+  assert.equal(h.ws.connected, true);
+  h.ws.start();
+  assert.equal(h.sockets.length, 1, "no second socket while OPEN");
+  assert.equal(first.closeCalls, 0, "the live socket was left untouched");
+  assert.equal(h.ws.connected, true);
+
+  // CLOSED with a reconnect already armed: the armed attempt is the one that
+  // runs; start() must not orphan it with a second socket.
+  first.drop(1006);
+  h.ws.start();
+  assert.equal(h.sockets.length, 1, "no second socket while a reconnect is armed");
+  await flush();
+  assert.equal(h.sockets.length, 2, "the armed reconnect still ran");
   h.last().open();
-  h.ws.start();
-  t.diagnostic(`sockets constructed by two start() calls: ${h.sockets.length}`);
+
+  // stop() clears both the socket and the reconnect, so an explicit restart
+  // still reconnects — idempotence must not become a one-shot latch.
   h.ws.stop();
-  t.skip("known defect (documented idempotency does not hold) — awaiting its own bead");
+  h.ws.start();
+  assert.equal(h.sockets.length, 3, "start() after stop() reconnects");
+  h.ws.stop();
+});
+
+test("start() during a pending auth recovery does not orphan the socket it opens", async () => {
+  let releaseAuth: () => void = () => {};
+  const auth = new Promise<string | null>((resolve) => {
+    releaseAuth = () => resolve("refreshed-key");
+  });
+  const h = harness({ maxBackoffMs: 0, onAuthFailure: () => auth });
+
+  h.ws.start();
+  h.last().drop(1006); // handshake never opened → failedHandshakes = 1
+  await flush(); // the armed reconnect runs
+  assert.equal(h.sockets.length, 2);
+  h.last().drop(1006); // failedHandshakes = 2 → auth recovery (still pending)
+  await flush();
+  assert.equal(h.sockets.length, 2, "no reconnect armed while auth recovery is pending");
+
+  // A caller that trusts start()'s idempotence asks for a socket meanwhile.
+  h.ws.start();
+  assert.equal(h.sockets.length, 3);
+
+  // Auth resolves and schedules ITS reconnect; the live socket must survive it.
+  releaseAuth();
+  await flush();
+  assert.equal(h.sockets.length, 3, "the late auth reconnect must not add a socket");
+  assert.equal(h.ws.connected, false, "the start()ed socket is still the current one");
+  h.last().open();
+  assert.equal(h.ws.connected, true);
+  h.ws.stop();
+});
+
+test("a superseded socket cannot deliver frames, reject replies, or reconnect", async () => {
+  const h = harness({ maxBackoffMs: 0 });
+  h.ws.start();
+  const stale = h.last();
+  stale.open();
+
+  h.ws.stop();
+  h.ws.start();
+  const current = h.last();
+  assert.equal(h.sockets.length, 2);
+  current.open();
+
+  const pending = outcome(h.ws.reply({ ...replyPayload, content: "live" }, 5_000));
+  // A superseded socket's handlers are still installed on a real socket whose
+  // close event lands late; its events must be ignored rather than becoming a
+  // duplicate delivery path, a rejected live reply, and a second reconnect chain.
+  stale.onmessage?.({ data: JSON.stringify({ type: "message", message: msg("stale") }) });
+  stale.onclose?.({ code: 1006 });
+  await flush();
+
+  assert.deepEqual(h.delivered, [], "a superseded socket must not deliver frames");
+  assert.equal(await pendingish(pending), "still pending", "a stale close must not reject the live reply");
+  assert.equal(h.sockets.length, 2, "a superseded close must not schedule a reconnect");
+
+  // The live socket still works end to end.
+  current.deliver(JSON.stringify({ type: "reply_ack", ok: true, responseId: "ack-live" }));
+  assert.equal(await pending, 'resolved {"ok":true,"responseId":"ack-live"}');
+  current.deliver(JSON.stringify({ type: "message", message: msg("m-live") }));
+  assert.deepEqual(h.delivered, [[msg("m-live")]]);
+  h.ws.stop();
 });
 
 test("pending replies are rejected on reconnect and cannot steal the next ack", async () => {

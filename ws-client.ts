@@ -122,9 +122,22 @@ export class RelayWebSocket {
     return this.socket?.readyState === 1 /* OPEN */;
   }
 
-  /** Open the socket (idempotent). */
+  /**
+   * Open the socket. Idempotent: while a connection attempt is live
+   * (CONNECTING / OPEN / CLOSING) or a reconnect is already armed, a repeated
+   * call is a no-op, so one transport can never hold two sockets. `stop()`
+   * clears both, so start()-stop()-start() still reconnects.
+   */
   start(): void {
     this.closedByUs = false;
+    // A reconnect is already pending; let it run instead of racing it with a
+    // second socket that would orphan the first one's handlers.
+    if (this.reconnectTimer !== undefined) return;
+    // A live socket is being established, is open, or is closing. If it is
+    // going away, its own onclose schedules the next attempt.
+    if (this.socket !== undefined && this.socket.readyState !== 3 /* CLOSED */) {
+      return;
+    }
     this.connect();
   }
 
@@ -186,6 +199,10 @@ export class RelayWebSocket {
     this.socket = socket;
 
     socket.onopen = () => {
+      // Ignore a superseded socket (stop()-then-start(), or a late event from a
+      // socket a reconnect already replaced): its open must not arm a ping on a
+      // dead socket nor reset the live socket's backoff state.
+      if (this.socket !== socket) return;
       this.openedSinceAttempt = true;
       this.failedHandshakes = 0;
       this.triedAuthRecovery = false;
@@ -206,15 +223,23 @@ export class RelayWebSocket {
     };
 
     socket.onmessage = (event: MessageEvent) => {
+      // Frames off a superseded socket are dropped: delivery must come from the
+      // one current socket, or a superseded one becomes a duplicate path in.
+      if (this.socket !== socket) return;
       this.handleFrame(typeof event.data === "string" ? event.data : "");
     };
 
     socket.onerror = () => {
       // Errors are followed by onclose; reconnection is handled there.
+      if (this.socket !== socket) return;
       this.log("WebSocket error");
     };
 
     socket.onclose = (event: CloseEvent) => {
+      // A stale close (the socket was already replaced or stopped) must not
+      // reject the CURRENT socket's pending replies, clear its timers, or
+      // schedule a reconnect that would orphan it.
+      if (this.socket !== socket) return;
       this.clearPing();
       this.clearStabilityTimer();
       // Replies sent on this socket can no longer be acked by it; reject them
@@ -405,7 +430,17 @@ export class RelayWebSocket {
     const max = this.opts.maxBackoffMs ?? 30_000;
     const delay = Math.min(max, 1000 * 2 ** Math.min(this.attempts, 5));
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = setTimeout(() => this.connect(), delay);
+    this.reconnectTimer = setTimeout(() => {
+      // The handle has fired: clear it first so start() no longer sees a
+      // pending reconnect and a later start() is judged against the socket.
+      this.reconnectTimer = undefined;
+      // A start() (or an earlier attempt) may have opened a socket while this
+      // timer was pending; connecting now would orphan it.
+      if (this.socket !== undefined && this.socket.readyState !== 3 /* CLOSED */) {
+        return;
+      }
+      this.connect();
+    }, delay);
     if (typeof (this.reconnectTimer as { unref?: () => void }).unref === "function") {
       (this.reconnectTimer as { unref: () => void }).unref();
     }
