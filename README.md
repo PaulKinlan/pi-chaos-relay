@@ -408,14 +408,16 @@ its channel type, a short channel fingerprint, and a character/byte count (plus 
 name and size of each attachment); a `bash`
 approval shows a **REDACTED command string** (secret-shaped values are masked) so the
 operator can judge benign vs destructive; `write`/`edit` show the **target path and
-size**; a control-plane call names the target it would use (the profile name that will
-actually be used, channel name/id/type, a `relay_connect` keyword or the email address a
-verification link would go to) while its credential fields (`botToken`, `password`,
-`secret`, and `relay_connect`'s token) show only a length; and other tools show field
-sizes or path fingerprints — never their contents. Every echoed target is squashed onto
-one line and passed through the same secret-shaped-value redaction as a `bash` command,
-so a channel-borne `relay_switch_profile {name: …}` cannot copy local file contents into
-the question.
+size**; a control-plane call shows the parsed channel kind, a short fingerprint for
+`channelId` and for any name the caller chose (never the name itself), an email address
+because that is the routing target a verification link would go to, and only a length
+for credential fields (`botToken`, `password`, `secret`, `relay_connect`'s token) — the
+question adds a line saying the call changes where the session connects or who may drive
+it, so deny it if you did not ask for it. Caller-supplied names are deliberately drawn
+as a fingerprint rather than echoed, because the agent chooses them: a channel-borne
+`relay_switch_profile {name: …}` must not be able to copy local file contents into a
+question that goes back out over the relay. Other tools show field sizes or path
+fingerprints — never their contents.
 Terminal/local turns are never gated.
 
 ## Telegram setup — end to end
