@@ -38,6 +38,34 @@ npm test             # node --test over test/*.test.ts
 
 Both must be green. Add or update tests for behavior changes.
 
+### Focused iteration: the fast gate (implementers)
+
+While iterating, `npm run test:fast` runs the same two whole-tree checks plus only
+the tests affected by your branch, so an isolated module change does not pay for
+the 3,000-line `test/index.test.ts` integration suite on every commit:
+
+```sh
+npm run test:fast                  # npx tsc --noEmit + version gate + affected tests
+npm run test:fast -- --dry-run     # print the plan (mode, tests, commands), run nothing
+npm run test:fast -- --base <ref>  # change list against <ref> instead of the default branch
+```
+
+It is conservative by construction, and that is the whole contract: the entry
+point (`index.ts`), `package.json` / `package-lock.json`, `tsconfig.json`,
+anything under `test/` (the suite and its harness), and **any path that is not in
+the explicit reverse-dependency map** (`MODULE_TESTS` in `scripts/fast-gate.ts`)
+send the run to the FULL suite instead. The working tree is always included, so a
+dirty checkout only ever widens the run.
+
+This is NOT the landing gate. The merger runs the full
+`npx tsc --noEmit && npm test` on the merged union, and a change is green only
+once that passes. When you add a module, decide its fast-tier coverage in one
+line — add it to `MODULE_TESTS` (its own tests plus the tests of the modules that
+import it) or to `FULL_TESTS_TRIGGERS`; `test/fast-gate.test.ts` fails while a
+shipped module is in neither. On the fleet VMs this is what
+`~/.fleet/check.conf` points `CHECK_FAST_CMD` at (`CHECK_CMD` stays the full
+gate).
+
 `npm test` also enforces version consistency. Its `pretest` step runs
 `scripts/check-version-consistency-gate.mjs`, which picks the strongest base it can
 resolve and then runs the strict check in `scripts/check-version-consistency.mjs`:

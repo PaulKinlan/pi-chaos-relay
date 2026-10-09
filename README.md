@@ -528,7 +528,16 @@ are removed after 24 hours. You can force an immediate pull with
 npm test        # node --test unit tests (relay client, poller, config); runs the version check first
 npx tsc --noEmit -p tsconfig.json   # type-check against pi types
 npm run check:version -- --base origin/master   # package.json/lockfile agreement (required by the gate)
+npm run test:fast   # implementer iteration: the two checks above + only the affected tests
 ```
+
+`npm run test:fast` is for iteration, not for landing. It always runs the
+whole-tree type-check and the version gate, then narrows the tests using the
+explicit reverse-dependency map in `scripts/fast-gate.ts` — and falls back to the
+**full** suite for the entry point, the manifests/lockfile, `tsconfig.json`,
+anything under `test/`, and any path that is not in the map. Landing (and the
+fleet merger) still runs `npx tsc --noEmit && npm test` on the merged tree; see
+AGENTS.md.
 
 `npm test` runs the version check first (via `pretest`), so a tree whose
 `package.json` and `package-lock.json` disagree fails the gate instead of shipping —
