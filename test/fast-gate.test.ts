@@ -63,9 +63,13 @@ test("several isolated modules union their tests, sorted and deduped", () => {
   assert.equal(selection.mode, "affected");
   // url-redact fans out to every module that imports it (relay-client, ws-client,
   // inbound-attachments and poller through relay-client); config reaches
-  // approval-policy. The closure guard test proves these edges are complete.
+  // approval-policy. The closure guard test proves these edges are complete:
+  // it is what caught the two new edges when approvals.ts extracted the summary
+  // (approvals.ts imports parseConnectInput and redactCommandSecrets, so connect
+  // and url-redact changes can now affect the approvals tests).
   assert.deepEqual(selection.tests, [
     "test/approval-policy.test.ts",
+    "test/approvals.test.ts",
     "test/config.test.ts",
     "test/connect.test.ts",
     "test/inbound-attachments.test.ts",
@@ -280,7 +284,7 @@ function importSpecifiersFrom(source: string): string[] {
   for (const re of [
     /\bfrom\s*["'](\.[^"']+)["']/g,
     /\bimport\s*["'](\.[^"']+)["']/g,
-    /\bimport\s*\(\s*["'`](\.\/[^"'`]+)["'`]/g,
+    /\bimport\s*\(\s*["'`](\.\.?\/[^"'`]+)["'`]/g,
   ]) {
     for (const m of source.matchAll(re)) specs.push(m[1]);
   }
