@@ -3092,6 +3092,37 @@ test("summarizeToolCall keeps relay_reply payload-free (channel + size only)", (
   assert.ok(!summary.includes(body), `must not echo the reply body: ${summary}`);
 });
 
+test("summarizeToolCall names every relay_reply attachment, with its size", () => {
+  // The operator approves an OUTBOUND send from this line, so a bare count is
+  // not enough: `2 attachment(s)` cannot be told apart from shipping ~/.ssh/id_rsa.
+  // Names and sizes are shown; the file CONTENTS never are.
+  const dir = mkdtempSync(join(tmpdir(), "chaos-relay-attach-"));
+  try {
+    const notes = join(dir, "notes.md");
+    writeFileSync(notes, "hello"); // 5 bytes
+    const key = join(dir, "id_rsa");
+    writeFileSync(key, "PRIVATE-KEY-BYTES");
+
+    const summary = summarizeToolCall("relay_reply", {
+      channelType: "telegram",
+      channelId: "chanA",
+      content: "see attached",
+      files: [notes, key, dir, join(dir, "missing.bin"), 42],
+    });
+
+    assert.ok(summary.startsWith("relay_reply: channel telegram"), `names the channel: ${summary}`);
+    assert.ok(summary.includes("4 attachment(s)"), `counts the real paths only: ${summary}`);
+    assert.ok(summary.includes("notes.md (5 bytes)"), `names and sizes the first: ${summary}`);
+    assert.ok(summary.includes("id_rsa (17 bytes)"), `a sensitive name is visible: ${summary}`);
+    assert.ok(summary.includes("(not a regular file)"), `flags a directory: ${summary}`);
+    assert.ok(summary.includes("missing.bin (unreadable)"), `flags an unreadable path: ${summary}`);
+    assert.ok(!summary.includes("PRIVATE-KEY-BYTES"), `must never echo attachment contents: ${summary}`);
+    assert.ok(!summary.includes(dir), `must not echo the absolute directory: ${summary}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("summarizeToolCall shows write/edit paths as paths plus a content size, not a hash", () => {
   const write = summarizeToolCall("write", { path: "docs/notes.md", content: "hello" });
   assert.ok(write.includes("docs/notes.md"), `shows the relative path: ${write}`);
