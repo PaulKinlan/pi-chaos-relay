@@ -177,8 +177,11 @@ channel-borne instruction to do it requires the operator's own approval.
 
 The approval prompt never echoes the payload: a `bash` approval shows a REDACTED
 command string, `write`/`edit` show the target path and size, and a control-plane
-call names its target (profile name, channel name/id/type, a `relay_connect`
-keyword, an email domain) while credential fields show only a length. `all` = ask
+call names its target (the profile name that will actually be used, channel
+name/id/type, a `relay_connect` keyword, or the email address a verification link
+would go to) while credential fields show only a length. Echoed targets are
+squashed onto one line and redacted like a `bash` command, so local file contents
+cannot ride along in a `relay_switch_profile {name: …}` question. `all` = ask
 before every tool except the read-only relay plumbing, `off` = fully autonomous
 (explicit opt-out). Set with `/chaos-relay approvals <off|writes|all>` or the
 `CHAOS_RELAY_APPROVAL_MODE` env var.

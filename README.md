@@ -399,6 +399,7 @@ move the session to a profile whose approval mode is `off`. Either one takes the
 session over *and* self-approves the gate, because the next approval question is
 then delivered to the attacker's channel. In `writes` and `all` modes those
 calls pause for your approval like any other gated tool.
+
 When a tool is gated, the agent pauses and sends an approval request to the active
 channel; **reply `yes <code>` to allow or `no <code>` to deny** — the prompt shows a
 short code, and only the originating sender's reply counts (auto-denies after 5 minutes).
@@ -407,10 +408,14 @@ its channel type, a short channel fingerprint, and a character/byte count (plus 
 name and size of each attachment); a `bash`
 approval shows a **REDACTED command string** (secret-shaped values are masked) so the
 operator can judge benign vs destructive; `write`/`edit` show the **target path and
-size**; a control-plane call names the target it would use (profile name, channel
-name/id/type, a `relay_connect` keyword, an email domain) while its credential fields
-(`botToken`, `password`, `secret`, and `relay_connect`'s token/address input) show only a
-length; and other tools show field sizes or path fingerprints — never their contents.
+size**; a control-plane call names the target it would use (the profile name that will
+actually be used, channel name/id/type, a `relay_connect` keyword or the email address a
+verification link would go to) while its credential fields (`botToken`, `password`,
+`secret`, and `relay_connect`'s token) show only a length; and other tools show field
+sizes or path fingerprints — never their contents. Every echoed target is squashed onto
+one line and passed through the same secret-shaped-value redaction as a `bash` command,
+so a channel-borne `relay_switch_profile {name: …}` cannot copy local file contents into
+the question.
 Terminal/local turns are never gated.
 
 ## Telegram setup — end to end

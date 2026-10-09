@@ -658,7 +658,7 @@ export function summarizeToolCall(toolName: string, input: Record<string, unknow
     return `edit: ${target} (${edits.length} edit(s), ${bytes} bytes)`;
   }
   if (CONTROL_PLANE_RELAY_TOOLS.has(toolName)) {
-    return `${toolName}: ${summarizeControlPlaneInput(input)}`;
+    return `${toolName}: ${summarizeControlPlaneInput(toolName, input)}`;
   }
   // Any other gated tool: never echo raw values, only shapes.
   const entries = Object.entries(input ?? {});
@@ -688,54 +688,108 @@ const CONTROL_PLANE_RELAY_TOOLS = new Set([
   "relay_switch_profile",
 ]);
 
-/** Input fields that name a target without being a credential. */
+/** Input fields that name a target rather than carrying a credential. */
 const SAFE_TARGET_FIELDS = new Set(["name", "channelName", "channelType", "channelId"]);
 
-/** The leading word of `relay_connect`'s one-shot input, when it names a
- *  channel kind ("webhook my-hook"): a KIND is not a credential, the rest of a
- *  token/address is. */
-const CONNECT_KINDS = new Set(["webhook", "telegram", "discord", "email"]);
+/**
+ * A target the caller chose (profile name, channel name, address, webhook name)
+ * rendered for the approval question. The value is AGENT-CONTROLLED, so it is
+ * squashed onto ONE line, secret-shaped values are redacted and it is capped.
+ * Without that, `read ~/.aws/credentials` followed by
+ * `relay_switch_profile {name: <secret>}` would ship the secret to the driving
+ * channel inside the question — before anyone approved anything — which is the
+ * very egress the session taint exists to close. Same rule the `bash` summary
+ * follows (redaction plus a cap), for the same reason.
+ */
+function summarizeFreeTextTarget(value: string, max = 60): string {
+  const oneLine = value.replace(/[\s\p{C}]+/gu, " ").trim();
+  const redacted = redactCommandSecrets(oneLine);
+  return redacted.length <= max ? redacted : `${redacted.slice(0, max)}… (${redacted.length} chars total)`;
+}
+
+/** The numeric bot id in a Telegram token (`123456:AA…`) is public and tells the
+ *  operator WHICH bot it is; the secret half never is. */
+function summarizeTelegramToken(value: string): string {
+  const m = value.trim().match(/^(\d+):/);
+  return m ? `${m[1]}:<redacted>` : "<redacted>";
+}
 
 /**
  * One line naming what a control-plane call would do, for the approval
- * question. Non-secret targets are echoed (profile name, channel name/id/type,
- * a connect KEYWORD, an email DOMAIN); credential-bearing values never are —
- * `botToken`, `password`, `secret` and `relay_connect`'s `input` render as a
- * length, and an email address keeps only its domain. The question travels to
- * the channel driving the turn, so echoing a live credential here would leak it
- * to whoever is listening. */
-function summarizeControlPlaneInput(input: Record<string, unknown>): string {
+ * question. The TARGET is echoed so the operator can judge it (an injected
+ * `relay_switch_profile` summarised as `name:9 chars` is unanswerable), while
+ * credential-bearing values never are: `botToken`, `password`, `secret` and a
+ * connect token render as a length, and an email address is shown in full
+ * because it is a ROUTING TARGET — the verification link goes to whatever
+ * address is approved, so hiding its local part hides the takeover this gate
+ * exists to stop. Every echoed value goes through summarizeFreeTextTarget
+ * (one line, redacted, capped), because the caller controls it.
+ */
+function summarizeControlPlaneInput(toolName: string, input: Record<string, unknown>): string {
   const parts: string[] = [];
   for (const [key, value] of Object.entries(input ?? {})) {
-    if (typeof value !== "string") continue;
-    if (SAFE_TARGET_FIELDS.has(key)) {
-      const shown = key === "channelId" ? shortId(value) : truncateForDisplay(value);
-      parts.push(`${key}=${shown}`);
-      continue;
-    }
-    if (key === "userEmail") {
-      const at = value.lastIndexOf("@");
-      // Domain only: enough for the operator to recognise their own mailbox,
-      // never the local part.
-      parts.push(at > 0 ? `userEmail=***${value.slice(at)}` : `userEmail:${value.length} chars`);
-      continue;
-    }
-    if (key === "input") {
-      const [kind = "", ...rest] = value.trim().split(/\s+/);
-      if (!CONNECT_KINDS.has(kind.toLowerCase())) {
-        parts.push(`input=<redacted, ${value.length} chars>`);
-      } else if (kind.toLowerCase() === "webhook") {
-        // addWebhook takes a NAME after the keyword; a name is not a credential.
-        const name = rest.length ? ` ${rest.join(" ")}` : "";
-        parts.push(`input=${kind}${name}`);
-      } else {
-        parts.push(`input=${kind} <redacted>`);
+    if (typeof value === "string") {
+      if (key === "channelId") {
+        parts.push(`${key}=${shortId(value)}`);
+        continue;
       }
+      if (key === "name" && toolName === "relay_switch_profile") {
+        // Show the profile name that will ACTUALLY be used (the slug), not the
+        // raw string: its [a-z0-9._-] charset cannot fake the question layout.
+        parts.push(`${key}=${summarizeFreeTextTarget(profileNameForPath(profilePathForName(value)))}`);
+        continue;
+      }
+      if (SAFE_TARGET_FIELDS.has(key)) {
+        parts.push(`${key}=${summarizeFreeTextTarget(value)}`);
+        continue;
+      }
+      if (key === "userEmail") {
+        parts.push(`userEmail=${summarizeFreeTextTarget(value)}`);
+        continue;
+      }
+      if (key === "input") {
+        parts.push(`input=${summarizeConnectInput(value)}`);
+        continue;
+      }
+      parts.push(`${key}:${value.length} chars`);
       continue;
     }
-    parts.push(`${key}:${value.length} chars`);
+    // Never drop a field silently: an object/array target must still be visible
+    // as a shape rather than rendering the call as "no inputs".
+    if (Array.isArray(value)) {
+      parts.push(`${key}:${value.length} item(s)`);
+      continue;
+    }
+    if (value === null || value === undefined) {
+      parts.push(key);
+      continue;
+    }
+    parts.push(`${key}:object`);
   }
   return parts.length ? parts.join(", ") : "no inputs";
+}
+
+/**
+ * `relay_connect`'s one-shot input: a channel kind plus one identifying thing.
+ * A KIND and a webhook NAME are targets; a bot token, and the secret half of a
+ * Telegram token, are credentials. A bare address is a routing target.
+ */
+function summarizeConnectInput(value: string): string {
+  const [kindRaw = "", ...rest] = value.trim().split(/\s+/);
+  const kind = kindRaw.toLowerCase();
+  const remainder = rest.join(" ").trim();
+  if (kind === "webhook") {
+    return remainder ? `webhook ${summarizeFreeTextTarget(remainder)}` : "webhook";
+  }
+  if (kind === "telegram") return `telegram ${summarizeTelegramToken(remainder)}`;
+  if (kind === "discord") return "discord <redacted>";
+  if (kind === "email") {
+    return remainder ? `email ${summarizeFreeTextTarget(remainder)}` : "email <redacted>";
+  }
+  if (rest.length === 0 && /^[^\s@]+@[^\s@]+$/.test(kindRaw)) {
+    return summarizeFreeTextTarget(value.trim());
+  }
+  return `<redacted, ${value.length} chars>`;
 }
 
 /** Render a file path for DISPLAY: relative to the working directory when
