@@ -612,18 +612,26 @@ export class ApprovalQueue {
  * size) while withholding the secret-bearing contents. */
 export function summarizeToolCall(toolName: string, input: Record<string, unknown>): string {
   if (toolName === "relay_reply") {
-    // Payload-free: channel + size only. The reply body can carry local file
-    // contents, so it is NEVER echoed back to the channel.
+    // Payload-free: channel + body size, plus attachment NAMES and SIZES only.
+    // The reply body can carry local file contents, so it is NEVER echoed back
+    // to the channel. An attachment path is metadata, not content (write/edit
+    // summaries show paths too) — and the operator needs it: `2 attachment(s)`
+    // is indistinguishable from shipping ~/.ssh/id_rsa.
     const channelType = typeof input.channelType === "string" ? input.channelType : "?";
     const channelId = typeof input.channelId === "string" ? input.channelId : "";
     const content = typeof input.content === "string" ? input.content : "";
-    const files = Array.isArray(input.files) ? input.files.length : 0;
+    const files = Array.isArray(input.files)
+      ? input.files.filter((f): f is string => typeof f === "string")
+      : [];
     const parts: Array<string | null> = [
       `channel ${channelType}`,
       channelId ? `#${shortId(channelId)}` : null,
       `${content.length} chars / ${Buffer.byteLength(content, "utf8")} bytes`,
     ];
-    if (files > 0) parts.push(`${files} attachment(s)`);
+    if (files.length > 0) {
+      // One entry per file so a sensitive name cannot hide behind a count.
+      parts.push(`${files.length} attachment(s): ${files.map(describeAttachment).join(", ")}`);
+    }
     return `relay_reply: ${parts.filter((p): p is string => p !== null).join(", ")}`;
   }
   if (toolName === "bash") {
@@ -672,6 +680,23 @@ function summarizePath(raw: string): string {
   const rel = relative(process.cwd(), path);
   if (!rel.startsWith("..") && !isAbsolute(rel)) return rel || ".";
   return basename(path);
+}
+
+/** One approval-prompt line per relay_reply attachment: display name + on-disk
+ * size, stat-ed best-effort. A path and a size are the two facts the operator
+ * needs to tell an intended file from a sensitive one — the file's CONTENTS are
+ * never shown (and are not read here). */
+function describeAttachment(raw: string): string {
+  const name = summarizePath(raw);
+  let stat: ReturnType<typeof statSync>;
+  try {
+    stat = statSync(raw);
+  } catch {
+    return `${name} (unreadable)`;
+  }
+  // A directory or device is not attachable; say so rather than size it.
+  if (!stat.isFile()) return `${name} (not a regular file)`;
+  return `${name} (${stat.size} bytes)`;
 }
 
 /** Keep a command summary readable; very long commands are cut with a length
