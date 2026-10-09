@@ -190,7 +190,7 @@ test("removeProfileLock unlinks only a lock this process wrote", () => {
 
 // ── the race the lock exists for ─────────────────────────────────────────────
 
-test("three processes racing one profile: exactly one wins, on the extracted module", async () => {
+test("three processes racing one profile: exactly one wins, on the extracted module", { timeout: 30_000 }, async () => {
   const profile = "race";
   const moduleUrl = new URL("../profile-lock.ts", import.meta.url).href;
   const HOLD_MS = 3_000;
@@ -214,12 +214,33 @@ test("three processes racing one profile: exactly one wins, on the extracted mod
       stdio: ["ignore", "pipe", "pipe"],
     });
     let buffer = "";
+    let stderr = "";
+    let settled = false;
     let resolveFirst!: (line: string) => void;
-    const firstLine = new Promise<string>((resolve) => (resolveFirst = resolve));
+    let rejectFirst!: (err: Error) => void;
+    const firstLine = new Promise<string>((resolve, reject) => {
+      resolveFirst = resolve;
+      rejectFirst = reject;
+    });
     proc.stdout.on("data", (chunk) => {
       buffer += String(chunk);
       const nl = buffer.indexOf("\n");
-      if (nl >= 0) resolveFirst(buffer.slice(0, nl));
+      if (nl >= 0 && !settled) {
+        settled = true;
+        resolveFirst(buffer.slice(0, nl));
+      }
+    });
+    proc.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    // A racer that dies before printing (a type-stripping or import error) must
+    // FAIL this test, not hang it: node --test has no default timeout, so a
+    // never-resolving promise here would hold the gate open until the reaper
+    // killed it.
+    proc.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      rejectFirst(new Error(`a racer exited with code ${code} before claiming: ${stderr.slice(0, 400)}`));
     });
     return { proc, firstLine };
   });
@@ -230,7 +251,14 @@ test("three processes racing one profile: exactly one wins, on the extracted mod
     const winners = parsed.filter((r) => r.claimed);
     assert.equal(winners.length, 1, `exactly one process may claim: ${results.join(" | ")}`);
     for (const loser of parsed.filter((r) => !r.claimed)) {
-      assert.equal(loser.holder, winners[0].pid, "a loser is told which live pid holds it");
+      // A loser that hits EEXIST in the microsecond between the winner's
+      // exclusive create and its pid write reads an empty (ambiguous) file and
+      // correctly reports "held, pid unknown" — both outcomes are a refusal to
+      // clobber a holder, which is the contract.
+      assert.ok(
+        loser.holder === winners[0].pid || loser.holder === null,
+        `a loser reports the holder pid or null, not someone else: ${JSON.stringify(loser)}`,
+      );
     }
     // And the file on disk names the winner, not a loser.
     assert.equal(readFileSync(lockPath(profile), "utf-8"), String(winners[0].pid));

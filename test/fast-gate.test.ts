@@ -284,7 +284,7 @@ function importSpecifiersFrom(source: string): string[] {
   for (const re of [
     /\bfrom\s*["'](\.[^"']+)["']/g,
     /\bimport\s*["'](\.[^"']+)["']/g,
-    /\bimport\s*\(\s*["'`](\.\/[^"'`]+)["'`]/g,
+    /\bimport\s*\(\s*["'`](\.\.?\/[^"'`]+)["'`]/g,
   ]) {
     for (const m of source.matchAll(re)) specs.push(m[1]);
   }
