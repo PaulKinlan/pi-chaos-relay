@@ -164,6 +164,38 @@ test("a percent-encoded authority fails closed instead of echoing encoded userin
   }
 });
 
+test("a bracketed IPv6 authority the parser rejects fails closed", () => {
+  // The real parser validates IPv6 literals; anything that reaches the fallback
+  // with brackets is a URL it rejected, and this code must not hand-validate an
+  // address. `[::deadbeefdeadbeef]` (hextet > 4 hex digits) and
+  // `[1:2:3:4:5:6:7:8:9]` (too many groups) passed the old shape-only check.
+  const rejected = [
+    "[::deadbeefdeadbeef]:99999",
+    "[::deadbeefdeadbeef]",
+    "[::deadbeefdeadbeef]:80",
+    "[1:2:3:4:5:6:7:8:9]:99999",
+    "[1:2:3:4:5:6:7:8:9]",
+    // A VALID literal with a port the parser refuses also fails closed: the
+    // fallback will not vouch for an address it did not parse.
+    "[::1]:99999",
+    "[2001:db8::1]:99999",
+  ];
+  for (const authority of rejected) {
+    const out = redactUrlSecretsFromMessage(`failed https://user:pw@${authority}/p?t=1 end`);
+    assert.equal(out, "failed <invalid> end", `expected fail-closed for ${authority}: ${out}`);
+  }
+  // A valid literal on a parseable URL is still rendered, from the parser's own
+  // output (the try-branch) rather than from the fallback.
+  assert.equal(
+    redactUrlSecretsFromMessage("failed https://user:pw@[::1]:8443/p?t=1 end"),
+    "failed https://[::1]:8443 end",
+  );
+  assert.equal(
+    redactUrlSecretsFromMessage("failed https://user:pw@[2001:db8::1]/p?t=1 end"),
+    "failed https://[2001:db8::1] end",
+  );
+});
+
 test("redactCommandSecrets reduces an unparsable URL in an approval prompt", () => {
   const secret = "leakme-cmd-password-1234567890";
   const out = redactCommandSecrets(

@@ -40,8 +40,11 @@ const INVALID_ORIGIN = "<invalid>";
  * the first path/query/fragment separator, keeps only what follows the last
  * `@` (userinfo), drops a non-numeric "port", and returns `<invalid>` rather
  * than ever echoing a value it cannot reduce. A percent-encoded authority
- * (`alice%3Apw%40host`, which hides its userinfo from the last-`@` rule) also
- * fails closed — a host never legitimately contains a literal `%XX`.
+ * (`alice%3Apw%40host`, which hides its userinfo from the last-`@` rule) and a
+ * bracketed IPv6 authority (which this code will not hand-validate) also fail
+ * closed — as does anything past the authority: for a URL the parser rejected,
+ * the authority tail cannot be told apart from a mistyped secret, so it is
+ * withheld even when it looks like prose (`…:99999,then` → host only).
  */
 function originOnly(raw: string): string {
   try {
@@ -56,10 +59,14 @@ function originOnly(raw: string): string {
 /** WHATWG treats `\` as a path separator for special schemes; the authority
  * ends at the first of these. */
 const AUTHORITY_END_RE = /[/?#\\]/;
-/** A plain host or bracketed IPv6 literal, plus an optional numeric port. `%`
- * is deliberately absent: the host parser percent-decodes, so any `%XX` here
- * is an encoded delimiter (or an encoded secret), not part of a host. */
-const SAFE_HOST_RE = /^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._~\-]+)(?::\d+)?$/;
+/** A plain domain-shaped host, plus an optional numeric port. `%` is
+ * deliberately absent (the host parser percent-decodes, so any `%XX` here is an
+ * encoded delimiter, not part of a host) and so are brackets: a bracketed IPv6
+ * literal is validated by the real parser in the try-branch, and reaching the
+ * fallback with one means the parser rejected it — hand-validating an address
+ * here is exactly how `[::deadbeefdeadbeef]` (hextet > 4 hex digits) and
+ * `[1:2:3:4:5:6:7:8:9]` rode through. */
+const SAFE_HOST_RE = /^[A-Za-z0-9._~\-]+(?::\d+)?$/;
 
 /** Fail-closed reduction for a URL `new URL()` refused. Never echoes `raw`. */
 function fallbackOrigin(raw: string): string {
@@ -78,13 +85,14 @@ function fallbackOrigin(raw: string): string {
   // literal `%` — the parser decodes it and rejects it as a forbidden domain
   // code point. So any `%` fails closed rather than riding out as a "host".
   if (host.includes("%")) return INVALID_ORIGIN;
+  // A bracketed literal means the parser rejected this URL (a valid literal on
+  // a parseable URL never reaches the fallback). Refuse it rather than echo an
+  // address this code cannot verify.
+  if (host.startsWith("[")) return INVALID_ORIGIN;
   // A non-numeric tail after `:` is not a port — it could be a mistyped secret
-  // sitting in the port position, so drop it rather than echo it. Skipped for
-  // IPv6 literals, whose colons are part of the address.
-  if (!host.startsWith("[")) {
-    const colon = host.lastIndexOf(":");
-    if (colon !== -1 && !/^\d+$/.test(host.slice(colon + 1))) host = host.slice(0, colon);
-  }
+  // sitting in the port position, so drop it rather than echo it.
+  const colon = host.lastIndexOf(":");
+  if (colon !== -1 && !/^\d+$/.test(host.slice(colon + 1))) host = host.slice(0, colon);
   return host !== "" && SAFE_HOST_RE.test(host) ? `${scheme}${host}` : INVALID_ORIGIN;
 }
 
