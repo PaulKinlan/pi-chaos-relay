@@ -3442,9 +3442,11 @@ test("a delivery that hits a replaced runtime stops the instance and returns the
     // runtime rather than just the one that was in flight.
     pushMessage(socket, "m-stale-1", ts);
     pushMessage(socket, "m-stale-2", ts2, "second");
-    await waitFor(
-      () => readFileSync(logPath, "utf-8").slice(logBefore.length).split("inbound delivery deferred").length - 1 >= 2,
-    );
+    // The second frame may or may not be accepted before the first delivery
+    // finishes (both are legitimate: the transport is torn down with the flag), so
+    // this waits for the outcome that matters rather than for a schedule.
+    const deferred = () => readFileSync(logPath, "utf-8").slice(logBefore.length).split("inbound delivery deferred").length - 1;
+    await waitFor(() => deferred() >= 1 && injects === 1);
 
     // The durable log is shared across this file's tests, so only the lines this
     // test appended are asserted on.
@@ -3475,6 +3477,7 @@ test("a delivery that hits a replaced runtime stops the instance and returns the
     assert.deepEqual(swallowed, [], "negative control: with the pre-fix cursor (since = the message itself) a strict relay skips it forever");
 
     assert.equal(injects, 1, "only the first batch was ever offered to the agent");
+    assert.ok(deferred() >= 1, "the in-flight batch was handed back");
     assert.deepEqual(
       config.loadMessageState().seenIds.filter((id) => id.startsWith("m-stale-")),
       [],
@@ -3537,7 +3540,16 @@ test("a live runtime still delivers, and logs no replaced-runtime warning", asyn
       config.loadMessageState().seenIds.includes("m-live-1"),
       "a delivered message IS marked delivered (the flag must not over-fire)",
     );
+    // A DELIVERED batch must never be handed back at shutdown: that would deliver
+    // the message twice, which is why the in-flight set is cleared on a successful
+    // send.
+    const liveLogBefore = existsSync(logPath) ? readFileSync(logPath, "utf-8").length : 0;
     await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-live", fake.notifications));
+    assert.ok(
+      !readFileSync(logPath, "utf-8").slice(liveLogBefore).includes("returned to the poller"),
+      "a delivered batch is not requeued at shutdown",
+    );
+    assert.ok(config.loadMessageState().seenIds.includes("m-live-1"), "and it stays delivered");
   } finally {
     globalThis.WebSocket = origWs;
     if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
@@ -3579,6 +3591,118 @@ test("a push arriving after session_shutdown is not delivered and not consumed",
     );
   } finally {
     globalThis.WebSocket = origWs;
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+  }
+});
+
+test("a delivery in flight across session_shutdown is handed back before the replacement reads state", async () => {
+  // The P1 from review round 1: requeueing only when the in-flight delivery FAILS
+  // races the replacement instance, which reads the poller state in its own
+  // session_start. For a slow attachment download the replacement usually wins, and
+  // then the rewound cursor is overwritten by the replacement's next write — the
+  // message is lost after all. session_shutdown is awaited by pi before the
+  // replacement exists, so the hand-back has to happen THERE.
+  resetState();
+  writeProfileConfig("default", "ak_inflight");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origWs = globalThis.WebSocket;
+  const origFetch = globalThis.fetch;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+
+  let releaseDownload: (() => void) | undefined;
+  let downloadStarted = false;
+  globalThis.fetch = (async (input: unknown) => {
+    const href = String(input);
+    if (!href.includes("/attachments/")) throw new Error(`unexpected fetch: ${href}`);
+    downloadStarted = true;
+    await new Promise<void>((resolve) => {
+      releaseDownload = resolve;
+    });
+    // Real PNG magic, so the hydration produces an image content part.
+    return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), {
+      status: 200,
+      headers: { "content-type": "image/png" },
+    });
+  }) as unknown as typeof fetch;
+
+  try {
+    const fake = makeFakePi();
+    let injects = 0;
+    fake.pi.sendUserMessage = () => {
+      injects += 1;
+    };
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    const ctx = makeCtx("sess-inflight", fake.notifications);
+    // An image-capable model, so the delivery takes the image content path.
+    (ctx as { model: unknown }).model = { input: ["text", "image"] };
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, ctx);
+    assert.ok(PushWebSocket.instances.length >= 1, "WS constructed");
+
+    const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+    const logBefore = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+    const ts = new Date().toISOString();
+    PushWebSocket.instances[0].pushFrame(
+      JSON.stringify({
+        type: "message",
+        message: {
+          id: "m-inflight",
+          channelType: "telegram",
+          channelId: "ch-inflight",
+          from: "alice",
+          content: "look at this",
+          timestamp: ts,
+          attachments: [{ id: "att-1", filename: "photo.png", mimeType: "image/png", size: 8, kind: "image" }],
+        },
+      }),
+    );
+    await waitFor(() => downloadStarted);
+    assert.equal(injects, 0, "the delivery is still hydrating the attachment");
+
+    // The runtime is replaced while the download is still in flight.
+    await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-inflight", fake.notifications));
+
+    const raw = readFileSync(logPath, "utf-8").slice(logBefore.length);
+    assert.match(
+      raw,
+      /session shutting down: 1 undelivered batch\(es\), 1 message\(s\) returned to the poller/,
+      `the hand-back is logged at shutdown: ${raw}`,
+    );
+
+    // A replacement session reading state now must find the message still pending.
+    const state = config.loadMessageState();
+    assert.ok(!state.seenIds.includes("m-inflight"), `not marked delivered: ${JSON.stringify(state.seenIds)}`);
+    const replacement = windowedClient([
+      {
+        id: "m-inflight",
+        channelType: "telegram",
+        channelId: "ch-inflight",
+        from: "alice",
+        content: "look at this",
+        timestamp: ts,
+      },
+    ]);
+    const refetched = await new MessagePoller(replacement.client, { since: state.cursor, seen: state.seenIds }).poll();
+    assert.deepEqual(refetched.map((m) => m.id), ["m-inflight"], "the replacement session re-fetches it");
+
+    // Now let the dead instance's delivery finish: it must write NOTHING (a late
+    // write would race the replacement and could land in another profile's state).
+    const statePath = config.messageStatePath();
+    const onDisk = readFileSync(statePath, "utf-8");
+    assert.ok(releaseDownload, "the download was blocked");
+    releaseDownload();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(readFileSync(statePath, "utf-8"), onDisk, "the dead instance writes no state after the hand-back");
+    assert.equal(injects, 0, "nothing is injected into the replaced runtime");
+    assert.ok(
+      !readFileSync(logPath, "utf-8").slice(logBefore.length).includes("attachment delivery failed"),
+      "and it is not reported as a per-batch delivery failure",
+    );
+  } finally {
+    globalThis.WebSocket = origWs;
+    globalThis.fetch = origFetch;
     if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
     else process.env.CHAOS_RELAY_URL = prevUrl;
   }

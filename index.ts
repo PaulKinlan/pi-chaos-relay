@@ -287,9 +287,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   let deliveryQueue: Promise<void> = Promise.resolve();
   let activeModelAcceptsImages = false;
   /**
-   * True once THIS session's runtime is gone: pi emits `session_shutdown` before
-   * it disposes the session and invalidates the instance, or a `pi.*` call threw
-   * the stale-runtime error. A replaced instance must not keep delivering: every
+   * True once THIS session's runtime is gone. pi emits `session_shutdown` before
+   * it tears the session down — before `dispose()` (which invalidates the
+   * instance) for /new, /resume and /fork, and before it swaps in a freshly
+   * loaded extension instance for /reload — or a `pi.*` call threw the
+   * stale-runtime error. A replaced instance must not keep delivering: every
    * `pi.*` call throws, and a batch it consumed has already advanced the poller
    * cursor, so the replacement session could never see it. Background delivery is
    * therefore gated on this flag, and an undelivered batch is handed back to the
@@ -298,6 +300,16 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
    * flag false.
    */
   let runtimeReplaced = false;
+  /**
+   * Batches that have been accepted from the poller but not yet handed to `pi`.
+   * Tracked by batch identity (the array `accept()` returned) from `queueDelivery`
+   * until a `sendUserMessage` succeeds, so a session replacement can give them
+   * back SYNCHRONOUSLY before the replacement instance reads the poller state —
+   * see requeueInFlight. Without it, a batch whose delivery is still in flight
+   * (a slow attachment download, say) would be requeued only when that delivery
+   * finally failed, which is a race against the replacement's own state read.
+   */
+  const inFlightBatches = new Set<ChannelMessage[]>();
   let cfg: ResolvedConfig = resolveConfig();
 
   // Profile/session binding. `currentProfile` is the profile this process is
@@ -852,11 +864,38 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
    * persisted the cursor past it before delivery was attempted.
    */
   function requeueUndelivered(messages: ChannelMessage[], why: string): void {
+    inFlightBatches.delete(messages);
     const back = poller ? poller.requeue(messages) : [];
     markRuntimeReplaced(why);
     log(
       `inbound delivery deferred: ${back.length} of ${messages.length} message(s) ` +
         `returned to the poller for the replacement session`,
+    );
+  }
+
+  /**
+   * Hand every accepted-but-undelivered batch back to the poller, synchronously.
+   *
+   * Called from session_shutdown, which pi awaits BEFORE it disposes the session
+   * (invalidating this instance) and before the replacement instance is built and
+   * reads the poller state. That ordering is what makes the rollback reliable:
+   * the rewound cursor is on disk before anything can read it, so the relay
+   * replays the messages into the replacement session. Doing it later, from
+   * deliverToAgent, only worked if the replacement had not read state yet — for a
+   * slow attachment download it usually had, and the rewound cursor was then
+   * overwritten by the replacement's own next write, losing the message.
+   */
+  function requeueInFlight(why: string): void {
+    if (inFlightBatches.size === 0) return;
+    const batches = inFlightBatches.size;
+    let messages = 0;
+    for (const batch of inFlightBatches) {
+      messages += (poller ? poller.requeue(batch) : []).length;
+    }
+    inFlightBatches.clear();
+    log(
+      `${why}: ${batches} undelivered batch(es), ${messages} message(s) returned to the ` +
+        `poller for the replacement session`,
     );
   }
 
@@ -898,9 +937,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       }
     }
 
-    // Hydration awaits, so the runtime can be replaced between the check above and
-    // the send: re-check immediately before injecting, when a drop still costs
-    // nothing but the origin we pushed.
+    // Hydration awaits, so the runtime can be replaced before the send: check
+    // immediately before injecting, when a drop costs only the origin we pushed.
+    // (The same policy as the stale-error catch below, for the case where this
+    // instance already knows it is dead and `pi` would throw.)
     if (runtimeReplaced) {
       dropOrigin(origin);
       requeueUndelivered(messages, "delivering a batch");
@@ -909,6 +949,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
     try {
       pi.sendUserMessage(content, { deliverAs: "followUp" });
+      inFlightBatches.delete(messages); // delivered: never hand it back
     } catch (err) {
       // A replaced runtime is not a delivery the agent refused — it is a runtime
       // that no longer exists. Hand the batch back so the replacement session
@@ -925,6 +966,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       log("active model rejected inbound image content; delivering paths as text");
       try {
         pi.sendUserMessage(text, { deliverAs: "followUp" });
+        inFlightBatches.delete(messages);
       } catch (retryErr) {
         if (isStaleRuntimeError(retryErr)) {
           dropOrigin(origin);
@@ -938,6 +980,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
   /** Serialize downloads/injection so WS push and catch-up cannot race. */
   function queueDelivery(messages: ChannelMessage[]): Promise<void> {
+    inFlightBatches.add(messages);
     deliveryQueue = deliveryQueue
       .then(() => deliverToAgent(messages))
       .catch((err) => {
@@ -1060,6 +1103,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   /** Poll once and, if there are new messages, inject them into the agent. */
   async function pollAndDeliver(): Promise<void> {
     if (!poller) return;
+    if (runtimeReplaced) return; // same reason as onMessage: do not consume
     try {
       const messages = consumeApprovalReplies(await poller.poll());
       if (messages.length === 0) return;
@@ -1086,6 +1130,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       log: (m) => log(m),
       onMessage: (messages) => {
         if (!poller) return;
+        // A catch-up or safety poll can still be awaiting the relay when the swap
+        // lands; ws-client calls back into here for it. Never accept (persist a
+        // cursor) from an instance that cannot deliver: the messages stay in the
+        // relay's window for the replacement session.
+        if (runtimeReplaced) return;
         const fresh = consumeApprovalReplies(poller.accept(messages));
         if (fresh.length === 0) return;
         log(`delivering ${fresh.length} message(s) to the agent`);
@@ -1094,7 +1143,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       // Return RAW messages (cursor advanced, NOT deduped) so the single dedup
       // happens in onMessage below. Using poller.poll() here would dedup first,
       // then onMessage's accept() would drop them all as already-seen.
-      onCatchUp: async () => (poller ? await poller.pollRaw() : []),
+      onCatchUp: async () => (runtimeReplaced || !poller ? [] : await poller.pollRaw()),
       onAuthFailure: () => recoverApiKey(),
     });
     ws.start();
@@ -1167,11 +1216,21 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", () => {
-    // pi emits session_shutdown BEFORE it disposes the session and invalidates this
-    // extension instance, so flagging it here closes the window in which an
-    // in-flight delivery would call the (about to be stale) `pi`. Cleared/false in
-    // the replacement's own instance, never here.
-    runtimeReplaced = true;
+    // pi AWAITS this handler before it tears the session down, so this is the last
+    // moment at which a write from this instance is guaranteed to land before the
+    // replacement reads the poller state:
+    //  - requeueInFlight hands back every accepted-but-undelivered batch now, so
+    //    the replacement re-fetches it (a one-second-early cursor; see
+    //    MessagePoller.requeue). This is what makes the rollback race-free —
+    //    doing it only when the in-flight delivery failed raced the replacement's
+    //    own loadMessageState.
+    //  - the flag then stops this instance delivering or consuming at all. It is
+    //    per-instance state: pi loads a fresh extension instance for the
+    //    replacement (for /reload it clears the module cache and calls the factory
+    //    again without invalidating this one), and that instance starts with the
+    //    flag false.
+    requeueInFlight("session shutting down");
+    markRuntimeReplaced("session shutting down");
     stopPolling();
     stopTyping();
     // Drop any undelivered turn origins and the session read taint so the
