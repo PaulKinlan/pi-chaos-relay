@@ -366,71 +366,110 @@ test("summarizeToolCall prints only field labels it owns, and never a raw key", 
   assert.ok(!line.includes("evil"), `an unknown key is counted, not printed: ${line}`);
 });
 
-// --- repair notes must not defeat the nonce form (bead pi-chaos-relay-cmo) ---
+// --- notes must never influence whether a message is an answer (bead cmo) ----
 //
-// Inbound messages can carry notes appended by the inbound shape checks (bead
-// 4rr): an approval reply that itself had an unusable attachment arrives as
-// "yes <nonce>" plus that note. The nonce form is end-anchored, so before this
-// fix the reply stopped matching, was forwarded to the agent instead, and the
-// request timed out as a denial.
+// Bead 4rr's inbound checks generate notes (dropped attachments, a truncation
+// marker) and the agent must see them. They are carried in `inboundMeta`, NOT
+// appended to the sender's text, so approval matching sees only what the sender
+// wrote. The round-1 fix here stripped note-shaped blocks out of the *content*,
+// which inferred provenance from text: a sender could end their message with a
+// note-shaped block and have their own trailing text ignored (false consent), and
+// a truncated "yes <nonce>   …   no" looked like an answer. Both are pinned below.
 
-const REPAIR_NOTE = "\n\n[chaos-relay: 1 attachment not delivered (unusable)]";
-
-test("settle matches the nonce form when the reply carries a repair note", async () => {
-  const q = new ApprovalQueue(5_000);
-  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
-  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `yes ${req.nonce}${REPAIR_NOTE}` }), true);
-  assert.equal(await req.promise, true);
-});
-
-test("settle matches a denial with a repair note, and a truncation marker", async () => {
-  const q = new ApprovalQueue(5_000);
-  const denied = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
-  assert.equal(
-    q.settle({
-      channelId: "c1",
-      from: "alice",
-      content: `no ${denied.nonce}\n\n[chaos-relay: content truncated at 262144 bytes, from 900000 bytes]`,
-    }),
-    true,
-  );
-  assert.equal(await denied.promise, false);
-});
-
-test("settle matches the reference form when the reply carries a repair note", async () => {
-  const q = new ApprovalQueue(5_000);
-  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
-  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `#${req.ref}: yes${REPAIR_NOTE}` }), true);
-  assert.equal(await req.promise, true);
-});
-
-test("a note alone is still not an answer", async () => {
-  const q = new ApprovalQueue(5_000);
-  q.add({ channelId: "c1", from: "alice", toolName: "bash" });
-  assert.equal(q.settle({ channelId: "c1", from: "alice", content: REPAIR_NOTE.trim() }), false);
-  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `yes${REPAIR_NOTE}` }), false);
-});
-
-test("a reply shaped by the inbound pipeline settles its request", async () => {
-  // The cross-module pin: the note this content carries is written by
-  // parseInboundMessage, and the matcher must cope with exactly what it writes.
+test("a reply that carried an unusable attachment still answers its request", async () => {
+  // The original defect: the note used to be appended to the body, and the
+  // end-anchored nonce form stopped matching it, so the request timed out.
   const parsed = parseInboundMessage({
     id: "m-1",
     channelType: "telegram",
     channelId: "c1",
     from: "alice",
-    content: "PLACEHOLDER",
+    content: "REPLY",
     timestamp: "2026-01-01T00:00:00Z",
-    attachments: [{ id: "a1", filename: "x.bin", mimeType: "application/octet-stream", size: 10, kind: "file" }, { broken: true }],
+    attachments: [
+      { id: "a1", filename: "x.bin", mimeType: "application/octet-stream", size: 10, kind: "file" },
+      { broken: true },
+    ],
   });
   assert.equal(parsed.ok, true);
+  const message = (parsed as Extract<typeof parsed, { ok: true }>).message;
+  assert.deepEqual(message.inboundMeta?.notes, ["1 attachment not delivered (unusable)"]);
+  assert.equal(message.content, "REPLY", "the note is not in the body the matcher sees");
+
   const q = new ApprovalQueue(5_000);
   const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
-  const content = (parsed as Extract<typeof parsed, { ok: true }>).message.content.replace(
-    "PLACEHOLDER",
-    `yes ${req.nonce}`,
+  assert.equal(
+    q.settle({
+      channelId: "c1",
+      from: "alice",
+      content: message.content.replace("REPLY", `yes ${req.nonce}`),
+      inboundMeta: message.inboundMeta,
+    }),
+    true,
   );
-  assert.match(content, /\[chaos-relay: 1 attachment not delivered \(unusable\)\]$/);
-  assert.equal(q.settle({ channelId: "c1", from: "alice", content }), true);
   assert.equal(await req.promise, true);
+});
+
+test("a sender's own note-shaped text cannot turn a refusal into consent", async () => {
+  // "yes <nonce>" followed by a block that looks exactly like one of our notes:
+  // the text after it is the sender's, and it says no. Matching must see all of
+  // it, or a message that was not an answer becomes consent.
+  const q = new ApprovalQueue(5_000);
+  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  const content = `yes ${req.nonce}\n\n[chaos-relay: quoted text]\nI do not approve`;
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content }), false);
+  // …and the request is still pending, not resolved either way.
+  assert.equal(q.size, 1);
+  req.cancel();
+});
+
+test("a truncated reply is never treated as an answer, in either direction", async () => {
+  // The delivered prefix looks like an answer; the sender's full body does not.
+  const parsed = parseInboundMessage({
+    id: "m-2",
+    channelType: "telegram",
+    channelId: "c1",
+    from: "alice",
+    content: `yes NONCEHERE${" ".repeat(300_000)}no`,
+    timestamp: "2026-01-01T00:00:00Z",
+  });
+  assert.equal(parsed.ok, true);
+  const message = (parsed as Extract<typeof parsed, { ok: true }>).message;
+  assert.equal(message.inboundMeta?.truncated, true);
+  assert.ok(!message.content.includes("[chaos-relay:"), "the marker is not in the body");
+
+  const q = new ApprovalQueue(5_000);
+  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  const content = message.content.replace("NONCEHERE", req.nonce);
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content, inboundMeta: message.inboundMeta }), false);
+  assert.equal(q.size, 1, "the request keeps waiting and times out as a denial");
+  req.cancel();
+});
+
+test("an untruncated reply of the same shape still settles", async () => {
+  // The discriminating counterpart: only the truncation flag makes the
+  // difference, not the body shape.
+  const q = new ApprovalQueue(5_000);
+  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  assert.equal(
+    q.settle({
+      channelId: "c1",
+      from: "alice",
+      content: `yes ${req.nonce}`,
+      inboundMeta: { notes: ["1 attachment not delivered (unusable)"], truncated: false },
+    }),
+    true,
+  );
+  assert.equal(await req.promise, true);
+});
+
+test("settle still refuses a bare answer and a note-only message", async () => {
+  const q = new ApprovalQueue(5_000);
+  q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: "yes" }), false);
+  assert.equal(
+    q.settle({ channelId: "c1", from: "alice", content: "[chaos-relay: 1 attachment not delivered (unusable)]" }),
+    false,
+  );
+  assert.equal(q.settle({ channelId: "c1", from: "bob", content: "yes deadbeef" }), false);
 });

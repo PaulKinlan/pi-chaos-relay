@@ -294,6 +294,9 @@ export function formatMessagesForAgent(messages: ChannelMessage[]): string {
     const replyTo = resolveReplyTo(m);
     if (replyTo) lines.push(formatReplyContext(replyTo));
     lines.push(m.content);
+    // Generated notes (bead 4rr/cmo) are shown to the agent but are not part of
+    // the sender's text: the matcher must never see them (see inbound-message.ts).
+    for (const note of m.inboundMeta?.notes ?? []) lines.push(`[chaos-relay: ${note}]`);
     lines.push(fence);
     lines.push("");
   }

@@ -477,13 +477,19 @@ message that never arrived, that message's kind may already have used its three
 lines — the relay's own logs are then the next place to look.
 
 A message that is merely too big is delivered in a repaired form, with a warning
-in the log **and** a note in the delivered content, because a repair the agent
-cannot see is a repair it cannot ask you about:
+in the log **and** a note in what the agent sees, because a repair the agent
+cannot see is a repair it cannot ask you about. The notes are carried beside the
+message, never inside the sender's text: an approval answer is matched against
+what the sender actually wrote, so a reply that itself carried an unusable
+attachment still answers its request, and a sender cannot type a note-shaped
+block to have their own later words ignored.
 
-- content over **256 KiB** is truncated and ends with
-  `[chaos-relay: content truncated at 262144 bytes, from <n> bytes]`;
+- content over **256 KiB** is truncated and the agent sees
+  `[chaos-relay: content truncated at 262144 bytes, from <n> bytes]` — such a
+  message is never treated as an answer to an approval, because the rest of what
+  the sender wrote is unknown;
 - only the first **3** attachments are fetched, and unusable or over-limit ones
-  add `[chaos-relay: <n> attachments not delivered (…)` to the message;
+  add a `[chaos-relay: <n> attachments not delivered (…)]` note beside the message;
 - an inbound WebSocket frame over **5 MiB** is dropped before it is parsed — the
   same bound the HTTP transport already applies to a whole `/messages` response,
   so the push path never refuses something the poll path would have delivered.

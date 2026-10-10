@@ -483,7 +483,9 @@ test("accept reports a repaired message and delivers the repaired form", () => {
   const huge = msg("big", "z".repeat(MAX_INBOUND_CONTENT_BYTES + 10));
   const fresh = poller.accept([huge]);
   assert.equal(fresh.length, 1);
-  assert.match(fresh[0].content, /\[chaos-relay: content truncated/);
+  assert.equal(fresh[0].inboundMeta?.truncated, true, "the truncation is metadata, not body text");
+  assert.match(fresh[0].inboundMeta?.notes[0] ?? "", /content truncated/);
+  assert.ok(!fresh[0].content.includes("[chaos-relay:"), "the body is the sender's text alone");
   assert.equal(reported.length, 1);
   assert.equal(reported[0].code, "content-truncated");
   assert.match(reported[0].detail, /repaired an inbound message: message "big": content truncated/);
@@ -502,7 +504,9 @@ test("a message repaired once reports one repair and the ORIGINAL size", () => {
   const body = "q".repeat(600_000);
   const fresh = poller.accept([msg("m-big", body)]);
   assert.equal(reported.filter((r) => r.code === "content-truncated").length, 1);
-  assert.match(fresh[0].content, /\[chaos-relay: content truncated at \d+ bytes, from 600000 bytes\]/);
+  assert.equal(fresh[0].inboundMeta?.truncated, true);
+  assert.match(fresh[0].inboundMeta?.notes[0] ?? "", /content truncated at \d+ bytes, from 600000/);
+  assert.ok(!fresh[0].content.includes("[chaos-relay:"), "the body stays the sender's text");
   assert.ok(Buffer.byteLength(body, "utf8") < MAX_INBOUND_FRAME_BYTES, "the fixture is a legal frame");
 });
 
@@ -548,4 +552,21 @@ test("the cursor advances by instant, not by string order", () => {
   offsets.accept([{ ...msg("e"), timestamp: "2026-01-01T09:00:00+05:00" }]);
   assert.equal(offsets.cursor, "2026-01-01T09:00:00+05:00");
   assert.equal(at([]), 0);
+});
+
+test("formatMessagesForAgent shows the generated notes and keeps them out of the body", () => {
+  const message = {
+    ...msg("m-notes"),
+    content: "hello\n\n[chaos-relay: quoted text]\nnot an answer",
+    inboundMeta: { notes: ["1 attachment not delivered (unusable)"], truncated: false },
+  };
+  const out = formatMessagesForAgent([message]);
+  assert.match(out, /\[chaos-relay: 1 attachment not delivered \(unusable\)\]/);
+  // The sender's own note-shaped line is still there, untouched and uninterpreted.
+  assert.match(out, /\[chaos-relay: quoted text\]\nnot an answer/);
+});
+
+test("formatMessagesForAgent leaves a message without notes byte-identical", () => {
+  const out = formatMessagesForAgent([msg("m-plain")]);
+  assert.ok(!out.includes("[chaos-relay: "), "no notes are invented");
 });
