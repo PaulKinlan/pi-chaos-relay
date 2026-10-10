@@ -136,3 +136,29 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
   block the agent (see `DEFAULT_TIMEOUT_MS` in `relay-client.ts`).
 - The canonical relay server lives in `~/chaos/packages/server`; match its
   API spec (`~/chaos/docs/relay-api-spec.md`).
+- Background delivery is bound to ONE session runtime, and there is nothing to
+  re-arm: an event handler's `ExtensionContext` has no `sendUserMessage` (only
+  `ExtensionAPI` and `ReplacedSessionContext` do). For `/new`, `/resume` and
+  `/fork` pi disposes the session, which invalidates the whole instance — every
+  later `pi.*` call throws "stale after session replacement"; for `/reload` it
+  clears the extension module cache and builds a fresh instance without
+  invalidating the old one, and the SDK still says not to use the old ctx. Either
+  way the old instance must stop, and pi loads a replacement instance that arms
+  itself in its own `session_start`.
+- Hand accepted-but-undelivered batches back at `session_shutdown`, synchronously,
+  BEFORE the replacement reads the poller state. pi awaits that handler before it
+  disposes the session and builds the replacement, so a `requeue` there is
+  guaranteed to land first; requeueing later, from the delivery that failed, races
+  the replacement's own state read (for a slow attachment download the replacement
+  usually wins, and its next write overwrites the rewound cursor — the message is
+  lost after all). `MessagePoller.requeue` un-sees the batch and rewinds the
+  cursor one second before its earliest message, never forwards; without it the
+  persisted cursor has already moved past those messages, so the replacement could
+  never fetch them. Tracked in `inFlightBatches` from `queueDelivery` until a
+  `sendUserMessage` succeeds — a delivered batch is never handed back.
+- Never `accept()` (persist a cursor) from an instance that can no longer deliver:
+  a catch-up or safety poll may still be awaiting the relay when the swap lands, so
+  re-check liveness AFTER the await, immediately before `accept()` — the check
+  before the await is not enough (`pollAndDeliver` awaits `pollRaw()`, then
+  accepts). A batch reaching a replaced runtime early is handed back rather than
+  silently dropped; it may have been accepted before the flag was set.

@@ -124,6 +124,43 @@ export class MessagePoller {
     }
     return fresh;
   }
+
+  /**
+   * Hand a batch BACK to the poller because it was accepted but never delivered.
+   *
+   * {@link accept} persists the cursor together with the batch (one write per
+   * batch, bead pi-chaos-relay-mlq), so a batch that is accepted and then cannot
+   * be delivered would be skipped forever by the next session. That is exactly
+   * what happens when the session runtime is replaced mid-delivery: pi invalidates
+   * the whole extension instance, the delivery throws, and the batch is gone.
+   * Requeue restores the ids to the de-dup set and rewinds the cursor to just
+   * before the batch, so the relay replays it and the replacement session's poller
+   * delivers it.
+   *
+   * The rewind lands one second before the batch's earliest timestamp: the relay's
+   * `since` filter may or may not include the boundary, and the de-dup set makes
+   * the overlap harmless either way. The cursor only ever moves BACK here.
+   *
+   * Returns the messages that were requeued — empty for a batch this poller never
+   * accepted (or already requeued).
+   */
+  requeue(messages: readonly ChannelMessage[]): ChannelMessage[] {
+    const back: ChannelMessage[] = [];
+    for (const msg of messages) {
+      if (msg?.id && this.seen.delete(msg.id)) back.push(msg);
+    }
+    if (back.length === 0) return [];
+    const earliest = back
+      .map((m) => Date.parse(String(m.timestamp ?? "")))
+      .filter((t) => Number.isFinite(t))
+      .sort((a, b) => a - b)[0];
+    if (earliest !== undefined) {
+      const rewind = new Date(earliest - 1_000).toISOString();
+      if (!this.since || rewind < this.since) this.since = rewind;
+    }
+    this.onPersist?.({ since: this.since, seen: Array.from(this.seen) });
+    return back;
+  }
 }
 
 /**

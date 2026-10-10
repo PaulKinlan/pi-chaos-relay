@@ -54,6 +54,21 @@ code doesn't consume. See AGENTS.md for the checklist.
 `CLAUDE.md` mirrors the load-bearing rules from `AGENTS.md`; a rule change must
 update both together.
 
+## Delivery is bound to one session runtime
+
+When pi replaces the session (`/new`, `/resume`, `/fork`) it disposes the old
+session and invalidates the whole extension instance, so every later `pi.*` call
+throws the "stale after session replacement" error; `/reload` builds a fresh
+instance without invalidating the old one, and the SDK still forbids using the old
+ctx. Either way an event handler's `ExtensionContext` has no `sendUserMessage` to
+re-arm with, so the old instance must stop, and the replacement arms itself in its
+own `session_start`. Two rules follow: (1) `session_shutdown` must hand every
+accepted-but-undelivered batch back to the poller SYNCHRONOUSLY — pi awaits it
+before the replacement can read state, whereas requeueing from the failed delivery
+races that read and loses the message; (2) never report the SDK's stale message as
+a per-batch delivery failure. `MessagePoller.requeue` rewinds the persisted cursor
+so the replacement re-fetches. See AGENTS.md.
+
 ## Gotchas
 
 - Secrets (the ECDSA keypair, apiKey) live in `~/.pi/chaos-relay.json` (0600),

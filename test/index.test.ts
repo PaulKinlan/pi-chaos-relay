@@ -36,6 +36,8 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { generateKeyPair } from "../crypto.ts";
 import { RelayError } from "../relay-client.ts";
+import type { ChannelMessage, GetMessagesResult, RelayClient } from "../relay-client.ts";
+import { MessagePoller } from "../poller.ts";
 
 const OFFLINE_RELAY_URL = "http://127.0.0.1:9"; // refused instantly; keeps every connect local
 
@@ -52,7 +54,7 @@ delete process.env.CHAOS_RELAY_API_KEY;
 process.env.CHAOS_RELAY_URL = OFFLINE_RELAY_URL;
 
 const config = await import("../config.ts");
-const { default: chaosRelayExtension, toFriendly, claimProfileLock, ApprovalQueue, log, rebindLogSummary, summarizeToolCall } =
+const { default: chaosRelayExtension, toFriendly, claimProfileLock, ApprovalQueue, log, rebindLogSummary, summarizeToolCall, isStaleRuntimeError } =
   await import("../index.ts");
 
 type ExtensionApi = Parameters<typeof chaosRelayExtension>[0];
@@ -186,14 +188,30 @@ class PushWebSocket {
   onmessage: ((event: unknown) => void) | null = null;
   onerror: ((event: unknown) => void) | null = null;
   onclose: ((event: { code: number }) => void) | null = null;
-  constructor(_url: string) {
+  constructor(url: string) {
+    this.url = url;
     PushWebSocket.instances.push(this);
   }
+  url: string;
   send(): void {}
   close(): void {}
   pushFrame(data: string): void {
     this.onmessage?.({ data } as unknown as MessageEvent);
   }
+}
+
+/**
+ * The socket THIS test's extension opened. ws-client builds the URL from the
+ * profile's apiKey (`toWsUrl` puts it in `?token=`), so a still-reconnecting
+ * socket left behind by an earlier test — its backoff timer can fire between this
+ * test's `instances = []` and its `session_start` — can never be picked by
+ * accident. Using `instances[0]` made the d8e regression tests flake when the
+ * whole file ran.
+ */
+function socketForProfile(apiKey: string): PushWebSocket {
+  const socket = PushWebSocket.instances.find((s) => s.url.includes(apiKey));
+  assert.ok(socket, `no WebSocket was opened for api key ${apiKey}`);
+  return socket;
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
@@ -3359,4 +3377,436 @@ test("default writes mode: an approved bash in a channel turn taints the session
     "the text reply after an approved bash is blocked without an explicit approval",
   );
   t.mock.timers.reset();
+});
+
+// ── a replaced session runtime must not deliver, and must not eat the batch ───
+//
+// pi replaces the session runtime for /new, /resume, /fork and /reload: it emits
+// session_shutdown, disposes the session, and invalidates the WHOLE extension
+// instance, so every later `pi.*` call throws the SDK's stale-runtime error. The
+// poller has already persisted the cursor by then, so before this fix the batch
+// was both reported as "attachment delivery failed" and lost. These tests drive
+// the real extension with the SDK's own error text.
+
+/** pi's exact words once an instance is invalidated (dist/core/extensions/loader.js). */
+const STALE_RUNTIME_MESSAGE =
+  "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().";
+
+function pushMessage(socket: InstanceType<typeof PushWebSocket>, id: string, timestamp: string, content = "hi"): void {
+  socket.pushFrame(
+    JSON.stringify({
+      type: "message",
+      message: { id, channelType: "telegram", channelId: "ch-stale", from: "alice", content, timestamp },
+    }),
+  );
+}
+
+/**
+ * A client that filters like the relay's `since` cursor under the STRICT reading
+ * (only messages strictly after the cursor), which is the case the one-second
+ * rewind exists for: an inclusive cursor would have replayed the dropped message
+ * anyway, a strict one would have skipped it forever.
+ */
+function windowedClient(messages: ChannelMessage[]): { client: RelayClient; asked: Array<string | undefined> } {
+  const asked: Array<string | undefined> = [];
+  const client = {
+    async getMessages(since?: string): Promise<GetMessagesResult> {
+      asked.push(since);
+      return { messages: messages.filter((m) => !since || (m.timestamp ?? "") > since), since: "" };
+    },
+  } as unknown as RelayClient;
+  return { client, asked };
+}
+
+test("isStaleRuntimeError recognises the SDK's replacement error and nothing else", () => {
+  assert.equal(isStaleRuntimeError(new Error(STALE_RUNTIME_MESSAGE)), true);
+  assert.equal(isStaleRuntimeError(STALE_RUNTIME_MESSAGE), true, "a bare string works too");
+  // The image-rejection path must stay on its own branch: that error is a
+  // refusal to deliver THIS content, not a dead runtime.
+  assert.equal(isStaleRuntimeError(new Error("Agent is already processing")), false);
+  assert.equal(isStaleRuntimeError(new Error("active model rejected image input")), false);
+  assert.equal(isStaleRuntimeError(undefined), false);
+});
+
+test("a delivery that hits a replaced runtime stops the instance and returns the batch to the poller", async () => {
+  resetState();
+  writeProfileConfig("default", "ak_stale");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origWs = globalThis.WebSocket;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+
+  try {
+    const fake = makeFakePi();
+    let injects = 0;
+    fake.pi.sendUserMessage = () => {
+      injects += 1;
+      throw new Error(STALE_RUNTIME_MESSAGE);
+    };
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-stale", fake.notifications));
+    const socket = socketForProfile("ak_stale");
+
+    const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+    const logBefore = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+    const ts = new Date().toISOString();
+    const ts2 = new Date(Date.now() + 1000).toISOString();
+    // Two frames in one burst: the second is accepted and QUEUED behind the first
+    // before the first delivery has finished, so both are caught by the replaced
+    // runtime rather than just the one that was in flight.
+    pushMessage(socket, "m-stale-1", ts);
+    pushMessage(socket, "m-stale-2", ts2, "second");
+    // The second frame may or may not be accepted before the first delivery
+    // finishes (both are legitimate: the transport is torn down with the flag), so
+    // this waits for the outcome that matters rather than for a schedule.
+    const deferred = () => readFileSync(logPath, "utf-8").slice(logBefore.length).split("inbound delivery deferred").length - 1;
+    await waitFor(() => deferred() >= 1 && injects === 1);
+
+    // The durable log is shared across this file's tests, so only the lines this
+    // test appended are asserted on.
+    const raw = readFileSync(logPath, "utf-8").slice(logBefore.length);
+    assert.ok(raw.includes("session runtime replaced while"), `the cause is named: ${raw}`);
+    assert.ok(
+      !raw.includes("attachment delivery failed"),
+      `a replaced runtime is not an attachment failure: ${raw}`,
+    );
+
+    // The batch was handed back, not eaten: it is out of the persisted de-dup log
+    // and the persisted cursor sits before it, so the relay replays it.
+    const state = config.loadMessageState();
+    assert.ok(!state.seenIds.includes("m-stale-1"), `not marked delivered: ${JSON.stringify(state.seenIds)}`);
+    assert.ok(
+      !state.cursor || state.cursor < ts,
+      `the cursor is rewound before the undelivered message (cursor=${state.cursor}, ts=${ts})`,
+    );
+
+    // Prove the window with the relay's own semantics: a poller over this state
+    // re-fetches the message, while one over the pre-fix cursor (since = ts, what
+    // accept() persisted) does not.
+    const fresh = windowedClient([{ id: "m-stale-1", channelType: "telegram", channelId: "ch-stale", from: "alice", content: "hi", timestamp: ts }]);
+    const replay = await new MessagePoller(fresh.client, { since: state.cursor, seen: state.seenIds }).poll();
+    assert.deepEqual(replay.map((m) => m.id), ["m-stale-1"], "the replacement session re-fetches it");
+    const lost = windowedClient([{ id: "m-stale-1", channelType: "telegram", channelId: "ch-stale", from: "alice", content: "hi", timestamp: ts }]);
+    const swallowed = await new MessagePoller(lost.client, { since: ts, seen: [] }).poll();
+    assert.deepEqual(swallowed, [], "negative control: with the pre-fix cursor (since = the message itself) a strict relay skips it forever");
+
+    assert.equal(injects, 1, "only the first batch was ever offered to the agent");
+    assert.ok(deferred() >= 1, "the in-flight batch was handed back");
+    assert.deepEqual(
+      config.loadMessageState().seenIds.filter((id) => id.startsWith("m-stale-")),
+      [],
+      "no message of the dead instance is left marked delivered",
+    );
+    // The transport itself is torn down with the flag, so a LATER frame is never
+    // even consumed: accept() would persist the cursor past it, which is exactly
+    // how the message would have been lost.
+    const consumed = readFileSync(logPath, "utf-8").slice(logBefore.length).split("delivering ").length - 1;
+    pushMessage(socket, "m-stale-3", new Date(Date.now() + 2000).toISOString(), "third");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(
+      readFileSync(logPath, "utf-8").slice(logBefore.length).split("delivering ").length - 1,
+      consumed,
+      "a frame after the teardown is not consumed or announced",
+    );
+    assert.ok(
+      !config.loadMessageState().seenIds.includes("m-stale-3"),
+      "a frame after the teardown does not advance the cursor",
+    );
+
+    await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-stale", fake.notifications));
+  } finally {
+    globalThis.WebSocket = origWs;
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+  }
+});
+
+test("a live runtime still delivers, and logs no replaced-runtime warning", async () => {
+  resetState();
+  writeProfileConfig("default", "ak_live");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origWs = globalThis.WebSocket;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+
+  try {
+    const fake = makeFakePi();
+    const injected: string[] = [];
+    fake.pi.sendUserMessage = (content: unknown) => {
+      injected.push(typeof content === "string" ? content : JSON.stringify(content));
+    };
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-live", fake.notifications));
+    const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+    const before = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+
+    pushMessage(socketForProfile("ak_live"), "m-live-1", new Date().toISOString(), "hello live");
+    await waitFor(() => injected.length === 1);
+    assert.match(injected[0], /hello live/, "the live runtime delivers as before");
+
+    const after = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+    assert.ok(
+      !after.slice(before.length).includes("session runtime replaced"),
+      "the negative control logs no replacement warning",
+    );
+    assert.ok(
+      config.loadMessageState().seenIds.includes("m-live-1"),
+      "a delivered message IS marked delivered (the flag must not over-fire)",
+    );
+    // A DELIVERED batch must never be handed back at shutdown: that would deliver
+    // the message twice, which is why the in-flight set is cleared on a successful
+    // send.
+    const liveLogBefore = existsSync(logPath) ? readFileSync(logPath, "utf-8").length : 0;
+    await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-live", fake.notifications));
+    assert.ok(
+      !readFileSync(logPath, "utf-8").slice(liveLogBefore).includes("returned to the poller"),
+      "a delivered batch is not requeued at shutdown",
+    );
+    assert.ok(config.loadMessageState().seenIds.includes("m-live-1"), "and it stays delivered");
+  } finally {
+    globalThis.WebSocket = origWs;
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+  }
+});
+
+test("a push arriving after session_shutdown is not delivered and not consumed", async () => {
+  resetState();
+  writeProfileConfig("default", "ak_after");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origWs = globalThis.WebSocket;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+
+  try {
+    const fake = makeFakePi();
+    let injects = 0;
+    fake.pi.sendUserMessage = () => {
+      injects += 1;
+    };
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-after", fake.notifications));
+    const socket = socketForProfile("ak_after");
+    await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-after", fake.notifications));
+
+    // pi emits session_shutdown BEFORE invalidating the instance, so a push that
+    // is already in flight (or lands in that window) must be dropped rather than
+    // delivered into a dead runtime or consumed past the cursor.
+    const ts = new Date().toISOString();
+    pushMessage(socket, "m-after-1", ts);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    assert.equal(injects, 0, "nothing is injected after shutdown");
+    assert.ok(
+      !config.loadMessageState().seenIds.includes("m-after-1"),
+      "nothing is consumed after shutdown",
+    );
+  } finally {
+    globalThis.WebSocket = origWs;
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+  }
+});
+
+test("a delivery in flight across session_shutdown is handed back before the replacement reads state", async () => {
+  // The P1 from review round 1: requeueing only when the in-flight delivery FAILS
+  // races the replacement instance, which reads the poller state in its own
+  // session_start. For a slow attachment download the replacement usually wins, and
+  // then the rewound cursor is overwritten by the replacement's next write — the
+  // message is lost after all. session_shutdown is awaited by pi before the
+  // replacement exists, so the hand-back has to happen THERE.
+  resetState();
+  writeProfileConfig("default", "ak_inflight");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origWs = globalThis.WebSocket;
+  const origFetch = globalThis.fetch;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+
+  let releaseDownload: (() => void) | undefined;
+  let downloadStarted = false;
+  globalThis.fetch = (async (input: unknown) => {
+    const href = String(input);
+    if (!href.includes("/attachments/")) throw new Error(`unexpected fetch: ${href}`);
+    downloadStarted = true;
+    await new Promise<void>((resolve) => {
+      releaseDownload = resolve;
+    });
+    // Real PNG magic, so the hydration produces an image content part.
+    return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), {
+      status: 200,
+      headers: { "content-type": "image/png" },
+    });
+  }) as unknown as typeof fetch;
+
+  try {
+    const fake = makeFakePi();
+    let injects = 0;
+    fake.pi.sendUserMessage = () => {
+      injects += 1;
+    };
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    const ctx = makeCtx("sess-inflight", fake.notifications);
+    // An image-capable model, so the delivery takes the image content path.
+    (ctx as { model: unknown }).model = { input: ["text", "image"] };
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, ctx);
+    const socket = socketForProfile("ak_inflight");
+
+    const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+    const logBefore = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+    const ts = new Date().toISOString();
+    socket.pushFrame(
+      JSON.stringify({
+        type: "message",
+        message: {
+          id: "m-inflight",
+          channelType: "telegram",
+          channelId: "ch-inflight",
+          from: "alice",
+          content: "look at this",
+          timestamp: ts,
+          attachments: [{ id: "att-1", filename: "photo.png", mimeType: "image/png", size: 8, kind: "image" }],
+        },
+      }),
+    );
+    await waitFor(() => downloadStarted);
+    assert.equal(injects, 0, "the delivery is still hydrating the attachment");
+
+    // The runtime is replaced while the download is still in flight.
+    await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-inflight", fake.notifications));
+
+    const raw = readFileSync(logPath, "utf-8").slice(logBefore.length);
+    assert.match(
+      raw,
+      /session shutting down: 1 undelivered batch\(es\), 1 message\(s\) returned to the poller/,
+      `the hand-back is logged at shutdown: ${raw}`,
+    );
+
+    // A replacement session reading state now must find the message still pending.
+    const state = config.loadMessageState();
+    assert.ok(!state.seenIds.includes("m-inflight"), `not marked delivered: ${JSON.stringify(state.seenIds)}`);
+    const replacement = windowedClient([
+      {
+        id: "m-inflight",
+        channelType: "telegram",
+        channelId: "ch-inflight",
+        from: "alice",
+        content: "look at this",
+        timestamp: ts,
+      },
+    ]);
+    const refetched = await new MessagePoller(replacement.client, { since: state.cursor, seen: state.seenIds }).poll();
+    assert.deepEqual(refetched.map((m) => m.id), ["m-inflight"], "the replacement session re-fetches it");
+
+    // Now let the dead instance's delivery finish: it must write NOTHING (a late
+    // write would race the replacement and could land in another profile's state).
+    const statePath = config.messageStatePath();
+    const onDisk = readFileSync(statePath, "utf-8");
+    assert.ok(releaseDownload, "the download was blocked");
+    releaseDownload();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(readFileSync(statePath, "utf-8"), onDisk, "the dead instance writes no state after the hand-back");
+    assert.equal(injects, 0, "nothing is injected into the replaced runtime");
+    assert.ok(
+      !readFileSync(logPath, "utf-8").slice(logBefore.length).includes("attachment delivery failed"),
+      "and it is not reported as a per-batch delivery failure",
+    );
+  } finally {
+    globalThis.WebSocket = origWs;
+    globalThis.fetch = origFetch;
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+  }
+});
+
+test("a safety poll awaiting the relay when the session is replaced does not consume", (t) => {
+  // The WS is down, so the safety poll is the delivery path. poll() is
+  // accept(await pollRaw()): the old gate ran before the await, so a swap landing
+  // mid-poll still let accept() persist the advanced cursor from a dead instance
+  // (and then the delayed delivery requeued, writing again — the round-1 race, on
+  // a narrower path).
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  resetState();
+  writeProfileConfig("default", "ak-pollswap");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origWs = globalThis.WebSocket;
+  const origFetch = globalThis.fetch;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+
+  let releaseGetMessages: (() => void) | undefined;
+  let getMessagesStarted = false;
+  const url = "http://127.0.0.1:9";
+  globalThis.fetch = (async (input: unknown) => {
+    const href = String(input);
+    if (!href.startsWith(`${url}/messages`)) throw new Error(`unexpected fetch: ${href}`);
+    getMessagesStarted = true;
+    await new Promise<void>((resolve) => {
+      releaseGetMessages = resolve;
+    });
+    return new Response(
+      JSON.stringify({
+        messages: [
+          {
+            id: "m-pollswap",
+            channelType: "telegram",
+            channelId: "ch-pollswap",
+            from: "alice",
+            content: "polled while the session was replaced",
+            timestamp: new Date().toISOString(),
+          },
+        ],
+        since: "",
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as unknown as typeof fetch;
+
+  return (async () => {
+    try {
+      const fake = makeFakePi();
+      let injects = 0;
+      fake.pi.sendUserMessage = () => {
+        injects += 1;
+      };
+      chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+      await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-pollswap", fake.notifications));
+      const statePath = config.messageStatePath();
+      const stateBefore = existsSync(statePath) ? readFileSync(statePath, "utf-8") : "";
+
+      // Fire the safety poll; it blocks awaiting the relay.
+      t.mock.timers.tick(120_000);
+      await waitFor(() => getMessagesStarted);
+
+      // The session is replaced while that poll is still in flight.
+      await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-pollswap", fake.notifications));
+
+      assert.ok(releaseGetMessages, "getMessages was blocked");
+      releaseGetMessages();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+
+      const state = config.loadMessageState();
+      assert.ok(
+        !state.seenIds.includes("m-pollswap"),
+        `the dead instance must not consume the polled message: ${JSON.stringify(state.seenIds)}`,
+      );
+      assert.equal(
+        existsSync(statePath) ? readFileSync(statePath, "utf-8") : "",
+        stateBefore,
+        "and it must not write poller state after the swap",
+      );
+      assert.equal(injects, 0, "nothing is injected into the replaced runtime");
+    } finally {
+      globalThis.WebSocket = origWs;
+      globalThis.fetch = origFetch;
+      if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+      else process.env.CHAOS_RELAY_URL = prevUrl;
+      t.mock.timers.reset();
+    }
+  })();
 });
