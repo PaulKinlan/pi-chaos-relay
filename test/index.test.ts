@@ -4245,3 +4245,239 @@ test("the safety poll refuses a malformed message once and still delivers the va
   );
   assert.equal(sent.length, 1, "and nothing was delivered twice");
 });
+
+// --- inbound image acceptance (bead pi-chaos-relay-oap) ----------------------
+//
+// Paul's report from the hub: with v0.17.36 the agent saw "[Received 1
+// attachment.]" instead of the image, and after a session replacement inbound
+// images died while text still arrived. These tests drive the real inbound path —
+// a relay-pushed frame for an EMAIL channel, a REAL local HTTP relay serving the
+// attachment, real PNG bytes, the real magic-byte hydration — and assert what the
+// agent is actually handed, including through a replacement session.
+
+/** A genuine 1x1 PNG: the delivery must carry exactly these bytes, not a note. */
+const ONE_PIXEL_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==",
+  "base64",
+);
+const ONE_PIXEL_PNG_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+const EMAIL_IMAGE_MESSAGE_ID = "m-email-image";
+
+interface ImageRelay {
+  url: string;
+  attachmentRequests: () => number;
+  blockDownloads: () => void;
+  waitForDownloadStart: () => Promise<void>;
+  releaseDownload: () => void;
+  close: () => Promise<void>;
+}
+
+/** A real relay on 127.0.0.1: an email message with one image attachment. */
+async function startImageRelay(): Promise<ImageRelay> {
+  let requests = 0;
+  let started = false;
+  // Only the FIRST download is held open (the mid-flight replacement scenario);
+  // the replacement session's own download must be answered normally.
+  let blockNext = 0;
+  let release: (() => void) | undefined;
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const sendJson = (body: unknown) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    if (url.pathname.endsWith("/attachments/att-1")) {
+      requests += 1;
+      started = true;
+      const respond = () => {
+        res.writeHead(200, { "content-type": "image/png", "content-length": String(ONE_PIXEL_PNG.length) });
+        res.end(ONE_PIXEL_PNG);
+      };
+      // Held open on request, so a test can replace the session mid-download.
+      if (blockNext > 0) {
+        blockNext -= 1;
+        release = respond;
+      } else {
+        respond();
+      }
+      return;
+    }
+    if (url.pathname === "/messages") {
+      return sendJson({
+        messages: [emailImageMessage("2026-10-10T00:00:01.000Z")],
+        since: "2026-10-10T00:00:01.000Z",
+      });
+    }
+    if (url.pathname === "/health") return sendJson({ status: "ok" });
+    return sendJson({});
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as { port: number };
+  return {
+    url: `http://127.0.0.1:${port}`,
+    attachmentRequests: () => requests,
+    blockDownloads: () => {
+      blockNext = 1;
+    },
+    waitForDownloadStart: () => waitFor(() => started),
+    releaseDownload: () => release?.(),
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+/** The email the relay pushes: body text plus one PNG attachment. */
+function emailImageMessage(timestamp: string, id = EMAIL_IMAGE_MESSAGE_ID) {
+  return {
+    id,
+    channelType: "email",
+    channelId: "inbox-1",
+    from: "alice@example.com",
+    content: "Here is the photo you asked for.",
+    timestamp,
+    attachments: [
+      { id: "att-1", filename: "photo.png", mimeType: "image/png", size: ONE_PIXEL_PNG.length, kind: "image" },
+    ],
+  };
+}
+
+function pushEmailImage(
+  socket: InstanceType<typeof PushWebSocket>,
+  id: string,
+  timestamp: string,
+): void {
+  socket.pushFrame(JSON.stringify({ type: "message", message: emailImageMessage(timestamp, id) }));
+}
+
+/** Every send this instance made, with the content parts pulled out. */
+function imagePartsOf(sends: unknown[]): Array<{ type: string; mimeType?: string; data?: string; text?: string }> {
+  const out: Array<{ type: string; mimeType?: string; data?: string; text?: string }> = [];
+  for (const send of sends) {
+    if (Array.isArray(send)) {
+      for (const part of send) out.push(part as { type: string });
+    } else if (typeof send === "object" && send !== null) {
+      out.push(send as { type: string });
+    }
+  }
+  return out;
+}
+
+test("an emailed image reaches the agent as image content, not as an attachment note", async (t) => {
+  resetState();
+  const relay = await startImageRelay();
+  t.after(() => relay.close());
+  writeProfileConfig("default", "ak_img");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  const origWs = globalThis.WebSocket;
+  process.env.CHAOS_RELAY_URL = relay.url;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.WebSocket = origWs;
+  });
+
+  const fake = makeFakePi();
+  const sends: unknown[] = [];
+  fake.pi.sendUserMessage = (content: unknown) => {
+    sends.push(content);
+  };
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  const ctx = makeCtx("sess-image", fake.notifications);
+  // An image-capable model: this is the configuration where the agent should get
+  // the picture itself rather than a path or a placeholder.
+  (ctx as { model: unknown }).model = { input: ["text", "image"] };
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, ctx);
+
+  pushEmailImage(socketForProfile("ak_img"), "m-img-1", "2026-10-10T00:00:01.000Z");
+  await waitFor(() => sends.length === 1);
+
+  const parts = imagePartsOf(sends);
+  const image = parts.find((p) => p.type === "image");
+  assert.ok(
+    image,
+    `the agent received image content, not only text: ${JSON.stringify(parts.map((p) => p.type))}`,
+  );
+  assert.equal(image.mimeType, "image/png");
+  assert.equal(image.data, ONE_PIXEL_PNG_B64, "the delivered bytes are the bytes the relay served");
+  const text = parts.find((p) => p.type === "text")?.text ?? "";
+  assert.match(text, /Here is the photo you asked for\./, "the email body is still there");
+  assert.ok(
+    !text.includes("[Received 1 attachment.]"),
+    `no attachment placeholder instead of the image: ${text}`,
+  );
+  assert.equal(relay.attachmentRequests(), 1, "the attachment was fetched from the relay over HTTP");
+});
+
+test("a replacement session receives the emailed image after the first session is replaced mid-download", async (t) => {
+  resetState();
+  const relay = await startImageRelay();
+  t.after(() => relay.close());
+  relay.blockDownloads(); // the first instance hangs in hydration
+  writeProfileConfig("default", "ak_img_replace");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  const origWs = globalThis.WebSocket;
+  process.env.CHAOS_RELAY_URL = relay.url;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.WebSocket = origWs;
+  });
+
+  const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+  const logBefore = existsSync(logPath) ? readFileSync(logPath, "utf-8").length : 0;
+
+  // Instance 1: the image frame is accepted and the download starts.
+  const fake1 = makeFakePi();
+  const sends1: unknown[] = [];
+  fake1.pi.sendUserMessage = (content: unknown) => {
+    sends1.push(content);
+  };
+  chaosRelayExtension(fake1.pi as unknown as ExtensionApi);
+  const ctx1 = makeCtx("sess-image-1", fake1.notifications);
+  (ctx1 as { model: unknown }).model = { input: ["text", "image"] };
+  await callHandler(fake1.handlers, "session_start", { reason: "startup" }, ctx1);
+  pushEmailImage(socketForProfile("ak_img_replace"), "m-img-replace", "2026-10-10T00:00:02.000Z");
+  await relay.waitForDownloadStart();
+
+  // pi awaits session_shutdown before the replacement exists: the batch must be
+  // handed back HERE, or the replacement resumes past it and the image is gone.
+  await callHandler(fake1.handlers, "session_shutdown", {}, ctx1);
+  relay.releaseDownload(); // the first download finishes, too late to be delivered
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  // Instance 2, the replacement: the relay replays the message on the new socket
+  // (the on-connect lookback), and the hand-back left it un-seen.
+  const fake2 = makeFakePi();
+  const sends2: unknown[] = [];
+  fake2.pi.sendUserMessage = (content: unknown) => {
+    sends2.push(content);
+  };
+  chaosRelayExtension(fake2.pi as unknown as ExtensionApi);
+  const ctx2 = makeCtx("sess-image-2", fake2.notifications);
+  (ctx2 as { model: unknown }).model = { input: ["text", "image"] };
+  await callHandler(fake2.handlers, "session_start", { reason: "startup" }, ctx2);
+  const socket2 = PushWebSocket.instances.at(-1)!;
+  pushEmailImage(socket2, "m-img-replace", "2026-10-10T00:00:02.000Z");
+  await waitFor(() => sends2.length === 1);
+
+  const raw = readFileSync(logPath, "utf-8").slice(logBefore);
+  assert.equal(sends1.length, 0, `the replaced instance delivered nothing: ${JSON.stringify(sends1)}`);
+  assert.match(
+    raw,
+    /session shutting down: 1 undelivered batch\(es\), 1 message\(s\) returned to the poller/,
+    `the batch was handed back: ${raw}`,
+  );
+  const parts = imagePartsOf(sends2);
+  const image = parts.find((p) => p.type === "image");
+  assert.ok(image, `the replacement received image content: ${JSON.stringify(parts.map((p) => p.type))}`);
+  assert.equal(image.data, ONE_PIXEL_PNG_B64, "with the real bytes, re-downloaded by the replacement");
+  assert.equal(
+    relay.attachmentRequests(),
+    2,
+    "the replacement re-fetched the attachment: the image was DELAYED, not dropped",
+  );
+});
