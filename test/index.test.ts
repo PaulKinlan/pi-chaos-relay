@@ -4032,3 +4032,120 @@ test("a refused env URL still falls through to a valid saved relay", async (t) =
     `the refused env host is never dialed: ${PushWebSocket.instances.map((s) => s.url).join(", ")}`,
   );
 });
+
+// --- review round 1 (8qv): the fallback and direct-client paths -------------
+//
+// isValidRelayUrl refuses a plaintext external URL, but resolveConfig then falls
+// back to DEFAULT_RELAY_URL. Every path that could build a client from that
+// fallback has to be shut, or a saved bearer key travels to a relay the operator
+// never configured.
+
+test("a malformed env URL plus a plaintext saved URL still refuses the fallback relay", async (t) => {
+  resetState();
+  // The combination the review found: the env value is invalid for an unrelated
+  // reason, so it is not itself "insecure" — but the SAVED url is.
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://192.168.1.5:8787", apiKey: "ak_saved_plain" }) + "\n",
+  );
+  const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+  const logBefore = existsSync(logPath) ? readFileSync(logPath, "utf-8").length : 0;
+  await withRelayEnv(t, { url: "not-a-url" }, "sess-malformed-env-plain-saved", async (fake) => {
+    await callHandler(
+      fake.handlers,
+      "session_start",
+      { reason: "startup" },
+      makeCtx("sess-malformed-env-plain-saved", fake.notifications),
+    );
+  });
+
+  assert.equal(PushWebSocket.instances.length, 0, "no socket is opened");
+  const raw = readFileSync(logPath, "utf-8").slice(logBefore);
+  assert.match(raw, /the saved relay URL is refused/, `the refusal names the saved URL: ${raw}`);
+  assert.ok(
+    !raw.includes("connecting to relay") || !raw.includes("chaos-relay.com"),
+    `the default relay is never dialed with the saved key: ${raw}`,
+  );
+});
+
+test("status does not send the saved key to the fallback relay", async (t) => {
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://192.168.1.5:8787", apiKey: "ak_status_plain" }) + "\n",
+  );
+  const output = await withRelayEnv(t, {}, "sess-status-refused", async (fake) => {
+    const command = fake.commands.get("chaos-relay");
+    assert.ok(command, "extension registers the /chaos-relay command");
+    // The reachability + listChannels calls belong to this command, and
+    // listChannels() is AUTHENTICATED: a fallback client would send the key to
+    // chaos-relay.com. blockNonLoopbackFetch (installed by withRelayEnv) would
+    // reject that fetch, so this call resolving at all is part of the assertion.
+    await command.handler("status", makeCtx("sess-status-refused", fake.notifications));
+    return fake.notifications.map((n) => n.message).join("\n");
+  });
+
+  assert.match(output, /refused/, `status reports the refusal: ${output}`);
+  assert.match(
+    output,
+    /http:\/\/192\.168\.1\.5:8787/,
+    `and names the refused URL (origin only): ${output}`,
+  );
+  // No live calls: a fallback client would have produced these from a host that
+  // never received the request (or, unguarded, from chaos-relay.com WITH the key).
+  assert.ok(!/relay health:/.test(output), `status made no health call: ${output}`);
+  assert.ok(!/relay channels:/.test(output), `status made no authenticated channel call: ${output}`);
+  assert.match(output, /not contacting https:\/\/chaos-relay\.com/, `and says so: ${output}`);
+});
+
+test("a bound opted-in plaintext session still warns on connect", async (t) => {
+  resetState();
+  // Bound (apiKey present) + opt-in set: the client is cached, so a warning that
+  // only lived in the auto-provisioning path would never fire.
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://192.168.1.5:8787", apiKey: "ak_bound_optin" }) + "\n",
+  );
+  const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+  const logBefore = existsSync(logPath) ? readFileSync(logPath, "utf-8").length : 0;
+  await withRelayEnv(
+    t,
+    { allowInsecure: "1" },
+    "sess-bound-optin",
+    async (fake) => {
+      await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-bound-optin", fake.notifications));
+    },
+  );
+  const raw = readFileSync(logPath, "utf-8").slice(logBefore);
+  assert.match(
+    raw,
+    /reached over plaintext http:\/\/ because CHAOS_RELAY_ALLOW_INSECURE_HTTP is set/,
+    `the opted-in connect is called out: ${raw}`,
+  );
+  assert.ok(PushWebSocket.instances.length >= 1, "and the opted-in plaintext relay is still connected");
+});
+
+test("doctor reports a refused saved URL instead of a green URL line", async (t) => {
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://192.168.1.5:8787", apiKey: "ak_doctor_plain" }) + "\n",
+  );
+  const output = await withRelayEnv(t, {}, "sess-doctor-refused", async (fake) => {
+    const command = fake.commands.get("chaos-relay");
+    assert.ok(command, "extension registers the /chaos-relay command");
+    await command.handler("doctor", makeCtx("sess-doctor-refused", fake.notifications));
+    return fake.notifications.map((n) => n.message).join("\n");
+  });
+
+  assert.match(
+    output,
+    /refused=http:\/\/192\.168\.1\.5:8787 \(plaintext outside loopback\)/,
+    `the refused candidate is reported: ${output}`,
+  );
+  assert.match(output, /CHAOS_RELAY_ALLOW_INSECURE_HTTP=1/, `with the way out: ${output}`);
+  assert.ok(
+    !/relay transport sends the API key in plaintext\n[^]*?ok/.test(output),
+    `a refused URL is not reported as an in-use plaintext transport: ${output}`,
+  );
+});

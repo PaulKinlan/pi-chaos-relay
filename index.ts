@@ -314,6 +314,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   /** The plaintext-refusal warning is emitted once per instance (ensureClient runs
    *  on every connect attempt, and repeating it would bury the log). */
   let warnedPlaintextRefusal = false;
+  /** Likewise for the "this connection is plaintext because of the opt-in" warning. */
+  let warnedInsecureRelay = false;
   let cfg: ResolvedConfig = resolveConfig();
 
   // Profile/session binding. `currentProfile` is the profile this process is
@@ -537,15 +539,49 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   function refusedPlaintextRelayUrl(): string | undefined {
     const envRaw = (process.env.CHAOS_RELAY_URL ?? "").trim();
     const persisted = loadPersisted();
+    const persistedInsecure =
+      typeof persisted.relayUrl === "string" && isInsecureRelayUrl(persisted.relayUrl);
     const persistedValid = isValidRelayUrl(persisted.relayUrl ?? "");
+    // A VALID configured candidate means nothing is being refused: the opt-in (or a
+    // loopback host) makes even a plaintext URL valid, and an https env URL simply
+    // wins over a refused saved one.
+    if (envRaw !== "" && isValidRelayUrl(envRaw)) return undefined;
     if (envRaw !== "") {
       // A refused env value is only fatal when nothing valid remains: with a valid
       // saved URL the documented behaviour is to warn and use that one.
-      return isInsecureRelayUrl(envRaw) && !persistedValid ? envRaw : undefined;
+      if (isInsecureRelayUrl(envRaw)) return persistedValid ? undefined : envRaw;
+      // An env value that is invalid for some OTHER reason (a typo, a pasted
+      // command) does not make a refused saved URL acceptable: resolveConfig would
+      // skip both and land on the default relay with the saved apiKey.
+      if (!persistedValid && persistedInsecure) return persisted.relayUrl as string;
+      return undefined;
     }
-    return typeof persisted.relayUrl === "string" && isInsecureRelayUrl(persisted.relayUrl)
-      ? persisted.relayUrl
-      : undefined;
+    if (persistedValid) return undefined;
+    return persistedInsecure ? (persisted.relayUrl as string) : undefined;
+  }
+
+  /**
+   * Refuse to use the resolved relay when a configured plaintext URL was refused.
+   * Every path that builds a client must call this first: resolveConfig silently
+   * falls back to DEFAULT_RELAY_URL, and a fallback client would carry the saved
+   * bearer key to a host the operator never configured.
+   */
+  function blockedByPlaintextRefusal(): boolean {
+    if (!refusedPlaintextRelayUrl()) return false;
+    if (!warnedPlaintextRefusal) {
+      warnedPlaintextRefusal = true;
+      log(`WARN: ${insecurePersistedRefusal()}`);
+    }
+    return true;
+  }
+
+  /** The same warning the auto-provisioning path gives, for a connection that is
+   *  only possible because the opt-in is set. Logged once per instance: a bound
+   *  session connects through a cached client and would otherwise never say it. */
+  function warnIfConnectingInsecurely(relayUrl: string): void {
+    if (warnedInsecureRelay || !isInsecureRelayUrl(relayUrl)) return;
+    warnedInsecureRelay = true;
+    log(`WARN: ${insecureRelayWarning(relayUrl)}`);
   }
 
   function ensureClient(): RelayClient | undefined {
@@ -554,15 +590,12 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // for a BOUND session would silently re-point it — and its bearer API key — at
     // a relay the operator never configured. Fail closed instead, with the specific
     // reason (the doctor reports the same condition).
-    if (refusedPlaintextRelayUrl()) {
-      if (!warnedPlaintextRefusal) {
-        warnedPlaintextRefusal = true;
-        log(`WARN: ${insecurePersistedRefusal()}`);
-      }
+    if (blockedByPlaintextRefusal()) {
       client = undefined;
       poller = undefined;
       return undefined;
     }
+    warnIfConnectingInsecurely(cfg.relayUrl);
     if (!isConfigured(cfg)) {
       client = undefined;
       poller = undefined;
@@ -2463,7 +2496,18 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       lines.push(`  - local ${ch.type} ${ch.channelId}${label ? ` (${label})` : ""}`);
     }
     // Live reachability + callable channel details from the relay, if configured.
-    if (current.apiKey) {
+    // This builds its own client (status must work before any session connects), so
+    // it needs the plaintext refusal explicitly: `current.relayUrl` is the resolved
+    // fallback when a configured plaintext URL was refused, and listChannels()
+    // would send the saved bearer key there.
+    const refusedUrl = refusedPlaintextRelayUrl();
+    if (current.apiKey && refusedUrl) {
+      lines.push(
+        `relay URL:     refused — ${insecureUrlReason(refusedUrl)} ` +
+          `(not contacting ${safeUrlOrigin(current.relayUrl)})`,
+      );
+    } else if (current.apiKey) {
+      warnIfConnectingInsecurely(current.relayUrl);
       try {
         const c = new RelayClient({
           relayUrl: current.relayUrl,
@@ -2594,7 +2638,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // 2. relayUrl validity — the exact failure mode this doctor targets.
     const envUrl = process.env.CHAOS_RELAY_URL;
     const effectiveUrl = resolveConfig().relayUrl;
-    const urlOk = isValidRelayUrl(effectiveUrl);
+    // A refused plaintext URL resolves to the DEFAULT relay, so checking only the
+    // effective value would report a green URL line for a config that is being
+    // refused (and silently serving the default).
+    const refusedUrl = refusedPlaintextRelayUrl();
+    const urlOk = isValidRelayUrl(effectiveUrl) && !refusedUrl;
     const persistedUrl = persisted.relayUrl;
     // Origin-only display: the raw URL values can carry credentials in userinfo
     // or be a pasted secret, so never echo them (safeUrlOrigin strips userinfo
@@ -2603,6 +2651,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       `effective=${safeUrlOrigin(effectiveUrl)}`,
       envUrl ? `env=${safeUrlOrigin(envUrl)}` : null,
       persistedUrl ? `file=${safeUrlOrigin(persistedUrl)}` : null,
+      refusedUrl ? `refused=${safeUrlOrigin(refusedUrl)} (plaintext outside loopback)` : null,
     ].filter(Boolean).join(", ");
     checks.push({
       ok: urlOk,
@@ -2610,8 +2659,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       detail: urlDetail,
       fix: urlOk
         ? undefined
-        : "Run /chaos-relay reset to clear the bad URL, then /chaos-relay setup. " +
-          "Anonymous http:// is refused unless the host is loopback.",
+        : refusedUrl
+          ? "Use an https:// relay (or http:// on a loopback host), or set " +
+            "CHAOS_RELAY_ALLOW_INSECURE_HTTP=1 to accept plaintext deliberately."
+          : "Run /chaos-relay reset to clear the bad URL, then /chaos-relay setup. " +
+            "Anonymous http:// is refused unless the host is loopback.",
     });
     // A plaintext external URL is valid only because the opt-in is set; a security
     // doctor should say so rather than reporting a green URL line.
