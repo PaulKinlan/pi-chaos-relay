@@ -136,3 +136,14 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
   block the agent (see `DEFAULT_TIMEOUT_MS` in `relay-client.ts`).
 - The canonical relay server lives in `~/chaos/packages/server`; match its
   API spec (`~/chaos/docs/relay-api-spec.md`).
+- Background delivery is bound to ONE session runtime. When pi replaces the
+  session (`/new`, `/resume`, `/fork`, `/reload`) it invalidates the whole
+  extension instance, so every later `pi.*` call throws the "stale after session
+  replacement" error and there is no ctx to re-arm with (an event handler's
+  `ExtensionContext` has no `sendUserMessage`; only `ExtensionAPI` does). So
+  `deliverToAgent` treats that error as "this runtime is gone": it stops the
+  transport, hands the already-accepted batch BACK to the poller
+  (`MessagePoller.requeue` — without it the persisted cursor has already moved
+  past those messages, so the replacement session could never fetch them), and
+  never reports it as a per-batch delivery failure. The replacement instance arms
+  itself in its own `session_start`.

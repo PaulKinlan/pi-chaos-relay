@@ -54,6 +54,17 @@ code doesn't consume. See AGENTS.md for the checklist.
 `CLAUDE.md` mirrors the load-bearing rules from `AGENTS.md`; a rule change must
 update both together.
 
+## Delivery is bound to one session runtime
+
+When pi replaces the session (`/new`, `/resume`, `/fork`, `/reload`) it
+invalidates the whole extension instance, so every later `pi.*` call throws the
+"stale after session replacement" error, and an event handler's `ExtensionContext`
+has no `sendUserMessage` to re-arm with. `deliverToAgent` must therefore treat
+that error as "this runtime is gone": stop the transport, hand the accepted batch
+back to the poller (`MessagePoller.requeue`, which rewinds the persisted cursor so
+the replacement session re-fetches it), and never report it as a per-batch
+delivery failure. See AGENTS.md.
+
 ## Gotchas
 
 - Secrets (the ECDSA keypair, apiKey) live in `~/.pi/chaos-relay.json` (0600),

@@ -339,3 +339,73 @@ test("formatMessagesForAgent resolves a Telegram-shaped nested reply_to_message"
   ]);
   assert.match(out, /\[In reply to message id="41": "Drop the booking\?"\]/);
 });
+
+// ── requeue: a batch that was accepted but never delivered goes BACK ──────────
+//
+// Regression for pi-chaos-relay-d8e. accept() persists the cursor with the batch,
+// so when the session runtime is replaced mid-delivery the message would be
+// skipped forever by the replacement session. requeue() re-opens the window.
+
+test("requeue un-sees a batch, rewinds the cursor before it, and persists that", () => {
+  const persisted: PollerPersistState[] = [];
+  const poller = new MessagePoller(stubClient([]), { onPersist: (s) => persisted.push(s) });
+  const batch = [msg("a"), { ...msg("b"), timestamp: "2026-01-01T00:05:00Z" }];
+  assert.equal(poller.accept(batch).length, 2);
+  assert.equal(poller.cursor, "2026-01-01T00:05:00Z");
+
+  const back = poller.requeue(batch);
+
+  assert.deepEqual(back.map((m) => m.id), ["a", "b"]);
+  assert.equal(
+    poller.cursor,
+    new Date(Date.parse("2026-01-01T00:00:00Z") - 1000).toISOString(),
+    "the cursor lands one second before the batch's earliest message, so the relay replays it under either `since` convention",
+  );
+  assert.deepEqual(persisted.at(-1), { since: poller.cursor, seen: [] }, "the rolled-back state is persisted");
+  // The batch is fresh again for the replacement session's poller.
+  assert.deepEqual(poller.accept(batch).map((m) => m.id), ["a", "b"]);
+});
+
+test("requeue is a no-op for a batch this poller never accepted", () => {
+  const persisted: PollerPersistState[] = [];
+  const poller = new MessagePoller(stubClient([]), { onPersist: (s) => persisted.push(s) });
+  poller.accept([msg("known")]);
+  const cursor = poller.cursor;
+  const writes = persisted.length;
+
+  assert.deepEqual(poller.requeue([msg("never-seen")]), []);
+  assert.equal(poller.cursor, cursor, "an unknown batch does not move the cursor");
+  assert.equal(persisted.length, writes, "…and does not write");
+
+  assert.equal(poller.requeue([msg("known")]).length, 1);
+  assert.deepEqual(poller.requeue([msg("known")]), [], "a batch is only re-opened once");
+});
+
+test("requeue only ever moves the cursor backwards", () => {
+  const poller = new MessagePoller(stubClient([]));
+  const older = [{ ...msg("old"), timestamp: "2026-01-01T00:00:00Z" }];
+  const newer = [{ ...msg("new"), timestamp: "2026-01-01T01:00:00Z" }];
+  poller.accept(older);
+  poller.accept(newer);
+  assert.equal(poller.cursor, "2026-01-01T01:00:00Z");
+
+  poller.requeue(older);
+  const rewound = new Date(Date.parse("2026-01-01T00:00:00Z") - 1000).toISOString();
+  assert.equal(poller.cursor, rewound, "re-opening an older batch rewinds before it");
+  // Re-opening the NEWER batch must not move the cursor forward past the older
+  // message that is still pending.
+  poller.requeue(newer);
+  assert.equal(poller.cursor, rewound, "a second requeue never moves the cursor forward");
+});
+
+test("requeue handles a batch with no usable timestamp", () => {
+  const poller = new MessagePoller(stubClient([]));
+  const noTimestamp = { ...msg("y"), timestamp: undefined } as unknown as ChannelMessage;
+  assert.equal(poller.accept([noTimestamp]).length, 1);
+  assert.equal(poller.requeue([noTimestamp]).length, 1, "it is still un-seen");
+  assert.equal(poller.cursor, undefined, "…and the cursor is left alone");
+  // A message without an id is never de-duped by accept(), so there is nothing to
+  // re-open.
+  const noId = { ...msg(""), timestamp: "2026-01-01T00:00:00Z" } as ChannelMessage;
+  assert.deepEqual(poller.requeue([noId]), []);
+});
