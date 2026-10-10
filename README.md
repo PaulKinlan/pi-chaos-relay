@@ -459,6 +459,39 @@ Terminal/local turns are never gated.
 4. Done. Email text and attachments sent to the inbound address reach the agent;
    replies go back to the sender via `relay_reply`.
 
+### What happens to a broken or oversized message
+
+The relay forwards channel payloads as-is, so every inbound message is checked
+before the agent sees it. A message that is missing a required field, carries a
+field of the wrong type, or has a timestamp that is not ISO-8601 (which would
+corrupt the persisted resume cursor) is **dropped and reported** in the log as
+`WARN: dropped an inbound message: <why>`. It is never half-delivered, and
+because its id is remembered the replay that follows (the relay resends until
+the cursor passes it) is silent and never reaches the agent.
+
+Reporting is capped so a misbehaving relay cannot fill the log: the first three
+occurrences of each *kind* of problem are logged, the fourth adds "further
+occurrences of this are not logged", and after that the kind is silent for the
+rest of the session. A different kind still reports. If you are chasing a
+message that never arrived, that message's kind may already have used its three
+lines — the relay's own logs are then the next place to look.
+
+A message that is merely too big is delivered in a repaired form, with a warning
+in the log **and** a note in the delivered content, because a repair the agent
+cannot see is a repair it cannot ask you about:
+
+- content over **256 KiB** is truncated and ends with
+  `[chaos-relay: content truncated at 262144 bytes, from <n> bytes]`;
+- only the first **3** attachments are fetched, and unusable or over-limit ones
+  add `[chaos-relay: <n> attachments not delivered (…)` to the message;
+- an inbound WebSocket frame over **5 MiB** is dropped before it is parsed — the
+  same bound the HTTP transport already applies to a whole `/messages` response,
+  so the push path never refuses something the poll path would have delivered.
+
+A missing timestamp is delivered, but it cannot advance the resume cursor, and
+the cursor is compared as an instant (so a timestamp with fractional seconds or a
+UTC offset orders correctly).
+
 ## How inbound delivery works
 
 While a pi session is active, the extension holds a **WebSocket** to the relay

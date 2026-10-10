@@ -9,6 +9,8 @@
 
 import type { ChannelMessage, RelayClient, ReplyReference } from "./relay-client.ts";
 import { resolveReplyTo } from "./relay-client.ts";
+import type { InboundIssue } from "./inbound-message.ts";
+import { inboundMessageId, parseInboundMessage } from "./inbound-message.ts";
 import { randomBytes } from "node:crypto";
 
 const SEEN_MAX = 1000; // hard cap before trimming
@@ -25,6 +27,7 @@ export class MessagePoller {
   private seen: Set<string>;
   private readonly client: RelayClient;
   private readonly onPersist?: (state: PollerPersistState) => void;
+  private readonly onInvalid?: (issue: InboundIssue) => void;
 
   constructor(
     client: RelayClient,
@@ -41,12 +44,20 @@ export class MessagePoller {
       onPersist?: (state: PollerPersistState) => void;
       /** Previously-seen message ids, persisted so dedup survives a restart. */
       seen?: string[];
+      /**
+       * Report a refused or repaired inbound message. This is the one point both
+       * transports share, so it is where the relay's payloads are shape-checked
+       * (see `inbound-message.ts`). The issue names the field, clips anything the
+       * relay chose, and carries a stable `code` the caller rate-limits on.
+       */
+      onInvalid?: (issue: InboundIssue) => void;
     } = {},
   ) {
     this.client = client;
     // Resume from a persisted cursor so a restart doesn't re-read the backlog.
     this.since = opts.since;
     this.onPersist = opts.onPersist;
+    this.onInvalid = opts.onInvalid;
     // Restore the persisted de-dup log so the relay's on-connect replay and any
     // catch-up poll don't re-process messages already delivered before restart.
     this.seen = new Set(opts.seen ?? []);
@@ -96,16 +107,70 @@ export class MessagePoller {
    * same de-dup set, so a message delivered by push and then again by a
    * catch-up poll is only surfaced once. Returns the fresh ones.
    */
-  accept(messages: ChannelMessage[]): ChannelMessage[] {
+  accept(messages: readonly unknown[]): ChannelMessage[] {
     const fresh: ChannelMessage[] = [];
-    for (const msg of messages) {
-      if (!msg?.id || this.seen.has(msg.id)) continue;
+    let rememberedRejected = false;
+    // The relay's own envelope is untrusted too: a non-array `messages` would
+    // otherwise be iterated (a string, character by character) and reported as a
+    // pile of unrelated refusals.
+    if (!Array.isArray(messages)) {
+      this.onInvalid?.({
+        code: "messages-not-array",
+        detail: "dropped a poll result: messages is not an array",
+      });
+      return fresh;
+    }
+    for (const candidate of messages) {
+      // The relay forwards channel payloads as-is over both transports, so the
+      // declared type is a claim, not a fact: validate before anything here or
+      // downstream reads a field (a non-array `attachments` used to reach
+      // Array.prototype.slice, and a non-ISO `timestamp` used to poison the
+      // persisted cursor below).
+      const parsed = parseInboundMessage(candidate);
+      if (!parsed.ok) {
+        // Remember its id so a relay replay does not re-report it forever: the
+        // catch-up poll returns the same message until the cursor passes it, and
+        // the cursor must NOT advance past a message that was never delivered.
+        // The id is checked BEFORE reporting, so the replay is silent too — the
+        // seen set is remembered across restarts, which is what makes that hold
+        // beyond this process. A frame with no usable id cannot be remembered;
+        // the caller's log limiter bounds those.
+        const rejectedId = inboundMessageId(candidate);
+        if (rejectedId) {
+          if (this.seen.has(rejectedId)) continue;
+          this.seen.add(rejectedId);
+          rememberedRejected = true;
+        }
+        this.onInvalid?.({
+          code: parsed.code,
+          detail: `dropped an inbound message: ${parsed.detail}`,
+        });
+        continue;
+      }
+      const msg = parsed.message;
+      // Dedup BEFORE reporting repairs: a replayed batch (the relay resends until
+      // the cursor passes it) must not repeat the repair warnings either.
+      if (this.seen.has(msg.id)) continue;
       this.seen.add(msg.id);
+      for (const warning of parsed.warnings) {
+        this.onInvalid?.({
+          code: warning.code,
+          detail: `repaired an inbound message: ${warning.detail}`,
+        });
+      }
       fresh.push(msg);
-      // Advance the resume cursor to the latest delivered timestamp. ISO-8601
-      // strings compare chronologically, so a string compare is sufficient.
-      if (msg.timestamp && (!this.since || msg.timestamp > this.since)) {
-        this.since = msg.timestamp;
+      // Advance the resume cursor to the latest delivered timestamp. Compare
+      // INSTANTS, not strings: ISO-8601 with a zone is not string-sortable
+      // (`…00.5Z` sorts before `…00Z`, and an offset such as `+05:00` sorts after
+      // a later `Z` timestamp), so a string compare can leave the cursor behind
+      // the newest delivery. The stored value stays verbatim, so what the relay
+      // receives as `since` is still one of its own timestamps.
+      if (msg.timestamp) {
+        const at = Date.parse(msg.timestamp);
+        const current = this.since === undefined ? Number.NaN : Date.parse(this.since);
+        if (!Number.isFinite(current) || (Number.isFinite(at) && at > current)) {
+          this.since = msg.timestamp;
+        }
       }
     }
     // Keep the dedup set from growing without bound.
@@ -119,7 +184,10 @@ export class MessagePoller {
     // batch that advanced the cursor always delivered a fresh message, so
     // `fresh.length > 0` subsumes both persist triggers the old separate
     // callbacks (cursor-advanced, seen-grew) covered.
-    if (fresh.length > 0) {
+    // A batch that only remembered a rejected id still changed the de-dup log,
+    // and persisting it is what stops the next process from re-reporting the
+    // same frame after the relay replays it.
+    if (fresh.length > 0 || rememberedRejected) {
       this.onPersist?.({ since: this.since, seen: Array.from(this.seen) });
     }
     return fresh;

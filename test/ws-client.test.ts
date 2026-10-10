@@ -21,6 +21,8 @@ import assert from "node:assert/strict";
 import { RelayWebSocket, toWsUrl } from "../ws-client.ts";
 import type { RelayWebSocketOptions } from "../ws-client.ts";
 import type { ChannelMessage } from "../relay-client.ts";
+import { MAX_INBOUND_CONTENT_BYTES, MAX_INBOUND_FRAME_BYTES } from "../inbound-message.ts";
+import { MessagePoller } from "../poller.ts";
 
 /** A scripted stand-in for the WebSocket the transport would get from the host. */
 class FakeWebSocket {
@@ -1127,5 +1129,135 @@ test("an unexpected close rejects in-flight replies immediately", async () => {
   const reply = outcome(h.ws.reply(replyPayload, 5_000));
   socket.drop(1006);
   assert.equal(await reply, "rejected WebSocket closed");
+  h.ws.stop();
+});
+
+// --- handleFrame: the frame bound and the message shape (bead 4rr) -----------
+//
+// The raw frame is bounded before JSON.parse, and a pushed message is shape-checked
+// here because it is the only input that reaches onMessage without a poll.
+
+test("an oversized frame is dropped before it is parsed", () => {
+  const h = harness();
+  h.ws.start();
+  const socket = h.last();
+  socket.open();
+  const oversized = JSON.stringify({
+    type: "message",
+    message: { ...msg("m-big"), content: "x".repeat(MAX_INBOUND_FRAME_BYTES + 100) },
+  });
+  assert.ok(oversized.length > MAX_INBOUND_FRAME_BYTES, "the fixture is over the limit");
+  assert.doesNotThrow(() => socket.deliver(oversized));
+  assert.deepEqual(h.delivered, []);
+  assert.match(h.logs.join("\n"), /dropping relay frame: \d+ bytes exceeds the \d+ byte limit/);
+  h.ws.stop();
+});
+
+test("a frame whose message has a malformed field is dropped with the reason", () => {
+  const h = harness();
+  h.ws.start();
+  const socket = h.last();
+  socket.open();
+  for (const [broken, expected] of [
+    [{ ...msg("m1"), attachments: "seven" }, /attachments is not an array/],
+    [{ ...msg("m2"), timestamp: "2026-01-01" }, /timestamp is not an ISO-8601 timestamp/],
+    [{ content: "no id" }, /has no usable id/],
+    ["not an object", /not a JSON object/],
+    // A relay-chosen id with a newline in it must not forge a log line.
+    [{ ...msg("m3"), id: "x\nWARN: forged", channelType: undefined }, /has no channelType/],
+  ] as const) {
+    socket.deliver(JSON.stringify({ type: "message", message: broken }));
+    assert.match(h.logs.join("\n"), expected);
+  }
+  assert.deepEqual(h.delivered, [], "nothing malformed reached the message callback");
+  h.ws.stop();
+});
+
+test("an oversized-content frame is forwarded unchanged for the poller to repair", () => {
+  // Repairs belong to ONE layer (MessagePoller.accept, which both transports
+  // share). Repairing here as well truncated the marker this layer had just
+  // appended and reported the wrong "from <n> bytes" to the agent.
+  const h = harness();
+  h.ws.start();
+  const socket = h.last();
+  socket.open();
+  const content = "y".repeat(MAX_INBOUND_CONTENT_BYTES + 1_000);
+  socket.deliver(JSON.stringify({ type: "message", message: { ...msg("m-rep"), content } }));
+  assert.equal(h.delivered.length, 1);
+  assert.equal(h.delivered[0][0].content, content, "delivered byte-for-byte");
+  assert.ok(
+    !h.logs.join("\n").includes("truncated"),
+    `no repair is logged here: ${h.logs.join(" | ")}`,
+  );
+  h.ws.stop();
+});
+
+test("a frame just under the cap is not dropped, so the poller can repair it", () => {
+  // The frame bound mirrors the HTTP envelope cap: a bound tighter than that
+  // would make the push path lose (or refuse) a message the poll path delivers.
+  const h = harness();
+  h.ws.start();
+  const socket = h.last();
+  socket.open();
+  const content = "k".repeat(2 * 1024 * 1024);
+  const frame = JSON.stringify({ type: "message", message: { ...msg("m-2mb"), content } });
+  assert.ok(frame.length < MAX_INBOUND_FRAME_BYTES, "the fixture is under the frame cap");
+  socket.deliver(frame);
+  assert.equal(h.delivered.length, 1);
+  assert.equal(h.delivered[0][0].content, content);
+  assert.deepEqual(h.logs.filter((l) => l.includes("dropping relay frame")), []);
+  h.ws.stop();
+});
+
+test("the same broken frame replayed forever cannot flood the log", () => {
+  const h = harness();
+  h.ws.start();
+  const socket = h.last();
+  socket.open();
+  const broken = JSON.stringify({ type: "message", message: { ...msg("m1"), from: 42 } });
+  for (let i = 0; i < 20; i++) socket.deliver(broken);
+  const lines = h.logs.filter((line) => line.includes("dropping inbound message frame"));
+  assert.equal(lines.length, 4, `one line per occurrence up to the cap, plus the notice: ${h.logs.join(" | ")}`);
+  assert.match(lines[3], /further "from-missing" occurrences are not logged/);
+  assert.deepEqual(h.delivered, []);
+  h.ws.stop();
+});
+
+test("many distinct bad ids share one log budget", () => {
+  // The limiter keys on the problem code, not on the message, so a relay cannot
+  // grow the log (or the counter map) by varying what it sends.
+  const h = harness();
+  h.ws.start();
+  const socket = h.last();
+  socket.open();
+  for (let i = 0; i < 50; i++) {
+    socket.deliver(JSON.stringify({ type: "message", message: { ...msg(`m${i}`), from: undefined } }));
+  }
+  const lines = h.logs.filter((line) => line.includes("dropping inbound message frame"));
+  assert.equal(lines.length, 4, `capped across ids: ${h.logs.length} lines`);
+  h.ws.stop();
+});
+
+test("a pushed frame repaired end to end reports one repair with the original size", () => {
+  // The layer boundary is where the double-repair bug lived: this drives the frame
+  // through ws-client and then through the poller both transports share.
+  const h = harness();
+  h.ws.start();
+  const socket = h.last();
+  socket.open();
+  const content = "w".repeat(600_000);
+  socket.deliver(JSON.stringify({ type: "message", message: { ...msg("m-e2e"), content } }));
+
+  const reported: string[] = [];
+  const poller = new MessagePoller({} as never, { onInvalid: (issue) => reported.push(issue.detail) });
+  const fresh = poller.accept(h.delivered[0]);
+
+  assert.equal(reported.filter((d) => d.includes("content truncated")).length, 1, reported.join(" | "));
+  assert.match(
+    fresh[0].content,
+    /\[chaos-relay: content truncated at \d+ bytes, from 600000 bytes\]$/,
+    "the marker quotes the size the relay sent, not the size of our own marker",
+  );
+  assert.equal(h.logs.filter((l) => l.includes("truncated")).length, 0);
   h.ws.stop();
 });

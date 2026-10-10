@@ -46,14 +46,27 @@ test("a mapped module selects its own tests and its importers' tests", () => {
   // approval-policy.ts imports config.ts, so its test can catch a config change.
   assert.deepEqual(selection.tests, ["test/approval-policy.test.ts", "test/config.test.ts"]);
 
-  // relay-client is imported by poller, ws-client and inbound-attachments, so a
-  // change there can change their behaviour too — all four come along.
+  // relay-client is imported by poller, ws-client, inbound-attachments and
+  // inbound-message, so a change there can change their behaviour too — all five
+  // come along.
   const client = selectTests(["relay-client.ts"]);
   assert.equal(client.mode, "affected");
   assert.deepEqual(client.tests, [
     "test/inbound-attachments.test.ts",
+    "test/inbound-message.test.ts",
     "test/poller.test.ts",
     "test/relay-client.test.ts",
+    "test/ws-client.test.ts",
+  ]);
+  // A new module joins the tier on the same terms: its own tests plus every test
+  // whose import closure reaches it (the inbound shape checks are imported by the
+  // poller, the WebSocket transport and the attachment downloader).
+  const shape = selectTests(["inbound-message.ts"]);
+  assert.equal(shape.mode, "affected");
+  assert.deepEqual(shape.tests, [
+    "test/inbound-attachments.test.ts",
+    "test/inbound-message.test.ts",
+    "test/poller.test.ts",
     "test/ws-client.test.ts",
   ]);
 });
@@ -73,6 +86,7 @@ test("several isolated modules union their tests, sorted and deduped", () => {
     "test/config.test.ts",
     "test/connect.test.ts",
     "test/inbound-attachments.test.ts",
+    "test/inbound-message.test.ts",
     "test/poller.test.ts",
     "test/relay-client.test.ts",
     "test/url-redact.test.ts",
