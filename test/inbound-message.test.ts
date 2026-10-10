@@ -10,6 +10,7 @@ import test from "node:test";
 
 import {
   KNOWN_CHANNEL_TYPES,
+  stripInboundRepairNotes,
   MAX_INBOUND_ATTACHMENTS,
   MAX_INBOUND_CONTENT_BYTES,
   MAX_INBOUND_FILENAME_CHARS,
@@ -402,4 +403,29 @@ test("the limiter's map stays bounded however many distinct frames arrive", () =
   // codes come from a finite literal set — so the counters stay tiny.
   const lines = codes.map((code) => limit(code, "again"));
   assert.deepEqual(lines, [undefined, undefined, undefined, undefined]);
+});
+
+test("stripInboundRepairNotes returns the sender's text, not the repairs", () => {
+  assert.equal(stripInboundRepairNotes("yes abc123"), "yes abc123");
+  assert.equal(
+    stripInboundRepairNotes("yes abc123\n\n[chaos-relay: 1 attachment not delivered (unusable)]"),
+    "yes abc123",
+  );
+  // The truncation marker is the same kind of block.
+  assert.equal(
+    stripInboundRepairNotes("hello\n\n[chaos-relay: content truncated at 262144 bytes, from 900000 bytes]"),
+    "hello",
+  );
+  // Notes are not necessarily last: the attachment downloader appends after them.
+  assert.equal(
+    stripInboundRepairNotes(
+      "yes abc123\n\n[chaos-relay: 1 attachment not delivered (unusable)]\n\nAttachment unavailable: x.png — 404",
+    ),
+    "yes abc123",
+  );
+  // The prefix is a block on its own line; mere mention in a sentence is text.
+  assert.equal(
+    stripInboundRepairNotes("see [chaos-relay: notes] in the docs"),
+    "see [chaos-relay: notes] in the docs",
+  );
 });

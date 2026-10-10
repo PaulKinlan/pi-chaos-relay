@@ -138,7 +138,11 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
   the policy around it (when to claim, what to tell the user, shutdown release).
 - `approvals.ts` — the outstanding-approval queue (one entry per request, nonce
   and sender/channel binding, independent timeouts) and `summarizeToolCall`, the
-  payload-safe one-liner shown in the approval question.
+  payload-safe one-liner shown in the approval question. `settle` matches an
+  answer against the SENDER'S text, with `stripInboundRepairNotes` applied first:
+  the inbound shape checks append notes after the message, and an approval reply
+  that itself carried an unusable attachment must still answer its request
+  instead of timing out.
 - `config.ts` — resolves config from env + `~/.pi/chaos-relay.json` (0600).
 - `crypto.ts` — keypair generation + request signing.
 

@@ -121,6 +121,30 @@ function idString(value: unknown): string | undefined {
   return undefined;
 }
 
+/** Every repair note this module appends starts a block with this prefix. */
+const INBOUND_NOTE_PREFIX = "\n\n[chaos-relay: ";
+
+/**
+ * The part of a delivered message that is still the SENDER'S text, with the
+ * repair notes this module appended (and any later annotation that follows them)
+ * cut off.
+ *
+ * Callers that match operator input against a message body need this: an
+ * approval reply that itself carried an unusable attachment arrives as
+ * `yes <nonce>\n\n[chaos-relay: 1 attachment not delivered (unusable)]`, and the
+ * approval matcher's end-anchored nonce form would not match it, so the request
+ * timed out and was denied (bead pi-chaos-relay-cmo).
+ *
+ * The cut is at the FIRST block, not the last, because the notes are not
+ * necessarily the end of the content: `materializeInboundAttachments` appends
+ * its own `Attachment unavailable: …` lines after them. Everything before the
+ * first note is what the sender wrote.
+ */
+export function stripInboundRepairNotes(content: string): string {
+  const at = content.indexOf(INBOUND_NOTE_PREFIX);
+  return at < 0 ? content : content.slice(0, at);
+}
+
 /**
  * The id of a candidate message, if it has a usable one — for callers that must
  * remember a refused message (see `MessagePoller.accept`) without parsing it.

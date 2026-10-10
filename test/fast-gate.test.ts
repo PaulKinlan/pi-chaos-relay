@@ -52,6 +52,7 @@ test("a mapped module selects its own tests and its importers' tests", () => {
   const client = selectTests(["relay-client.ts"]);
   assert.equal(client.mode, "affected");
   assert.deepEqual(client.tests, [
+    "test/approvals.test.ts",
     "test/inbound-attachments.test.ts",
     "test/inbound-message.test.ts",
     "test/poller.test.ts",
@@ -64,6 +65,7 @@ test("a mapped module selects its own tests and its importers' tests", () => {
   const shape = selectTests(["inbound-message.ts"]);
   assert.equal(shape.mode, "affected");
   assert.deepEqual(shape.tests, [
+    "test/approvals.test.ts",
     "test/inbound-attachments.test.ts",
     "test/inbound-message.test.ts",
     "test/poller.test.ts",

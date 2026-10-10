@@ -66,6 +66,7 @@ export const MODULE_TESTS: Record<string, string[]> = {
   "crypto.ts": [
     "test/approval-policy.test.ts",
     "test/config.test.ts",
+    "test/approvals.test.ts",
     "test/crypto.test.ts",
     "test/inbound-attachments.test.ts",
     "test/inbound-message.test.ts",
@@ -77,6 +78,7 @@ export const MODULE_TESTS: Record<string, string[]> = {
   // The shape checks both transports run: poller.ts applies them and ws-client.ts
   // asks for a verdict, so their tests exercise this module too.
   "inbound-message.ts": [
+    "test/approvals.test.ts",
     "test/inbound-attachments.test.ts",
     "test/inbound-message.test.ts",
     "test/poller.test.ts",
@@ -85,6 +87,7 @@ export const MODULE_TESTS: Record<string, string[]> = {
   "poller.ts": ["test/poller.test.ts", "test/ws-client.test.ts"],
   "profile-lock.ts": ["test/profile-lock.test.ts"],
   "relay-client.ts": [
+    "test/approvals.test.ts",
     "test/inbound-attachments.test.ts",
     "test/inbound-message.test.ts",
     "test/poller.test.ts",

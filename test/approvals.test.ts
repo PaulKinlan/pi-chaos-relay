@@ -12,6 +12,7 @@
  * unchanged, they simply no longer import the entry point to reach it.
  */
 import { test } from "node:test";
+import { parseInboundMessage } from "../inbound-message.ts";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -363,4 +364,73 @@ test("summarizeToolCall prints only field labels it owns, and never a raw key", 
   } as Record<string, unknown>);
   assert.equal(line, "relay_register_webhook: channelName=fp:fe8ee15b, 2 chars, +3 more field(s)");
   assert.ok(!line.includes("evil"), `an unknown key is counted, not printed: ${line}`);
+});
+
+// --- repair notes must not defeat the nonce form (bead pi-chaos-relay-cmo) ---
+//
+// Inbound messages can carry notes appended by the inbound shape checks (bead
+// 4rr): an approval reply that itself had an unusable attachment arrives as
+// "yes <nonce>" plus that note. The nonce form is end-anchored, so before this
+// fix the reply stopped matching, was forwarded to the agent instead, and the
+// request timed out as a denial.
+
+const REPAIR_NOTE = "\n\n[chaos-relay: 1 attachment not delivered (unusable)]";
+
+test("settle matches the nonce form when the reply carries a repair note", async () => {
+  const q = new ApprovalQueue(5_000);
+  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `yes ${req.nonce}${REPAIR_NOTE}` }), true);
+  assert.equal(await req.promise, true);
+});
+
+test("settle matches a denial with a repair note, and a truncation marker", async () => {
+  const q = new ApprovalQueue(5_000);
+  const denied = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  assert.equal(
+    q.settle({
+      channelId: "c1",
+      from: "alice",
+      content: `no ${denied.nonce}\n\n[chaos-relay: content truncated at 262144 bytes, from 900000 bytes]`,
+    }),
+    true,
+  );
+  assert.equal(await denied.promise, false);
+});
+
+test("settle matches the reference form when the reply carries a repair note", async () => {
+  const q = new ApprovalQueue(5_000);
+  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `#${req.ref}: yes${REPAIR_NOTE}` }), true);
+  assert.equal(await req.promise, true);
+});
+
+test("a note alone is still not an answer", async () => {
+  const q = new ApprovalQueue(5_000);
+  q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: REPAIR_NOTE.trim() }), false);
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content: `yes${REPAIR_NOTE}` }), false);
+});
+
+test("a reply shaped by the inbound pipeline settles its request", async () => {
+  // The cross-module pin: the note this content carries is written by
+  // parseInboundMessage, and the matcher must cope with exactly what it writes.
+  const parsed = parseInboundMessage({
+    id: "m-1",
+    channelType: "telegram",
+    channelId: "c1",
+    from: "alice",
+    content: "PLACEHOLDER",
+    timestamp: "2026-01-01T00:00:00Z",
+    attachments: [{ id: "a1", filename: "x.bin", mimeType: "application/octet-stream", size: 10, kind: "file" }, { broken: true }],
+  });
+  assert.equal(parsed.ok, true);
+  const q = new ApprovalQueue(5_000);
+  const req = q.add({ channelId: "c1", from: "alice", toolName: "bash" });
+  const content = (parsed as Extract<typeof parsed, { ok: true }>).message.content.replace(
+    "PLACEHOLDER",
+    `yes ${req.nonce}`,
+  );
+  assert.match(content, /\[chaos-relay: 1 attachment not delivered \(unusable\)\]$/);
+  assert.equal(q.settle({ channelId: "c1", from: "alice", content }), true);
+  assert.equal(await req.promise, true);
 });

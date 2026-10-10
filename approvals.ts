@@ -23,6 +23,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { statSync } from "node:fs";
 import { basename, isAbsolute, relative } from "node:path";
+import { stripInboundRepairNotes } from "./inbound-message.ts";
 import { parseConnectInput } from "./connect.ts";
 import { redactCommandSecrets } from "./url-redact.ts";
 
@@ -150,7 +151,13 @@ export class ApprovalQueue {
     //      tolerated (the original /^\s*#(\d+)\b/ read "#2: yes" as a denial),
     //      resolved against the request that reference names on this channel, and
     //      also bound to the sender who was asked.
-    const answer = /^\s*(yes|no)\s+([0-9a-f]+)[.!]?\s*$/i.exec(message.content);
+    // Match against the SENDER'S text, not against the delivered content: this
+    // module's repair notes (bead 4rr) are appended after it, and the nonce form
+    // below is end-anchored, so a reply that itself carried an unusable
+    // attachment used to stop matching and the request timed out as a denial
+    // (bead pi-chaos-relay-cmo).
+    const answerText = stripInboundRepairNotes(message.content);
+    const answer = /^\s*(yes|no)\s+([0-9a-f]+)[.!]?\s*$/i.exec(answerText);
     if (answer) {
       const nonce = answer[2].toLowerCase();
       for (const [key, held] of this.pending) {
@@ -199,7 +206,7 @@ export class ApprovalQueue {
           break;
         }
       }
-      body = message.content.slice(addressed[0].length);
+      body = answerText.slice(addressed[0].length);
       if (id === undefined) {
         // Names a request that is not outstanding HERE for this sender (stale,
         // another channel, or another sender's request): not an answer, so
