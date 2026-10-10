@@ -69,6 +69,16 @@ races that read and loses the message; (2) never report the SDK's stale message 
 a per-batch delivery failure. `MessagePoller.requeue` rewinds the persisted cursor
 so the replacement re-fetches. See AGENTS.md.
 
+## The relay URL must be TLS, or loopback
+
+`isValidRelayUrl` accepts `https://` anywhere and `http://` only on loopback
+(`localhost`, 127.0.0.0/8, `[::1]`), because the bearer API key travels in every
+HTTP request and in the WebSocket `?token=` query string. `CHAOS_RELAY_ALLOW_INSECURE_HTTP=1`
+is the only bypass (off by default, warned about at every connect), and a refused
+plaintext URL must fail closed: no fallback to the default relay for a bound
+session, and no "malformed URL" wording for a perfectly well-formed one. See
+AGENTS.md.
+
 ## Gotchas
 
 - Secrets (the ECDSA keypair, apiKey) live in `~/.pi/chaos-relay.json` (0600),

@@ -38,6 +38,7 @@ import {
   addChannelRecord,
   DEFAULT_RELAY_URL,
   isConfigured,
+  isInsecureRelayUrl,
   isValidRelayUrl,
   APPROVAL_MODES,
   type ApprovalMode,
@@ -310,6 +311,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
    * finally failed, which is a race against the replacement's own state read.
    */
   const inFlightBatches = new Set<ChannelMessage[]>();
+  /** The plaintext-refusal warning is emitted once per instance (ensureClient runs
+   *  on every connect attempt, and repeating it would bury the log). */
+  let warnedPlaintextRefusal = false;
   let cfg: ResolvedConfig = resolveConfig();
 
   // Profile/session binding. `currentProfile` is the profile this process is
@@ -525,8 +529,40 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     });
   }
 
+  /**
+   * The configured URL that validation refuses ONLY because it is plaintext and
+   * not loopback, if any: the env value when it is set (env wins), else the saved
+   * one. Used to fail closed instead of letting the default relay take over.
+   */
+  function refusedPlaintextRelayUrl(): string | undefined {
+    const envRaw = (process.env.CHAOS_RELAY_URL ?? "").trim();
+    const persisted = loadPersisted();
+    const persistedValid = isValidRelayUrl(persisted.relayUrl ?? "");
+    if (envRaw !== "") {
+      // A refused env value is only fatal when nothing valid remains: with a valid
+      // saved URL the documented behaviour is to warn and use that one.
+      return isInsecureRelayUrl(envRaw) && !persistedValid ? envRaw : undefined;
+    }
+    return typeof persisted.relayUrl === "string" && isInsecureRelayUrl(persisted.relayUrl)
+      ? persisted.relayUrl
+      : undefined;
+  }
+
   function ensureClient(): RelayClient | undefined {
     cfg = resolveConfig();
+    // resolveConfig skips a refused candidate and lands on DEFAULT_RELAY_URL, which
+    // for a BOUND session would silently re-point it — and its bearer API key — at
+    // a relay the operator never configured. Fail closed instead, with the specific
+    // reason (the doctor reports the same condition).
+    if (refusedPlaintextRelayUrl()) {
+      if (!warnedPlaintextRefusal) {
+        warnedPlaintextRefusal = true;
+        log(`WARN: ${insecurePersistedRefusal()}`);
+      }
+      client = undefined;
+      poller = undefined;
+      return undefined;
+    }
     if (!isConfigured(cfg)) {
       client = undefined;
       poller = undefined;
@@ -573,6 +609,67 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     return (
       `CHAOS_RELAY_URL is set but is not an absolute http(s):// URL — ignoring it ` +
       `and using the persisted relay ${safeUrlOrigin(used)}. Fix CHAOS_RELAY_URL to make it take effect.`
+    );
+  }
+
+  /** Why a plaintext external URL is refused, in one clause, naming the opt-in a
+   *  deliberate operator would use instead. Never echoes the URL (an http URL can
+   *  carry userinfo), only the origin via safeUrlOrigin. */
+  function insecureUrlReason(used: string): string {
+    return (
+      `it points at ${safeUrlOrigin(used)}, and plaintext http:// sends the bearer ` +
+      `API key in the clear in every request and in the WebSocket query string; ` +
+      `use https://, an http:// loopback address, or set ` +
+      `CHAOS_RELAY_ALLOW_INSECURE_HTTP=1 to accept plaintext deliberately`
+    );
+  }
+
+  /** Warning + refusal when CHAOS_RELAY_URL is set to a plaintext URL outside
+   *  loopback and no persisted URL exists. Distinct from invalidEnvRefusal: the
+   *  value is a perfectly well-formed URL, so "not an absolute http(s):// URL"
+   *  would send the operator hunting for a typo that is not there. */
+  function insecureEnvRefusal(): string {
+    return (
+      `CHAOS_RELAY_URL is refused because ${insecureUrlReason(process.env.CHAOS_RELAY_URL ?? "")} ` +
+      `— and no relay URL is configured, so there is nothing valid to fall back to. ` +
+      `Refusing to auto-provision an identity over plaintext.`
+    );
+  }
+
+  /** The same refusal, but a valid persisted URL exists: ignore the env value and
+   *  stay on the persisted relay. */
+  function insecureEnvIgnoredWarning(used: string): string {
+    return (
+      `CHAOS_RELAY_URL is ignored because ${insecureUrlReason(process.env.CHAOS_RELAY_URL ?? "")} ` +
+      `— using the persisted relay ${safeUrlOrigin(used)} instead.`
+    );
+  }
+
+  /** Refusal when the PERSISTED relay is a plaintext external URL. This is the
+   *  upgrade path for a config written before this check existed: without a
+   *  specific reason the operator would only see "no relay configured", and the
+   *  session would follow the default relay to chaos-relay.com — carrying an
+   *  identity and key that were meant for their own relay. Refuse instead, and
+   *  name the way back (the opt-in, or an https:// URL). */
+  function insecurePersistedRefusal(): string {
+    return (
+      `the saved relay URL is refused because ` +
+      `${insecureUrlReason(loadPersisted().relayUrl ?? "")} — refusing to ` +
+      `auto-provision an identity against the default relay. Set ` +
+      `CHAOS_RELAY_ALLOW_INSECURE_HTTP=1 to keep using it, or run /chaos-relay setup ` +
+      `to move to an https:// relay.`
+    );
+  }
+
+  /** Warning when the relay in use IS plaintext outside loopback, i.e. the request
+   *  is served only because the opt-in is set. Logged at every connect so an
+   *  inherited env var cannot silently downgrade a session. */
+  function insecureRelayWarning(used: string): string {
+    return (
+      `relay ${safeUrlOrigin(used)} is reached over plaintext http:// because ` +
+      `CHAOS_RELAY_ALLOW_INSECURE_HTTP is set — the bearer API key is sent in the ` +
+      `clear on every request and in the WebSocket query string. Use https:// unless ` +
+      `this network is trusted.`
     );
   }
 
@@ -625,18 +722,42 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const envSet = envRaw.trim() !== "";
     const envValid = isValidRelayUrl(envRaw);
     const persistedValid = isValidRelayUrl(persisted.relayUrl ?? "");
+    // An http:// URL outside loopback is refused by isValidRelayUrl, so it lands in
+    // the "invalid" branch above — but it is a well-formed URL, and the generic
+    // "not an absolute http(s):// URL" text would be actively misleading. Say what
+    // is actually wrong and name the opt-in.
+    const envInsecure = envSet && isInsecureRelayUrl(envRaw);
     if (envSet && !envValid) {
       if (!persistedValid) {
-        const warning = invalidEnvRefusal();
+        const warning = envInsecure ? insecureEnvRefusal() : invalidEnvRefusal();
         log(`WARN: ${warning}`);
         notify?.(warning);
         return undefined;
       }
-      const warning = invalidEnvIgnoredWarning(relayUrl);
+      const warning = envInsecure
+        ? insecureEnvIgnoredWarning(relayUrl)
+        : invalidEnvIgnoredWarning(relayUrl);
       log(`WARN: ${warning}`);
       notify?.(warning);
     } else if (!envSet && !persistedValid) {
+      // A plaintext saved URL is refused like any other invalid one, but "no relay
+      // configured" would be a lie the operator cannot act on — and provisioning
+      // against the default would mint an identity they did not ask for on a relay
+      // they did not choose.
+      if (typeof persisted.relayUrl === "string" && isInsecureRelayUrl(persisted.relayUrl)) {
+        const warning = insecurePersistedRefusal();
+        log(`WARN: ${warning}`);
+        notify?.(warning);
+        return undefined;
+      }
       const warning = unconfiguredRelayWarning(relayUrl);
+      log(`WARN: ${warning}`);
+      notify?.(warning);
+    }
+    // Serving an external relay over plaintext is possible only with the opt-in;
+    // say so every time rather than letting it pass silently.
+    if (isInsecureRelayUrl(relayUrl)) {
+      const warning = insecureRelayWarning(relayUrl);
       log(`WARN: ${warning}`);
       notify?.(warning);
     }
@@ -2152,7 +2273,13 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       relayUrl = (await ctx.ui.input("Relay URL", relayUrl)) || relayUrl;
       while (!isValidRelayUrl(relayUrl)) {
         ctx.ui.notify(
-          "That is not a valid URL. Include the scheme, e.g. https://chaos-relay.com",
+          isInsecureRelayUrl(relayUrl)
+            ? `Refusing plaintext http:// to ${safeUrlOrigin(relayUrl)}: the relay API key ` +
+                `would cross the network in the clear. Use https:// (or an http:// loopback ` +
+                `address such as http://localhost:8787), or set ` +
+                `CHAOS_RELAY_ALLOW_INSECURE_HTTP=1 to accept it deliberately.`
+            : "That is not a valid URL. Use https://, or http:// on a loopback host " +
+                "(localhost, 127.0.0.1, [::1]).",
           "warning",
         );
         relayUrl = (await ctx.ui.input(
@@ -2479,12 +2606,27 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     ].filter(Boolean).join(", ");
     checks.push({
       ok: urlOk,
-      label: "relay URL is valid http(s)",
+      label: "relay URL is valid https (or loopback http)",
       detail: urlDetail,
       fix: urlOk
         ? undefined
-        : "Run /chaos-relay reset to clear the bad URL, then /chaos-relay setup.",
+        : "Run /chaos-relay reset to clear the bad URL, then /chaos-relay setup. " +
+          "Anonymous http:// is refused unless the host is loopback.",
     });
+    // A plaintext external URL is valid only because the opt-in is set; a security
+    // doctor should say so rather than reporting a green URL line.
+    if (isInsecureRelayUrl(effectiveUrl)) {
+      checks.push({
+        ok: false,
+        label: "relay transport sends the API key in plaintext",
+        detail:
+          `effective=${safeUrlOrigin(effectiveUrl)} (allowed by ` +
+          `CHAOS_RELAY_ALLOW_INSECURE_HTTP)`,
+        fix:
+          "Use an https:// relay, or an http:// loopback address for local work. " +
+          "Unset CHAOS_RELAY_ALLOW_INSECURE_HTTP once you no longer need it.",
+      });
+    }
 
     // 3. Identity + session token.
     // The ECDSA keypair is the durable identity. The Bearer API key is just a

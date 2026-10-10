@@ -341,16 +341,58 @@ export function normalizeApprovalMode(v: unknown): ApprovalMode {
 }
 
 /**
+ * True when `hostname` — as `URL.hostname` reports it — is a loopback address:
+ * `localhost`, an IPv4 address in 127.0.0.0/8 (RFC 1122 defines the whole /8 as
+ * loopback, not just 127.0.0.1), or the IPv6 loopback `::1` (which URL reports
+ * bracketed).
+ *
+ * The dotted-quad is parsed rather than prefix-matched, so a name that merely
+ * starts with "127." (e.g. `127.relay.example.com`) is NOT loopback.
+ */
+export function isLoopbackHostname(hostname: string): boolean {
+  const host = hostname.trim().toLowerCase();
+  if (host === "localhost" || host === "[::1]" || host === "::1") return true;
+  const octets = host.split(".");
+  if (octets.length !== 4) return false;
+  if (!octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) <= 255)) return false;
+  return Number(octets[0]) === 127;
+}
+
+/**
+ * Is plaintext `http://` to a NON-loopback host explicitly allowed?
+ *
+ * `CHAOS_RELAY_ALLOW_INSECURE_HTTP=1` is the deliberate escape hatch for a
+ * trusted network (a self-hosted or LAN relay with no TLS). It is off by
+ * default and never implied by anything else: an http:// URL outside loopback
+ * sends the bearer apiKey in the clear in every HTTP request AND in the
+ * WebSocket `?token=` query string, so it is a decision an operator has to make
+ * on purpose.
+ */
+export function insecureHttpAllowed(
+  env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+): boolean {
+  const raw = (env.CHAOS_RELAY_ALLOW_INSECURE_HTTP ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
+/**
  * True if `url` is an absolute http(s) URL we can safely build request URLs
  * from. Rejects empty strings, relative paths, and non-http schemes — all of
  * which would otherwise produce "Failed to parse URL" errors at fetch time.
  *
+ * `http://` is accepted ONLY for a loopback host, or when insecure http is
+ * explicitly allowed (see {@link insecureHttpAllowed}). A plaintext URL to an
+ * external host carries the bearer apiKey in the clear over HTTP and in the
+ * WebSocket query string, so it is refused by default.
+ *
  * Accepted: "https://chaos-relay.com", "http://localhost:8787",
+ *          "http://127.0.0.1:8787", "http://[::1]:8787",
  *          "https://relay.example.com/" (trailing slash ok).
  * Rejected: "", "/chaos-relay approvals writes", "chaos-relay.com",
- *          "ftp://x", "file:///x", "relay foo".
+ *          "ftp://x", "file:///x", "relay foo", "http://relay.example.com",
+ *          "http://192.168.1.5:8787" (unless insecure http is allowed).
  */
-export function isValidRelayUrl(url: unknown): url is string {
+export function isValidRelayUrl(url: unknown, allowInsecureHttp = insecureHttpAllowed()): url is string {
   if (typeof url !== "string" || url.trim() === "") return false;
   let parsed: URL;
   try {
@@ -358,7 +400,24 @@ export function isValidRelayUrl(url: unknown): url is string {
   } catch {
     return false;
   }
-  return parsed.protocol === "http:" || parsed.protocol === "https:";
+  if (parsed.protocol === "https:") return true;
+  if (parsed.protocol !== "http:") return false;
+  return isLoopbackHostname(parsed.hostname) || allowInsecureHttp;
+}
+
+/**
+ * True for a URL that is only acceptable because of the explicit insecure-http
+ * opt-in: plaintext `http://` to a non-loopback host. Used to warn loudly when
+ * such a URL is actually in use, and to explain a refusal in the doctor.
+ */
+export function isInsecureRelayUrl(url: unknown): boolean {
+  if (typeof url !== "string" || url.trim() === "") return false;
+  try {
+    const parsed = new URL(url.trim());
+    return parsed.protocol === "http:" && !isLoopbackHostname(parsed.hostname);
+  } catch {
+    return false;
+  }
 }
 
 export interface PersistedConfig {

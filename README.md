@@ -74,6 +74,7 @@ file > default**. The saved config file is `~/.pi/chaos-relay.json` (written wit
 | `CHAOS_RELAY_API_KEY` | — | Bearer API key from `POST /auth/register` (secret) |
 | `CHAOS_RELAY_AGENT_ID` | `pi` | Connection/session label channels are tagged with |
 | `CHAOS_RELAY_APPROVAL_MODE` | `writes` | Tool-approval policy: `off` / `writes` / `all` (see Tool approvals) |
+| `CHAOS_RELAY_ALLOW_INSECURE_HTTP` | unset | Allow a plaintext `http://` relay on a NON-loopback host (see Relay URL and transport) |
 | `CHAOS_RELAY_PROFILE` | `default` | Names a separate config file (`~/.pi/chaos-relay.<profile>.json`) — see Multiple instances |
 | `CHAOS_RELAY_CONFIG` | — | Absolute path to the config file (overrides `CHAOS_RELAY_PROFILE`) |
 
@@ -275,12 +276,22 @@ a command was accidentally pasted into the URL field. Two ways to recover:
 
 Default setup is zero-config and never asks for a URL, so this only affects
 older configs or a bad `CHAOS_RELAY_URL` / `--advanced` entry. A URL must be an
-absolute `http(s)://…`; the effective URL is the **first valid** value in
-precedence order (env → saved file → default), so a malformed value is skipped
-rather than silently discarding a valid lower-precedence one. If no URL is
-configured anywhere, auto-provisioning targets the hosted relay (with a warning),
-and a set-but-invalid `CHAOS_RELAY_URL` with no saved URL is **refused** instead
-of silently registering against the default.
+absolute `http(s)://…` **and use TLS unless it is loopback**: `https://` is
+accepted anywhere, `http://` only for `localhost` / `127.0.0.0/8` / `[::1]`.
+Anything else would put the bearer API key on the wire in the clear — in every
+HTTP request and in the WebSocket `?token=` query string — so a plaintext URL to
+an external host is refused, and the refusal says so instead of being reported as
+a malformed URL. Set `CHAOS_RELAY_ALLOW_INSECURE_HTTP=1` to accept it on purpose
+(a LAN relay with no TLS): it is off by default, never implied, and every connect
+over such a URL logs a warning.
+
+The effective URL is the **first valid** value in precedence order (env → saved
+file → default), so a malformed or refused value is skipped rather than silently
+discarding a valid lower-precedence one. If no URL is configured anywhere,
+auto-provisioning targets the hosted relay (with a warning); a set-but-invalid or
+plaintext-external `CHAOS_RELAY_URL` with no saved URL is **refused**, and so is a
+*saved* plaintext-external URL — a bound session refuses to connect rather than
+following the default relay with an identity that was meant for your own.
 
 The config file (and the `<config>.state` side-car holding the message cursor
 and de-dup log) are written atomically (temp file + rename), so a concurrent
@@ -561,7 +572,11 @@ for"; `npm test` needs no install.
 
 Integration testing against a local relay: run the CHAOS relay server
 (`deno task start` in `packages/server` with `--unstable-kv`) and point
-`CHAOS_RELAY_URL=http://localhost:8787`.
+`CHAOS_RELAY_URL=http://localhost:8787` (loopback, so plaintext needs no opt-in).
+
+A relay on another machine over plaintext `http://` needs
+`CHAOS_RELAY_ALLOW_INSECURE_HTTP=1`; prefer `https://` (a self-signed cert on a
+private network still keeps the API key out of the clear).
 
 ## Known gaps / future work
 

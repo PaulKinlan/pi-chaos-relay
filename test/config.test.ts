@@ -6,6 +6,9 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
   DEFAULT_RELAY_URL,
+  insecureHttpAllowed,
+  isInsecureRelayUrl,
+  isLoopbackHostname,
   MIN_POLL_INTERVAL_MS,
   getConfigPath,
   configPathFor,
@@ -1122,4 +1125,115 @@ test("an old profile migrated before the tombstone gets one on its next flush", 
     assert.equal(cfg.messageStateMigrated, true);
     assert.equal(cfg.apiKey, "k");
   });
+});
+
+// --- https, or http only on loopback (bead pi-chaos-relay-8qv) ---------------
+//
+// An http:// relay outside loopback sends the bearer apiKey in the clear in every
+// request and in the WebSocket `?token=` query string, so it is refused unless an
+// operator opts in on purpose.
+
+test("isValidRelayUrl accepts http only on a loopback host", () => {
+  // Loopback forms. RFC 1122 defines all of 127.0.0.0/8 as loopback.
+  assert.equal(isValidRelayUrl("http://localhost:8787", false), true);
+  assert.equal(isValidRelayUrl("http://LOCALHOST:8787", false), true);
+  assert.equal(isValidRelayUrl("http://127.0.0.1:8787", false), true);
+  assert.equal(isValidRelayUrl("http://127.0.0.2", false), true);
+  assert.equal(isValidRelayUrl("http://[::1]:8787", false), true);
+  // https is accepted anywhere, including for a LAN/Tailscale address.
+  assert.equal(isValidRelayUrl("https://chaos-relay.com", false), true);
+  assert.equal(isValidRelayUrl("https://192.168.1.5:8787", false), true);
+  assert.equal(isValidRelayUrl("https://[::1]:8787", false), true);
+});
+
+test("isValidRelayUrl refuses plaintext outside loopback", () => {
+  assert.equal(isValidRelayUrl("http://chaos-relay.com", false), false);
+  assert.equal(isValidRelayUrl("http://relay.example.com:8787", false), false);
+  assert.equal(isValidRelayUrl("http://192.168.1.5:8787", false), false);
+  assert.equal(isValidRelayUrl("http://10.0.0.1:8787", false), false);
+  // A name that merely LOOKS loopback is not loopback.
+  assert.equal(isValidRelayUrl("http://127.relay.example.com", false), false);
+  assert.equal(isValidRelayUrl("http://127.0.0.1.evil.example", false), false);
+  assert.equal(isValidRelayUrl("http://localhost.evil.example", false), false);
+  // IPv4-mapped IPv6 is not one of the accepted loopback spellings.
+  assert.equal(isValidRelayUrl("http://[::ffff:127.0.0.1]", false), false);
+});
+
+test("isLoopbackHostname recognises exactly the loopback forms", () => {
+  assert.equal(isLoopbackHostname("localhost"), true);
+  assert.equal(isLoopbackHostname("127.0.0.1"), true);
+  assert.equal(isLoopbackHostname("127.255.255.254"), true);
+  assert.equal(isLoopbackHostname("[::1]"), true);
+  assert.equal(isLoopbackHostname("::1"), true);
+  assert.equal(isLoopbackHostname("128.0.0.1"), false);
+  assert.equal(isLoopbackHostname("127.0.0.256"), false, "not a valid octet");
+  assert.equal(isLoopbackHostname("127.0.0"), false);
+  assert.equal(isLoopbackHostname("127.evil.example"), false);
+  assert.equal(isLoopbackHostname(""), false);
+});
+
+test("insecureHttpAllowed is opt-in only", () => {
+  assert.equal(insecureHttpAllowed({}), false, "never implied");
+  assert.equal(insecureHttpAllowed({ CHAOS_RELAY_ALLOW_INSECURE_HTTP: "" }), false);
+  assert.equal(insecureHttpAllowed({ CHAOS_RELAY_ALLOW_INSECURE_HTTP: "0" }), false);
+  assert.equal(insecureHttpAllowed({ CHAOS_RELAY_ALLOW_INSECURE_HTTP: "no" }), false);
+  assert.equal(insecureHttpAllowed({ CHAOS_RELAY_ALLOW_INSECURE_HTTP: "1" }), true);
+  assert.equal(insecureHttpAllowed({ CHAOS_RELAY_ALLOW_INSECURE_HTTP: "true" }), true);
+  assert.equal(insecureHttpAllowed({ CHAOS_RELAY_ALLOW_INSECURE_HTTP: " YES " }), true);
+});
+
+test("the plaintext opt-in is the only way an external http URL is accepted", () => {
+  assert.equal(isValidRelayUrl("http://192.168.1.5:8787", true), true, "explicit argument");
+  assert.equal(isValidRelayUrl("http://relay.example.com", true), true);
+  withEnv({ CHAOS_RELAY_ALLOW_INSECURE_HTTP: "1" }, () => {
+    assert.equal(isValidRelayUrl("http://relay.example.com"), true, "env opt-in, via the default argument");
+  });
+  withEnv({ CHAOS_RELAY_ALLOW_INSECURE_HTTP: undefined }, () => {
+    assert.equal(isValidRelayUrl("http://relay.example.com"), false, "and without it, refused");
+  });
+  // The opt-in must not weaken anything else.
+  assert.equal(isValidRelayUrl("ftp://relay.example.com", true), false);
+  assert.equal(isValidRelayUrl("ws://127.0.0.1:8787", true), false);
+  assert.equal(isValidRelayUrl("relay.example.com", true), false);
+});
+
+test("isInsecureRelayUrl flags exactly plaintext-outside-loopback", () => {
+  assert.equal(isInsecureRelayUrl("http://192.168.1.5:8787"), true);
+  assert.equal(isInsecureRelayUrl("http://relay.example.com"), true);
+  assert.equal(isInsecureRelayUrl("http://localhost:8787"), false);
+  assert.equal(isInsecureRelayUrl("http://127.0.0.1:8787"), false);
+  assert.equal(isInsecureRelayUrl("https://relay.example.com"), false);
+  assert.equal(isInsecureRelayUrl("https://192.168.1.5"), false);
+  assert.equal(isInsecureRelayUrl("ftp://relay.example.com"), false);
+  assert.equal(isInsecureRelayUrl(""), false);
+  assert.equal(isInsecureRelayUrl(undefined), false);
+});
+
+test("resolveConfig: a plaintext external URL is skipped like any invalid candidate", () => {
+  withEnv(
+    { CHAOS_RELAY_URL: "http://192.168.1.5:8787", CHAOS_RELAY_ALLOW_INSECURE_HTTP: undefined },
+    () => {
+      assert.equal(resolveConfig({}).relayUrl, DEFAULT_RELAY_URL, "nothing else configured");
+      assert.equal(
+        resolveConfig({ relayUrl: "http://127.0.0.1:9999" }).relayUrl,
+        "http://127.0.0.1:9999",
+        "a valid persisted loopback URL still wins over a refused env value",
+      );
+      assert.equal(
+        resolveConfig({ relayUrl: "http://10.0.0.9:8787" }).relayUrl,
+        DEFAULT_RELAY_URL,
+        "a plaintext persisted URL is refused too, not just the env value",
+      );
+    },
+  );
+  withEnv(
+    { CHAOS_RELAY_URL: "http://192.168.1.5:8787", CHAOS_RELAY_ALLOW_INSECURE_HTTP: "1" },
+    () => {
+      assert.equal(
+        resolveConfig({}).relayUrl,
+        "http://192.168.1.5:8787",
+        "with the explicit opt-in the same URL is honoured",
+      );
+    },
+  );
 });
