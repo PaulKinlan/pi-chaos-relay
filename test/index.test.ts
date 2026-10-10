@@ -188,14 +188,30 @@ class PushWebSocket {
   onmessage: ((event: unknown) => void) | null = null;
   onerror: ((event: unknown) => void) | null = null;
   onclose: ((event: { code: number }) => void) | null = null;
-  constructor(_url: string) {
+  constructor(url: string) {
+    this.url = url;
     PushWebSocket.instances.push(this);
   }
+  url: string;
   send(): void {}
   close(): void {}
   pushFrame(data: string): void {
     this.onmessage?.({ data } as unknown as MessageEvent);
   }
+}
+
+/**
+ * The socket THIS test's extension opened. ws-client builds the URL from the
+ * profile's apiKey (`toWsUrl` puts it in `?token=`), so a still-reconnecting
+ * socket left behind by an earlier test — its backoff timer can fire between this
+ * test's `instances = []` and its `session_start` — can never be picked by
+ * accident. Using `instances[0]` made the d8e regression tests flake when the
+ * whole file ran.
+ */
+function socketForProfile(apiKey: string): PushWebSocket {
+  const socket = PushWebSocket.instances.find((s) => s.url.includes(apiKey));
+  assert.ok(socket, `no WebSocket was opened for api key ${apiKey}`);
+  return socket;
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
@@ -3430,8 +3446,7 @@ test("a delivery that hits a replaced runtime stops the instance and returns the
     };
     chaosRelayExtension(fake.pi as unknown as ExtensionApi);
     await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-stale", fake.notifications));
-    assert.ok(PushWebSocket.instances.length >= 1, "WS constructed");
-    const socket = PushWebSocket.instances[0];
+    const socket = socketForProfile("ak_stale");
 
     const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
     const logBefore = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
@@ -3527,7 +3542,7 @@ test("a live runtime still delivers, and logs no replaced-runtime warning", asyn
     const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
     const before = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
 
-    pushMessage(PushWebSocket.instances[0], "m-live-1", new Date().toISOString(), "hello live");
+    pushMessage(socketForProfile("ak_live"), "m-live-1", new Date().toISOString(), "hello live");
     await waitFor(() => injected.length === 1);
     assert.match(injected[0], /hello live/, "the live runtime delivers as before");
 
@@ -3574,7 +3589,7 @@ test("a push arriving after session_shutdown is not delivered and not consumed",
     };
     chaosRelayExtension(fake.pi as unknown as ExtensionApi);
     await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-after", fake.notifications));
-    const socket = PushWebSocket.instances[0];
+    const socket = socketForProfile("ak_after");
     await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-after", fake.notifications));
 
     // pi emits session_shutdown BEFORE invalidating the instance, so a push that
@@ -3639,12 +3654,12 @@ test("a delivery in flight across session_shutdown is handed back before the rep
     // An image-capable model, so the delivery takes the image content path.
     (ctx as { model: unknown }).model = { input: ["text", "image"] };
     await callHandler(fake.handlers, "session_start", { reason: "startup" }, ctx);
-    assert.ok(PushWebSocket.instances.length >= 1, "WS constructed");
+    const socket = socketForProfile("ak_inflight");
 
     const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
     const logBefore = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
     const ts = new Date().toISOString();
-    PushWebSocket.instances[0].pushFrame(
+    socket.pushFrame(
       JSON.stringify({
         type: "message",
         message: {
