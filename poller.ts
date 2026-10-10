@@ -9,6 +9,7 @@
 
 import type { ChannelMessage, RelayClient, ReplyReference } from "./relay-client.ts";
 import { resolveReplyTo } from "./relay-client.ts";
+import { inboundMessageId, parseInboundMessage } from "./inbound-message.ts";
 import { randomBytes } from "node:crypto";
 
 const SEEN_MAX = 1000; // hard cap before trimming
@@ -25,6 +26,7 @@ export class MessagePoller {
   private seen: Set<string>;
   private readonly client: RelayClient;
   private readonly onPersist?: (state: PollerPersistState) => void;
+  private readonly onInvalid?: (detail: string) => void;
 
   constructor(
     client: RelayClient,
@@ -41,12 +43,20 @@ export class MessagePoller {
       onPersist?: (state: PollerPersistState) => void;
       /** Previously-seen message ids, persisted so dedup survives a restart. */
       seen?: string[];
+      /**
+       * Report a refused or repaired inbound message. This is the one point both
+       * transports share, so it is where the relay's payloads are shape-checked
+       * (see `inbound-message.ts`); the detail names the field and never echoes
+       * message contents. The caller owns rate-limiting the log.
+       */
+      onInvalid?: (detail: string) => void;
     } = {},
   ) {
     this.client = client;
     // Resume from a persisted cursor so a restart doesn't re-read the backlog.
     this.since = opts.since;
     this.onPersist = opts.onPersist;
+    this.onInvalid = opts.onInvalid;
     // Restore the persisted de-dup log so the relay's on-connect replay and any
     // catch-up poll don't re-process messages already delivered before restart.
     this.seen = new Set(opts.seen ?? []);
@@ -96,10 +106,38 @@ export class MessagePoller {
    * same de-dup set, so a message delivered by push and then again by a
    * catch-up poll is only surfaced once. Returns the fresh ones.
    */
-  accept(messages: ChannelMessage[]): ChannelMessage[] {
+  accept(messages: readonly unknown[]): ChannelMessage[] {
     const fresh: ChannelMessage[] = [];
-    for (const msg of messages) {
-      if (!msg?.id || this.seen.has(msg.id)) continue;
+    let rememberedRejected = false;
+    for (const candidate of messages) {
+      // The relay forwards channel payloads as-is over both transports, so the
+      // declared type is a claim, not a fact: validate before anything here or
+      // downstream reads a field (a non-array `attachments` used to reach
+      // Array.prototype.slice, and a non-ISO `timestamp` used to poison the
+      // persisted cursor below).
+      const parsed = parseInboundMessage(candidate);
+      if (!parsed.ok) {
+        // Remember its id so a relay replay does not re-report it forever: the
+        // catch-up poll returns the same message until the cursor passes it, and
+        // the cursor must NOT advance past a message that was never delivered.
+        // The id is checked BEFORE reporting, so the replay is silent too — the
+        // seen set is remembered across restarts, which is what makes that hold
+        // beyond this process. A frame with no usable id cannot be remembered;
+        // the caller's log limiter bounds those.
+        const rejectedId = inboundMessageId(candidate);
+        if (rejectedId) {
+          if (this.seen.has(rejectedId)) continue;
+          this.seen.add(rejectedId);
+          rememberedRejected = true;
+        }
+        this.onInvalid?.(`dropped an inbound message: ${parsed.reason}`);
+        continue;
+      }
+      for (const warning of parsed.warnings) {
+        this.onInvalid?.(`repaired an inbound message: ${warning}`);
+      }
+      const msg = parsed.message;
+      if (this.seen.has(msg.id)) continue;
       this.seen.add(msg.id);
       fresh.push(msg);
       // Advance the resume cursor to the latest delivered timestamp. ISO-8601
@@ -119,7 +157,10 @@ export class MessagePoller {
     // batch that advanced the cursor always delivered a fresh message, so
     // `fresh.length > 0` subsumes both persist triggers the old separate
     // callbacks (cursor-advanced, seen-grew) covered.
-    if (fresh.length > 0) {
+    // A batch that only remembered a rejected id still changed the de-dup log,
+    // and persisting it is what stops the next process from re-reporting the
+    // same frame after the relay replays it.
+    if (fresh.length > 0 || rememberedRejected) {
       this.onPersist?.({ since: this.since, seen: Array.from(this.seen) });
     }
     return fresh;

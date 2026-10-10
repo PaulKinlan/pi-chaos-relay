@@ -4149,3 +4149,99 @@ test("doctor reports a refused saved URL instead of a green URL line", async (t)
     `a refused URL is not reported as an in-use plaintext transport: ${output}`,
   );
 });
+
+test("the safety poll refuses a malformed message once and still delivers the valid one", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+
+  // One batch carrying a message the delivery path could not survive (a
+  // non-array `attachments` used to reach Array.prototype.slice) next to a
+  // perfectly good one.
+  const malformed = {
+    id: "m-bad",
+    channelType: "telegram",
+    channelId: "ch-frame",
+    from: "alice",
+    content: "hello",
+    timestamp: "2026-01-01T00:00:01Z",
+    attachments: "seven",
+  };
+  const good = {
+    id: "m-good",
+    channelType: "telegram",
+    channelId: "ch-frame",
+    from: "alice",
+    content: "deliver me",
+    timestamp: "2026-01-01T00:00:02Z",
+  };
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown) => {
+    if (String(url).includes("/messages")) {
+      return new Response(JSON.stringify({ messages: [malformed, good], since: "2026-01-01T00:00:02Z" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = origFetch;
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+  });
+
+  const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+  const before = existsSync(logPath) ? readFileSync(logPath, "utf-8").length : 0;
+  const flushAsync = async () => {
+    for (let i = 0; i < 8; i++) await new Promise((r) => setImmediate(r));
+  };
+
+  const fake = makeFakePi();
+  const sent: string[] = [];
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  (fake.pi as unknown as { sendUserMessage: unknown }).sendUserMessage = (content: unknown) => {
+    sent.push(String(content));
+  };
+  await callHandler(
+    fake.handlers,
+    "session_start",
+    { reason: "startup" },
+    makeCtx("sess-frame-check", fake.notifications),
+  );
+  t.after(() =>
+    callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-frame-check", fake.notifications)),
+  );
+
+  // First safety poll: the malformed message is refused with a reason, the valid
+  // one is delivered to the agent.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+  const afterFirst = readFileSync(logPath, "utf-8").slice(before);
+  assert.equal(
+    afterFirst.match(/dropped an inbound message/g)?.length,
+    1,
+    `one refusal was reported: ${afterFirst}`,
+  );
+  assert.match(afterFirst, /m-bad: attachments is not an array/);
+  assert.equal(sent.length, 1, `only the valid message was delivered: ${JSON.stringify(sent)}`);
+  assert.match(sent[0], /deliver me/);
+  assert.ok(!sent[0].includes("m-bad"), "the refused message never reached the prompt");
+
+  // The relay replays both until the cursor passes them, so the refusal must not
+  // be reported again (the id is remembered), while nothing is delivered twice.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+  const afterSecond = readFileSync(logPath, "utf-8").slice(before);
+  assert.equal(
+    afterSecond.match(/dropped an inbound message/g)?.length,
+    1,
+    `the replay is silent: ${afterSecond}`,
+  );
+  assert.equal(sent.length, 1, "and nothing was delivered twice");
+});

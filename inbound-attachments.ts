@@ -20,7 +20,8 @@ import { base64FromBytes } from "./relay-client.ts";
 import { redactUrlSecretsFromMessage } from "./url-redact.ts";
 
 const MAX_ATTACHMENT_AGE_MS = 24 * 60 * 60 * 1000;
-const MAX_ATTACHMENTS_PER_MESSAGE = 3;
+// Shared with the inbound shape checks so the two cannot drift.
+import { MAX_INBOUND_ATTACHMENTS as MAX_ATTACHMENTS_PER_MESSAGE } from "./inbound-message.ts";
 
 export interface PiImageContent {
   type: "image";

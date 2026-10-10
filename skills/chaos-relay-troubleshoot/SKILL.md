@@ -71,6 +71,13 @@ unconfigured rather than crashing.
   (`relay_register_*`) to get a fresh pairing code / link if needed.
 - Messages arrive repeatedly on restart → the resume cursor is stale; harmless,
   it self-heals. (Persists the last-delivered timestamp.)
+- A specific message never arrived, or the log has `WARN: dropped an inbound
+  message: …` / `WARN: dropping relay frame: …` → the relay sent a message the
+  client refuses: a missing/mistyped field, a non-ISO-8601 timestamp, or a frame
+  over 1 MiB. The warning names the field, not the contents. Content over 256 KiB
+  is not lost: it arrives truncated with a visible marker. Check the relay's own
+  logs for what it put on the wire; the client's limit values are in
+  `inbound-message.ts`.
 
 ### Replies not sending / "Relay request failed"
 - **`relay_reply: REFUSED by relay — Unknown channel <id>`** (or a type

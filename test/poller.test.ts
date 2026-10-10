@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { MessagePoller, formatMessagesForAgent } from "../poller.ts";
+import { MAX_INBOUND_CONTENT_BYTES } from "../inbound-message.ts";
 import type { PollerPersistState } from "../poller.ts";
 import type { ChannelMessage, GetMessagesResult, RelayClient } from "../relay-client.ts";
 
@@ -408,4 +409,78 @@ test("requeue handles a batch with no usable timestamp", () => {
   // re-open.
   const noId = { ...msg(""), timestamp: "2026-01-01T00:00:00Z" } as ChannelMessage;
   assert.deepEqual(poller.requeue([noId]), []);
+});
+
+// --- accept(): the inbound shape check (bead pi-chaos-relay-4rr) -------------
+//
+// The relay forwards channel payloads as-is over both transports, and accept() is
+// the one point they share, so this is where the fields are checked.
+
+test("accept refuses a malformed message, reports why, and delivers nothing", () => {
+  const reported: string[] = [];
+  const poller = new MessagePoller({} as never, { onInvalid: (d) => reported.push(d) });
+  const malformed = { ...msg("bad"), attachments: "not-an-array" } as unknown as ChannelMessage;
+  assert.deepEqual(poller.accept([malformed]), []);
+  assert.equal(reported.length, 1);
+  assert.match(reported[0], /dropped an inbound message: message bad: attachments is not an array/);
+  assert.equal(poller.cursor, undefined, "a refused message never moves the cursor");
+});
+
+test("accept delivers the valid messages in a batch and refuses only the bad one", () => {
+  const reported: string[] = [];
+  const poller = new MessagePoller({} as never, { onInvalid: (d) => reported.push(d) });
+  const batch = [
+    msg("m1"),
+    { ...msg("m2"), timestamp: "yesterday" } as unknown as ChannelMessage,
+    msg("m3"),
+  ];
+  assert.deepEqual(
+    poller.accept(batch).map((m) => m.id),
+    ["m1", "m3"],
+  );
+  assert.equal(reported.length, 1);
+  assert.match(reported[0], /message m2: timestamp is not an ISO-8601 timestamp/);
+  assert.equal(poller.cursor, "2026-01-01T00:00:00Z");
+});
+
+test("a refused message is remembered so a relay replay is neither reported nor delivered", () => {
+  const reported: string[] = [];
+  const persisted: PollerPersistState[] = [];
+  const poller = new MessagePoller({} as never, {
+    onInvalid: (d) => reported.push(d),
+    onPersist: (state) => persisted.push(state),
+  });
+  const malformed = { ...msg("bad"), attachments: 7 } as unknown as ChannelMessage;
+  poller.accept([malformed]);
+  assert.equal(reported.length, 1);
+  // The relay replays it until the cursor passes it (it never will: the message
+  // was never delivered), and a replay must not re-report or re-deliver.
+  assert.deepEqual(poller.accept([malformed]), []);
+  assert.equal(reported.length, 1, "the replay is silent");
+  // Remembering the id is a state change worth persisting: after a restart the
+  // replay is still recognised as already refused.
+  assert.equal(persisted.length, 1);
+  assert.deepEqual(persisted[0].seen, ["bad"]);
+});
+
+test("a refused message with no usable id cannot be remembered, so it is reported each time", () => {
+  // There is no key to remember it by; the caller's limiter bounds the lines.
+  const reported: string[] = [];
+  const poller = new MessagePoller({} as never, { onInvalid: (d) => reported.push(d) });
+  const noId = { ...msg("m1"), id: "", content: { rich: true } } as unknown as ChannelMessage;
+  assert.deepEqual(poller.accept([noId]), []);
+  assert.deepEqual(poller.accept([noId]), []);
+  assert.equal(reported.length, 2);
+});
+
+test("accept reports a repaired message and delivers the repaired form", () => {
+  const reported: string[] = [];
+  const poller = new MessagePoller({} as never, { onInvalid: (d) => reported.push(d) });
+  const huge = msg("big", "z".repeat(MAX_INBOUND_CONTENT_BYTES + 10));
+  const fresh = poller.accept([huge]);
+  assert.equal(fresh.length, 1);
+  assert.match(fresh[0].content, /\[chaos-relay: content truncated/);
+  assert.equal(reported.length, 1);
+  assert.match(reported[0], /repaired an inbound message: message big: content truncated/);
+  assert.equal(poller.cursor, "2026-01-01T00:00:00Z", "a delivered message still advances the cursor");
 });

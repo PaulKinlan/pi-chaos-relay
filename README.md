@@ -459,6 +459,23 @@ Terminal/local turns are never gated.
 4. Done. Email text and attachments sent to the inbound address reach the agent;
    replies go back to the sender via `relay_reply`.
 
+### What happens to a broken or oversized message
+
+The relay forwards channel payloads as-is, so every inbound message is checked
+before the agent sees it. A message that is missing a required field, carries a
+field of the wrong type, or has a timestamp that is not ISO-8601 (which would
+corrupt the persisted resume cursor) is **dropped and reported** in the log as
+`WARN: dropped an inbound message: <why>`. It is never half-delivered, and
+because its id is remembered the replay that follows (the relay resends until
+the cursor passes it) is silent and never reaches the agent.
+
+A message that is merely too big is delivered in a repaired form with a warning:
+content over **256 KiB** is truncated and ends with
+`[chaos-relay: content truncated at 262144 bytes, from <n> bytes]`, only the
+first **3** attachments are fetched, and an inbound WebSocket frame over
+**1 MiB** is dropped before it is even parsed. A missing timestamp is delivered,
+but it cannot advance the resume cursor.
+
 ## How inbound delivery works
 
 While a pi session is active, the extension holds a **WebSocket** to the relay

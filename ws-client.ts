@@ -26,6 +26,11 @@
  */
 
 import type { ChannelMessage } from "./relay-client.ts";
+import {
+  MAX_INBOUND_FRAME_BYTES,
+  frameIssueLimiter,
+  parseInboundMessage,
+} from "./inbound-message.ts";
 import { redactUrlSecretsFromMessage } from "./url-redact.ts";
 
 /**
@@ -108,6 +113,7 @@ export class RelayWebSocket {
   /** Pending reply acks, keyed by a client-side correlation id. */
   private pending = new Map<string, PendingReply>();
   private replySeq = 0;
+  private readonly limitFrameIssue = frameIssueLimiter();
 
   constructor(opts: RelayWebSocketOptions) {
     this.opts = opts;
@@ -116,6 +122,17 @@ export class RelayWebSocket {
 
   private log(msg: string): void {
     this.opts.log?.(msg);
+  }
+
+  /**
+   * Log a refused or repaired inbound frame, at most a few times per distinct
+   * reason: the relay replays a frame the client refused (the cursor cannot move
+   * past a message that was never delivered), so an unbounded log line per replay
+   * would let one broken frame fill the operator's log file.
+   */
+  private logFrameIssue(detail: string): void {
+    const line = this.limitFrameIssue(detail);
+    if (line) this.log(`WARN: ${line}`);
   }
 
   get connected(): boolean {
@@ -288,7 +305,17 @@ export class RelayWebSocket {
   }
 
   private handleFrame(raw: string): void {
-    if (!raw) return;
+    if (typeof raw !== "string" || !raw) return;
+    // The size bound is checked on the raw bytes, before JSON.parse, so a hostile
+    // relay cannot make the client allocate a parse tree for a frame that could
+    // never be a channel message.
+    const frameBytes = Buffer.byteLength(raw, "utf8");
+    if (frameBytes > MAX_INBOUND_FRAME_BYTES) {
+      this.logFrameIssue(
+        `dropping relay frame: ${frameBytes} bytes exceeds the ${MAX_INBOUND_FRAME_BYTES} byte limit`,
+      );
+      return;
+    }
     let data: Record<string, unknown>;
     try {
       const parsed: unknown = JSON.parse(raw);
@@ -307,8 +334,19 @@ export class RelayWebSocket {
     }
     switch (data.type) {
       case "message": {
-        const msg = data.message as ChannelMessage | undefined;
-        if (msg && msg.id) this.opts.onMessage([msg]);
+        // Shape-checked here as well as in the poller (which also covers the HTTP
+        // transport): a pushed frame is the only input that reaches `onMessage`
+        // without passing a poll, so nothing malformed should be handed to the
+        // extension's delivery path at all.
+        const parsed = parseInboundMessage(data.message);
+        if (!parsed.ok) {
+          this.logFrameIssue(`dropping inbound message frame: ${parsed.reason}`);
+          break;
+        }
+        for (const warning of parsed.warnings) {
+          this.logFrameIssue(`repaired inbound message frame: ${warning}`);
+        }
+        this.opts.onMessage([parsed.message]);
         break;
       }
       case "reply_ack": {

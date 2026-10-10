@@ -70,6 +70,7 @@ import {
   type RegisteredChannelRecord,
 } from "./config.ts";
 import { MessagePoller, formatMessagesForAgent } from "./poller.ts";
+import { frameIssueLimiter } from "./inbound-message.ts";
 import {
   formatReplyConfirmation,
   formatReplyRefusal,
@@ -505,6 +506,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   // Create a poller that resumes from the persisted cursor and writes the
   // cursor back as it advances, so a restart doesn't re-read the relay backlog.
   function makePoller(c: RelayClient): MessagePoller {
+    // Bound the log lines a broken relay can produce: see frameIssueLimiter.
+    const limitFrameIssue = frameIssueLimiter();
     // Cursor + de-dup log come from the side-car state file (falling back to
     // the legacy in-config fields on first run after upgrade), so the delivery
     // hot path never rewrites the profile config at all.
@@ -518,6 +521,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       // WebSocket message-delivery path — never let a disk error here become
       // an uncaughtException that kills pi. Losing an update at worst re-reads
       // a little backlog; the de-dup log filters the rest.
+      onInvalid: (detail) => {
+        const line = limitFrameIssue(detail);
+        if (line) log(`WARN: ${line}`);
+      },
       onPersist: ({ since, seen }) => {
         try {
           saveMessageState({ cursor: since, seenIds: seen });
