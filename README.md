@@ -469,6 +469,13 @@ corrupt the persisted resume cursor) is **dropped and reported** in the log as
 because its id is remembered the replay that follows (the relay resends until
 the cursor passes it) is silent and never reaches the agent.
 
+Reporting is capped so a misbehaving relay cannot fill the log: the first three
+occurrences of each *kind* of problem are logged, the fourth adds "further
+occurrences of this are not logged", and after that the kind is silent for the
+rest of the session. A different kind still reports. If you are chasing a
+message that never arrived, that message's kind may already have used its three
+lines — the relay's own logs are then the next place to look.
+
 A message that is merely too big is delivered in a repaired form, with a warning
 in the log **and** a note in the delivered content, because a repair the agent
 cannot see is a repair it cannot ask you about:

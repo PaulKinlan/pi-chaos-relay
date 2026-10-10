@@ -58,12 +58,16 @@ export const MAX_INBOUND_FRAME_BYTES = MAX_CONTROL_PLANE_BYTES;
 export const KNOWN_CHANNEL_TYPES = ["webhook", "telegram", "discord", "email", "slack"] as const;
 
 /**
- * ISO-8601 with an explicit zone. The resume cursor is compared as a plain
- * string (`poller.ts`: `msg.timestamp > this.since`), which is only chronological
- * for this shape — a parseable-but-differently-shaped date (or an epoch number)
- * would corrupt the persisted cursor and silently skip backlog.
+ * ISO-8601 with an explicit zone — `Z` or an offset, which is what a relay may
+ * reason about (`Date.parse` rejects nothing else that would sort by instant).
+ *
+ * The shape is pinned because the cursor value is handed BACK to the relay as
+ * `since` and the relay may compare it as it likes, including as a string against
+ * what it stored; a date-like string it never produced is the thing to refuse.
+ * On the client side `MessagePoller.accept` compares instants, so fractional
+ * seconds and offsets order correctly here.
  */
-const ISO_8601_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+const ISO_8601_WITH_ZONE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 /**
  * A parsed problem with an inbound message.
@@ -228,9 +232,9 @@ export function parseInboundMessage(
   // A MISSING timestamp is delivered: it cannot move the resume cursor (which is
   // only advanced by the ISO-8601 value checked below), so it is safe, and it is
   // the pre-existing behaviour for a channel that does not stamp its messages.
-  // A PRESENT timestamp that is not ISO-8601 is refused: the cursor is compared
-  // as a plain string, so a differently shaped value can park it on something no
-  // future timestamp beats and stall the queue permanently.
+  // A PRESENT timestamp that is not ISO-8601 with a zone is refused, because the
+  // value is stored verbatim and sent back to the relay as `since`: a shape the
+  // relay never produced could be compared wrongly on its side and skip backlog.
   const rawTimestamp = raw.timestamp;
   const timestampAbsent =
     rawTimestamp === undefined ||
@@ -240,7 +244,7 @@ export function parseInboundMessage(
   if (!timestampAbsent) {
     if (
       typeof rawTimestamp !== "string" ||
-      !ISO_8601_UTC_RE.test(rawTimestamp) ||
+      !ISO_8601_WITH_ZONE_RE.test(rawTimestamp) ||
       !Number.isFinite(Date.parse(rawTimestamp))
     ) {
       return refusal(
