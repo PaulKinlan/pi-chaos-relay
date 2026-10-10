@@ -18,7 +18,11 @@ failing check plus the fix, which beats guessing.
 It reports ✓/✗ on each of:
 
 1. **Config file parses** — `~/.pi/chaos-relay.json` is valid JSON.
-2. **Relay URL is valid http(s)** — an absolute `http://`/`https://` URL.
+2. **Relay URL is valid https (or loopback http)** — an absolute URL that is
+   `https://`, or `http://` only on a loopback host. A separate line flags a
+   plaintext external URL that is only in use because
+   `CHAOS_RELAY_ALLOW_INSECURE_HTTP=1` is set (the API key crosses the network in
+   the clear).
 3. **ECDSA identity (keypair)** — the durable identity; the API key is derived
    from it.
 4. **Session API key** — auto-issued from the keypair (re-issued on next connect

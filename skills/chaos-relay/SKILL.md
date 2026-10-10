@@ -37,6 +37,12 @@ Only fall back to the interactive `/chaos-relay setup` wizard if the user
 `--advanced` exposes. Env vars (`CHAOS_RELAY_URL`, `CHAOS_RELAY_API_KEY`) still
 override everything for headless/explicit setups.
 
+A relay URL must be `https://`, or `http://` on a loopback host
+(`localhost` / `127.0.0.1` / `[::1]`): plaintext to an external host would send
+the API key in the clear, so it is refused with an explanation. Only if the user
+explicitly wants a plaintext LAN relay, set
+`CHAOS_RELAY_ALLOW_INSECURE_HTTP=1` (each connect then logs a warning).
+
 ## Connecting each channel type
 
 **Telegram** (most common):

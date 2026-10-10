@@ -136,6 +136,14 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
   block the agent (see `DEFAULT_TIMEOUT_MS` in `relay-client.ts`).
 - The canonical relay server lives in `~/chaos/packages/server`; match its
   API spec (`~/chaos/docs/relay-api-spec.md`).
+- The relay URL carries the bearer API key, so `isValidRelayUrl` accepts
+  `https://` anywhere and `http://` only on loopback (`localhost`, 127.0.0.0/8,
+  `[::1]`). Never weaken that to a scheme check: a plaintext external URL sends
+  the key in every request and in the WebSocket `?token=` query string.
+  `CHAOS_RELAY_ALLOW_INSECURE_HTTP=1` is the only bypass, it is off unless set,
+  and any connect that relies on it logs a warning. A refused plaintext URL must
+  fail closed — never fall back to `DEFAULT_RELAY_URL` for a session that is
+  already bound, and never let the failure be reported as a malformed URL.
 - Background delivery is bound to ONE session runtime, and there is nothing to
   re-arm: an event handler's `ExtensionContext` has no `sendUserMessage` (only
   `ExtensionAPI` and `ReplacedSessionContext` do). For `/new`, `/resume` and
