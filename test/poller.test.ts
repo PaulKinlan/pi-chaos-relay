@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { MessagePoller, formatMessagesForAgent } from "../poller.ts";
-import { MAX_INBOUND_CONTENT_BYTES } from "../inbound-message.ts";
+import { MAX_INBOUND_CONTENT_BYTES, MAX_INBOUND_FRAME_BYTES } from "../inbound-message.ts";
+import type { InboundIssue } from "../inbound-message.ts";
 import type { PollerPersistState } from "../poller.ts";
 import type { ChannelMessage, GetMessagesResult, RelayClient } from "../relay-client.ts";
 
@@ -417,17 +418,18 @@ test("requeue handles a batch with no usable timestamp", () => {
 // the one point they share, so this is where the fields are checked.
 
 test("accept refuses a malformed message, reports why, and delivers nothing", () => {
-  const reported: string[] = [];
+  const reported: InboundIssue[] = [];
   const poller = new MessagePoller({} as never, { onInvalid: (d) => reported.push(d) });
   const malformed = { ...msg("bad"), attachments: "not-an-array" } as unknown as ChannelMessage;
   assert.deepEqual(poller.accept([malformed]), []);
   assert.equal(reported.length, 1);
-  assert.match(reported[0], /dropped an inbound message: message bad: attachments is not an array/);
+  assert.equal(reported[0].code, "attachments-not-array");
+  assert.match(reported[0].detail, /dropped an inbound message: message "bad": attachments is not an array/);
   assert.equal(poller.cursor, undefined, "a refused message never moves the cursor");
 });
 
 test("accept delivers the valid messages in a batch and refuses only the bad one", () => {
-  const reported: string[] = [];
+  const reported: InboundIssue[] = [];
   const poller = new MessagePoller({} as never, { onInvalid: (d) => reported.push(d) });
   const batch = [
     msg("m1"),
@@ -439,12 +441,13 @@ test("accept delivers the valid messages in a batch and refuses only the bad one
     ["m1", "m3"],
   );
   assert.equal(reported.length, 1);
-  assert.match(reported[0], /message m2: timestamp is not an ISO-8601 timestamp/);
+  assert.equal(reported[0].code, "timestamp-not-iso");
+  assert.match(reported[0].detail, /message "m2": timestamp is not an ISO-8601 timestamp/);
   assert.equal(poller.cursor, "2026-01-01T00:00:00Z");
 });
 
 test("a refused message is remembered so a relay replay is neither reported nor delivered", () => {
-  const reported: string[] = [];
+  const reported: InboundIssue[] = [];
   const persisted: PollerPersistState[] = [];
   const poller = new MessagePoller({} as never, {
     onInvalid: (d) => reported.push(d),
@@ -465,22 +468,84 @@ test("a refused message is remembered so a relay replay is neither reported nor 
 
 test("a refused message with no usable id cannot be remembered, so it is reported each time", () => {
   // There is no key to remember it by; the caller's limiter bounds the lines.
-  const reported: string[] = [];
+  const reported: InboundIssue[] = [];
   const poller = new MessagePoller({} as never, { onInvalid: (d) => reported.push(d) });
   const noId = { ...msg("m1"), id: "", content: { rich: true } } as unknown as ChannelMessage;
   assert.deepEqual(poller.accept([noId]), []);
   assert.deepEqual(poller.accept([noId]), []);
   assert.equal(reported.length, 2);
+  assert.equal(reported[0].code, "id-unusable");
 });
 
 test("accept reports a repaired message and delivers the repaired form", () => {
-  const reported: string[] = [];
+  const reported: InboundIssue[] = [];
   const poller = new MessagePoller({} as never, { onInvalid: (d) => reported.push(d) });
   const huge = msg("big", "z".repeat(MAX_INBOUND_CONTENT_BYTES + 10));
   const fresh = poller.accept([huge]);
   assert.equal(fresh.length, 1);
   assert.match(fresh[0].content, /\[chaos-relay: content truncated/);
   assert.equal(reported.length, 1);
-  assert.match(reported[0], /repaired an inbound message: message big: content truncated/);
+  assert.equal(reported[0].code, "content-truncated");
+  assert.match(reported[0].detail, /repaired an inbound message: message "big": content truncated/);
   assert.equal(poller.cursor, "2026-01-01T00:00:00Z", "a delivered message still advances the cursor");
+});
+
+// --- accept(): review round 1 (4rr) -----------------------------------------
+
+test("a message repaired once reports one repair and the ORIGINAL size", () => {
+  // The WebSocket layer validates a pushed frame and forwards it UNCHANGED, so
+  // this is the only repair pass. If the frame layer repaired too, its marker
+  // would push the content back over the cap and the agent would be told the
+  // wrong "from <n> bytes".
+  const reported: InboundIssue[] = [];
+  const poller = new MessagePoller({} as never, { onInvalid: (d) => reported.push(d) });
+  const body = "q".repeat(600_000);
+  const fresh = poller.accept([msg("m-big", body)]);
+  assert.equal(reported.filter((r) => r.code === "content-truncated").length, 1);
+  assert.match(fresh[0].content, /\[chaos-relay: content truncated at \d+ bytes, from 600000 bytes\]/);
+  assert.ok(Buffer.byteLength(body, "utf8") < MAX_INBOUND_FRAME_BYTES, "the fixture is a legal frame");
+});
+
+test("a replayed message does not repeat its repair warnings", () => {
+  const reported: InboundIssue[] = [];
+  const poller = new MessagePoller({} as never, { onInvalid: (d) => reported.push(d) });
+  // An untimestamped message is delivered (never advances the cursor), so the
+  // relay legitimately replays it on every poll.
+  const untimestamped = { ...msg("no-ts"), timestamp: "" } as unknown as ChannelMessage;
+  assert.equal(poller.accept([untimestamped]).length, 1);
+  assert.equal(reported.length, 1);
+  assert.equal(poller.accept([untimestamped]).length, 0);
+  assert.equal(reported.length, 1, "the replay is silent");
+});
+
+test("a non-array poll result is refused as a whole, not iterated", () => {
+  const reported: InboundIssue[] = [];
+  const poller = new MessagePoller({} as never, { onInvalid: (d) => reported.push(d) });
+  assert.deepEqual(poller.accept("three" as unknown as unknown[]), []);
+  assert.deepEqual(poller.accept(undefined as unknown as unknown[]), []);
+  assert.equal(reported.length, 2);
+  assert.ok(reported.every((r) => r.code === "messages-not-array"));
+  assert.equal(poller.cursor, undefined);
+});
+
+test("the cursor advances by instant, not by string order", () => {
+  const at = (timestamps: string[]) =>
+    new MessagePoller({} as never).accept(timestamps.map((timestamp, i) => ({ ...msg(`m${i}`), timestamp })))
+      .length;
+  // Fractional seconds: "01.5Z" is LATER than "01Z" but sorts before it.
+  const fractional = new MessagePoller({} as never);
+  fractional.accept([{ ...msg("a"), timestamp: "2026-01-01T00:00:01Z" }]);
+  fractional.accept([{ ...msg("b"), timestamp: "2026-01-01T00:00:01.5Z" }]);
+  assert.equal(fractional.cursor, "2026-01-01T00:00:01.5Z");
+  // Offsets: 05:00+05:00 is the same instant as 03:00Z, so it must not move the
+  // cursor (and the reverse — an earlier instant in another spelling — must not
+  // move it either).
+  const offsets = new MessagePoller({} as never);
+  offsets.accept([{ ...msg("c"), timestamp: "2026-01-01T03:00:00Z" }]);
+  offsets.accept([{ ...msg("d"), timestamp: "2026-01-01T05:00:00+05:00" }]);
+  assert.equal(offsets.cursor, "2026-01-01T03:00:00Z");
+  // 09:00+05:00 is 04:00Z, a genuinely later instant, so it does advance.
+  offsets.accept([{ ...msg("e"), timestamp: "2026-01-01T09:00:00+05:00" }]);
+  assert.equal(offsets.cursor, "2026-01-01T09:00:00+05:00");
+  assert.equal(at([]), 0);
 });

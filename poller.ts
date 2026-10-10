@@ -9,6 +9,7 @@
 
 import type { ChannelMessage, RelayClient, ReplyReference } from "./relay-client.ts";
 import { resolveReplyTo } from "./relay-client.ts";
+import type { InboundIssue } from "./inbound-message.ts";
 import { inboundMessageId, parseInboundMessage } from "./inbound-message.ts";
 import { randomBytes } from "node:crypto";
 
@@ -26,7 +27,7 @@ export class MessagePoller {
   private seen: Set<string>;
   private readonly client: RelayClient;
   private readonly onPersist?: (state: PollerPersistState) => void;
-  private readonly onInvalid?: (detail: string) => void;
+  private readonly onInvalid?: (issue: InboundIssue) => void;
 
   constructor(
     client: RelayClient,
@@ -46,10 +47,10 @@ export class MessagePoller {
       /**
        * Report a refused or repaired inbound message. This is the one point both
        * transports share, so it is where the relay's payloads are shape-checked
-       * (see `inbound-message.ts`); the detail names the field and never echoes
-       * message contents. The caller owns rate-limiting the log.
+       * (see `inbound-message.ts`). The issue names the field, clips anything the
+       * relay chose, and carries a stable `code` the caller rate-limits on.
        */
-      onInvalid?: (detail: string) => void;
+      onInvalid?: (issue: InboundIssue) => void;
     } = {},
   ) {
     this.client = client;
@@ -109,6 +110,16 @@ export class MessagePoller {
   accept(messages: readonly unknown[]): ChannelMessage[] {
     const fresh: ChannelMessage[] = [];
     let rememberedRejected = false;
+    // The relay's own envelope is untrusted too: a non-array `messages` would
+    // otherwise be iterated (a string, character by character) and reported as a
+    // pile of unrelated refusals.
+    if (!Array.isArray(messages)) {
+      this.onInvalid?.({
+        code: "messages-not-array",
+        detail: "dropped a poll result: messages is not an array",
+      });
+      return fresh;
+    }
     for (const candidate of messages) {
       // The relay forwards channel payloads as-is over both transports, so the
       // declared type is a claim, not a fact: validate before anything here or
@@ -130,20 +141,36 @@ export class MessagePoller {
           this.seen.add(rejectedId);
           rememberedRejected = true;
         }
-        this.onInvalid?.(`dropped an inbound message: ${parsed.reason}`);
+        this.onInvalid?.({
+          code: parsed.code,
+          detail: `dropped an inbound message: ${parsed.detail}`,
+        });
         continue;
       }
-      for (const warning of parsed.warnings) {
-        this.onInvalid?.(`repaired an inbound message: ${warning}`);
-      }
       const msg = parsed.message;
+      // Dedup BEFORE reporting repairs: a replayed batch (the relay resends until
+      // the cursor passes it) must not repeat the repair warnings either.
       if (this.seen.has(msg.id)) continue;
       this.seen.add(msg.id);
+      for (const warning of parsed.warnings) {
+        this.onInvalid?.({
+          code: warning.code,
+          detail: `repaired an inbound message: ${warning.detail}`,
+        });
+      }
       fresh.push(msg);
-      // Advance the resume cursor to the latest delivered timestamp. ISO-8601
-      // strings compare chronologically, so a string compare is sufficient.
-      if (msg.timestamp && (!this.since || msg.timestamp > this.since)) {
-        this.since = msg.timestamp;
+      // Advance the resume cursor to the latest delivered timestamp. Compare
+      // INSTANTS, not strings: ISO-8601 with a zone is not string-sortable
+      // (`…00.5Z` sorts before `…00Z`, and an offset such as `+05:00` sorts after
+      // a later `Z` timestamp), so a string compare can leave the cursor behind
+      // the newest delivery. The stored value stays verbatim, so what the relay
+      // receives as `since` is still one of its own timestamps.
+      if (msg.timestamp) {
+        const at = Date.parse(msg.timestamp);
+        const current = this.since === undefined ? Number.NaN : Date.parse(this.since);
+        if (!Number.isFinite(current) || (Number.isFinite(at) && at > current)) {
+          this.since = msg.timestamp;
+        }
       }
     }
     // Keep the dedup set from growing without bound.

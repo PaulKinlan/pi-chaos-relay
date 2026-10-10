@@ -126,9 +126,13 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
   as-is and signs nothing, so this is the boundary: a message whose field would
   break or corrupt state is refused and reported, an oversized/extra payload is
   repaired with a warning (content truncated at 256 KiB with a visible marker,
-  first 3 attachments, 200-char filenames), and a missing timestamp is delivered
-  but never allowed to move the resume cursor. `ws-client.ts` bounds the raw frame
-  (1 MiB, before `JSON.parse`) on top of that.
+  first 3 attachments, 200-char filenames, with a visible note in the delivered
+  content for anything not delivered), and a missing timestamp is delivered but
+  never allowed to move the resume cursor (which is compared as an instant, not as
+  a string). `ws-client.ts` bounds the raw frame — the same 5 MiB as
+  `MAX_CONTROL_PLANE_BYTES`, before `JSON.parse` — and uses the parser as a
+  VERDICT ONLY, forwarding the message unchanged so the repair and its single log
+  line happen exactly once, in `accept`.
 - `profile-lock.ts` — the profile lock protocol: exclusive claim, refuse a live
   holder, reclaim a stale/ambiguous file after the create grace. index.ts keeps
   the policy around it (when to claim, what to tell the user, shutdown release).

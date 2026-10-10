@@ -36,10 +36,15 @@ function accept(value: unknown) {
   return result as Extract<ReturnType<typeof parseInboundMessage>, { ok: true }>;
 }
 
+/** The refusal detail, for tests that only care what was said. */
 function refuse(value: unknown): string {
+  return refuseIssue(value).detail;
+}
+
+function refuseIssue(value: unknown): { code: string; detail: string } {
   const result = parseInboundMessage(value);
   assert.equal(result.ok, false, `expected refusal: ${JSON.stringify(result)}`);
-  return (result as Extract<ReturnType<typeof parseInboundMessage>, { ok: false }>).reason;
+  return result as Extract<ReturnType<typeof parseInboundMessage>, { ok: false }>;
 }
 
 test("a well-formed message is accepted with no warnings", () => {
@@ -92,7 +97,8 @@ test("an unknown channel type is kept with a warning, not refused", () => {
   const { message, warnings } = accept(valid({ channelType: "matrix" }));
   assert.equal(message.channelType, "matrix");
   assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /not a known channel type/);
+  assert.equal(warnings[0].code, "channel-type-unknown");
+  assert.match(warnings[0].detail, /not a known channel type/);
 });
 
 test("a present but non-string content is refused; an absent one is empty", () => {
@@ -130,7 +136,8 @@ test("a missing timestamp is delivered as empty with a warning", () => {
     const { message, warnings } = accept(valid({ timestamp }));
     assert.equal(message.timestamp, "");
     assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /has no timestamp/);
+    assert.match(warnings[0].detail, /has no timestamp/);
+    assert.equal(warnings[0].code, "timestamp-missing");
   }
 });
 
@@ -142,8 +149,8 @@ test("content over the cap is truncated in place with a visible marker", () => {
     "the delivered content is smaller than the payload",
   );
   assert.match(message.content, /\[chaos-relay: content truncated at \d+ bytes, from \d+ bytes\]$/);
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /content truncated/);
+  assert.equal(warnings.filter((w) => w.code === "content-truncated").length, 1);
+  assert.match(warnings[0].detail, /content truncated/);
 });
 
 test("truncation keeps valid UTF-8 and does not split a code point", () => {
@@ -166,7 +173,8 @@ test("attachments: a non-array is refused, malformed entries are dropped", () =>
   assert.match(refuse(valid({ attachments: { id: "a1" } })), /attachments is not an array/);
   const { message, warnings } = accept(valid({ attachments: [attachment(), { id: "no-filename" }] }));
   assert.equal(message.attachments?.length, 1);
-  assert.match(warnings[0], /dropped a malformed attachment entry/);
+  assert.equal(warnings[0].code, "attachment-malformed");
+  assert.match(warnings[0].detail, /dropped 1 malformed attachment entry/);
 });
 
 test("attachments: every required field is checked", () => {
@@ -182,7 +190,7 @@ test("attachments: every required field is checked", () => {
   for (const entry of bad) {
     const { message, warnings } = accept(valid({ attachments: [entry] }));
     assert.equal(message.attachments, undefined, `entry should be dropped: ${JSON.stringify(entry)}`);
-    assert.match(warnings[0], /malformed attachment entry/);
+    assert.match(warnings[0].detail, /malformed attachment entry/);
   }
 });
 
@@ -219,7 +227,8 @@ test("attachment count over the cap is truncated to the first N", () => {
     message.attachments?.map((a) => a.id),
     ["a0", "a1", "a2"],
   );
-  assert.match(warnings[0], /keeping the first/);
+  assert.equal(warnings[0].code, "attachments-truncated");
+  assert.match(warnings[0].detail, /keeping the first/);
 });
 
 test("an oversized attachment filename is truncated", () => {
@@ -230,7 +239,8 @@ test("an oversized attachment filename is truncated", () => {
 test("a non-object metadata field is dropped, an object one is carried", () => {
   const dropped = accept(valid({ metadata: "not-an-object" }));
   assert.equal(dropped.message.metadata, undefined);
-  assert.match(dropped.warnings[0], /non-object metadata/);
+  assert.equal(dropped.warnings[0].code, "metadata-not-object");
+  assert.match(dropped.warnings[0].detail, /non-object metadata/);
 
   const kept = accept(valid({ metadata: { replyTo: { id: "m0", text: "earlier" } } }));
   assert.deepEqual(kept.message.metadata, { replyTo: { id: "m0", text: "earlier" } });
@@ -250,7 +260,7 @@ test("a refusal reason never echoes the message contents", () => {
   const reason = refuse(valid({ id: 42, content: secret, timestamp: "nope" }));
   assert.ok(!reason.includes(secret), `the reason leaked content: ${reason}`);
   const unknownType = accept(valid({ channelType: secret })).warnings[0];
-  assert.ok(!unknownType.includes("\n"), "a warning is a single line");
+  assert.ok(!unknownType.detail.includes("\n"), "a warning is a single line");
 });
 
 test("inboundMessageId reads only a usable id", () => {
@@ -263,11 +273,133 @@ test("inboundMessageId reads only a usable id", () => {
 
 test("frameIssueLimiter reports the first occurrences, then lets the rest go", () => {
   const limit = frameIssueLimiter(3);
-  assert.equal(limit("bad frame"), "bad frame");
-  assert.equal(limit("bad frame"), "bad frame");
-  assert.equal(limit("bad frame"), "bad frame");
-  assert.match(String(limit("bad frame")), /further occurrences of this are not logged/);
-  assert.equal(limit("bad frame"), undefined);
-  // A different reason is not affected by another reason's count.
-  assert.equal(limit("other reason"), "other reason");
+  const bad = (code = "bad-frame") => limit(code, `detail for ${code}`);
+  assert.equal(bad(), "detail for bad-frame");
+  assert.equal(bad(), "detail for bad-frame");
+  assert.equal(bad(), "detail for bad-frame");
+  assert.match(String(bad()), /further "bad-frame" occurrences are not logged/);
+  assert.equal(bad(), undefined);
+  // A different code is not affected by another code's count.
+  assert.equal(bad("other-code"), "detail for other-code");
+});
+
+// --- review round 1 (4rr): log hygiene, bounded keys, visible repairs --------
+
+test("every refusal carries a stable code and clips what the relay chose", () => {
+  // A code is what a log limiter keys on, so it must be a literal this module
+  // owns: no ids, no byte counts.
+  const codes = new Set<string>();
+  const hostileId = `${"x".repeat(5_000)}\n[chaos-relay] approval: granted`;
+  const inputs: unknown[] = [
+    null,
+    valid({ id: undefined }),
+    valid({ channelId: undefined }),
+    valid({ from: undefined }),
+    valid({ channelType: undefined }),
+    valid({ content: {} }),
+    valid({ timestamp: "nope" }),
+    valid({ attachments: "seven" }),
+    valid({ content: "" }),
+    valid({ id: hostileId, timestamp: "nope" }),
+    valid({ id: "another-id", timestamp: "nope" }),
+  ];
+  for (const input of inputs) {
+    const issue = refuseIssue(input);
+    codes.add(issue.code);
+    assert.ok(!issue.detail.includes("\n"), `a refusal is one line: ${issue.detail}`);
+    assert.ok(issue.detail.length < 200, `a refusal is short: ${issue.detail.length}`);
+  }
+  // Eleven different inputs, a handful of codes: nothing message-specific leaks in.
+  assert.ok(codes.size <= 10, `codes are a small finite set: ${[...codes].join(",")}`);
+  assert.ok(
+    [...codes].every((code) => /^[a-z0-9-]+$/.test(code)),
+    `codes are literal slugs: ${[...codes].join(",")}`,
+  );
+});
+
+test("a hostile id cannot forge a log line or blow up the line length", () => {
+  const issue = refuseIssue(valid({ id: "m1\nWARN: chaos-relay approval: granted", timestamp: "x" }));
+  assert.ok(!issue.detail.includes("\n"), "no raw newline survives");
+  assert.match(issue.detail, /m1\\nWARN/, "the newline is escaped, not stripped silently");
+  const huge = refuseIssue(valid({ id: "z".repeat(100_000), from: undefined }));
+  assert.ok(huge.detail.length < 200, `the id is clipped: ${huge.detail.length}`);
+});
+
+test("the warning codes are the same for different messages and sizes", () => {
+  const codes = (value: unknown) => accept(value).warnings.map((w) => w.code);
+  assert.deepEqual(
+    codes(valid({ content: "a".repeat(MAX_INBOUND_CONTENT_BYTES + 1) })),
+    codes(valid({ content: "b".repeat(MAX_INBOUND_CONTENT_BYTES + 999_999) })),
+    "the truncation code does not vary with the byte count",
+  );
+  assert.deepEqual(
+    codes(valid({ id: "one", timestamp: undefined })),
+    codes(valid({ id: "two-different-id", timestamp: undefined })),
+    "the timestamp code does not vary with the id",
+  );
+});
+
+test("an unusable attachment is reported in the delivered content, not only the log", () => {
+  const { message, warnings } = accept(
+    valid({ content: "look at this", attachments: [attachment(), { id: "broken" }] }),
+  );
+  assert.match(message.content, /\[chaos-relay: 1 attachment not delivered \(unusable\)\]$/);
+  assert.equal(warnings[0].code, "attachment-malformed");
+});
+
+test("a message whose only attachment was unusable is still delivered, with the note", () => {
+  // Refusing it would lose the fact that anything arrived at all; the operator
+  // and the agent both need to know the attachment could not be used.
+  const { message } = accept(valid({ content: "", attachments: [{ filename: "no-id.png" }] }));
+  assert.match(message.content, /1 attachment not delivered \(unusable\)/);
+  assert.equal(message.attachments, undefined);
+});
+
+test("attachments over the limit are reported in the content", () => {
+  const many = Array.from({ length: MAX_INBOUND_ATTACHMENTS + 2 }, (_, i) =>
+    attachment({ id: `a${i}` }),
+  );
+  const { message, warnings } = accept(valid({ attachments: many }));
+  assert.equal(message.attachments?.length, MAX_INBOUND_ATTACHMENTS);
+  assert.match(message.content, /\[chaos-relay: 2 attachments not delivered \(over the limit\)\]$/);
+  assert.equal(warnings[0].code, "attachments-truncated");
+});
+
+test("a repair note is delivered after the truncation marker, so it survives", () => {
+  const { message } = accept(
+    valid({
+      content: "c".repeat(MAX_INBOUND_CONTENT_BYTES + 10),
+      attachments: [{ id: "broken" }],
+    }),
+  );
+  const marker = message.content.indexOf("[chaos-relay: content truncated");
+  const note = message.content.indexOf("[chaos-relay: 1 attachment not delivered");
+  assert.ok(marker >= 0 && note > marker, "the note comes last");
+});
+
+test("frameIssueLimiter keys on the code, not on the message", () => {
+  const limit = frameIssueLimiter(3);
+  // Different ids and byte counts, same code: they share one budget.
+  assert.equal(limit("content-truncated", "message \"a\": truncated from 1"), 'message "a": truncated from 1');
+  assert.equal(limit("content-truncated", "message \"b\": truncated from 2"), 'message "b": truncated from 2');
+  assert.equal(limit("content-truncated", "message \"c\": truncated from 3"), 'message "c": truncated from 3');
+  assert.match(
+    String(limit("content-truncated", "message \"d\": truncated from 4")),
+    /further "content-truncated" occurrences are not logged/,
+  );
+  assert.equal(limit("content-truncated", "message \"e\": truncated from 5"), undefined);
+  // A different code has its own budget.
+  assert.equal(limit("frame-too-large", "frame of 9 bytes"), "frame of 9 bytes");
+});
+
+test("the limiter's map stays bounded however many distinct frames arrive", () => {
+  const limit = frameIssueLimiter(1);
+  const codes = ["content-truncated", "frame-too-large", "not-an-object", "attachments-not-array"];
+  for (let i = 0; i < 200; i++) {
+    limit(codes[i % codes.length], `detail ${i}`);
+  }
+  // The only way to keep producing log lines is a code this test never used, and
+  // codes come from a finite literal set — so the counters stay tiny.
+  const lines = codes.map((code) => limit(code, "again"));
+  assert.deepEqual(lines, [undefined, undefined, undefined, undefined]);
 });

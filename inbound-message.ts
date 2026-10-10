@@ -22,6 +22,7 @@
  * message is never delivered, and never half-delivered.
  */
 
+import { MAX_CONTROL_PLANE_BYTES } from "./relay-client.ts";
 import type { ChannelMessage, InboundAttachment } from "./relay-client.ts";
 
 /** UTF-8 bytes of `content` delivered for one message before it is truncated. */
@@ -39,12 +40,15 @@ export const MAX_INBOUND_FILENAME_CHARS = 200;
 /**
  * Raw WebSocket frame size. A frame larger than this is dropped before
  * `JSON.parse`, so a hostile relay cannot make the client allocate for a frame
- * that could never be a channel message. Cleared against the two existing HTTP
- * caps (`MAX_CONTROL_PLANE_BYTES` = 5 MB for a whole response body, and the same
- * 5 MB for an attachment download): a single message frame has no business
- * being within an order of magnitude of a whole-backlog response.
+ * that could never be a channel message.
+ *
+ * Deliberately the SAME number as `MAX_CONTROL_PLANE_BYTES`, the cap the HTTP
+ * transport already applies to a whole `/messages` response: a bound the frame
+ * path enforced more tightly than the poll path would make the WebSocket refuse
+ * (and, once the cursor moves past it, permanently lose) a message the HTTP path
+ * would have delivered, truncated by the content cap below.
  */
-export const MAX_INBOUND_FRAME_BYTES = 1024 * 1024;
+export const MAX_INBOUND_FRAME_BYTES = MAX_CONTROL_PLANE_BYTES;
 
 /**
  * Channel types this build knows. A field outside the set is accepted (a relay
@@ -61,10 +65,20 @@ export const KNOWN_CHANNEL_TYPES = ["webhook", "telegram", "discord", "email", "
  */
 const ISO_8601_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
-export interface InboundMessageRejection {
+/**
+ * A parsed problem with an inbound message.
+ *
+ * `code` is a literal this module owns, so a log limiter can key on it and stay
+ * bounded no matter what the relay sends; `detail` is the line to log, which
+ * includes clipped (escaped, length-capped) field values for diagnosis.
+ */
+export interface InboundIssue {
+  code: string;
+  detail: string;
+}
+
+export interface InboundMessageRejection extends InboundIssue {
   ok: false;
-  /** Why the message was dropped. Safe to log: names fields, never echoes contents. */
-  reason: string;
 }
 
 export interface InboundMessageAcceptance {
@@ -72,13 +86,23 @@ export interface InboundMessageAcceptance {
   /** The message to deliver, with repairs applied. */
   message: ChannelMessage;
   /** Repairs and unusual-but-usable fields, each safe to log. */
-  warnings: string[];
+  warnings: InboundIssue[];
 }
 
-/** Echo a value into a log line without control characters and without a length bomb. */
+/**
+ * Echo a value into a log line without control characters and without a length
+ * bomb. `JSON.stringify` escapes newlines and quotes, so a relay-chosen id (or
+ * channel type) cannot forge a line in the operator's log or push a megabyte of
+ * text into it.
+ */
 function clip(value: unknown): string {
   const json = JSON.stringify(value);
   return (json ?? String(value)).slice(0, 60);
+}
+
+/** Refuse, with a stable code and a detail that clips every relay-chosen value. */
+function refusal(code: string, detail: string): InboundMessageRejection {
+  return { ok: false, code, detail };
 }
 
 function nonEmptyString(value: unknown): string | undefined {
@@ -171,31 +195,35 @@ export function parseInboundMessage(
   value: unknown,
 ): InboundMessageAcceptance | InboundMessageRejection {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return { ok: false, reason: "message is not a JSON object" };
+    return refusal("not-an-object", "message is not a JSON object");
   }
   const raw = value as Record<string, unknown>;
 
   const id = idString(raw.id);
-  if (!id) return { ok: false, reason: "message has no usable id" };
+  if (!id) return refusal("id-unusable", "message has no usable id");
+  // Every value the relay chose is clipped before it reaches a log line: an id
+  // with a newline in it would otherwise forge a line, and an id is unbounded.
+  const where = `message ${clip(id)}`;
 
   const channelId = nonEmptyString(raw.channelId);
-  if (!channelId) return { ok: false, reason: `message ${id} has no channelId` };
+  if (!channelId) return refusal("channel-id-missing", `${where} has no channelId`);
   const from = nonEmptyString(raw.from);
-  if (!from) return { ok: false, reason: `message ${id} has no from` };
+  if (!from) return refusal("from-missing", `${where} has no from`);
   const channelType = nonEmptyString(raw.channelType);
-  if (!channelType) return { ok: false, reason: `message ${id} has no channelType` };
+  if (!channelType) return refusal("channel-type-missing", `${where} has no channelType`);
 
-  const warnings: string[] = [];
+  const warnings: InboundIssue[] = [];
   if (!(KNOWN_CHANNEL_TYPES as readonly string[]).includes(channelType)) {
-    warnings.push(
-      `message ${id}: channelType ${clip(channelType)} is not a known channel type`,
-    );
+    warnings.push({
+      code: "channel-type-unknown",
+      detail: `${where}: channelType ${clip(channelType)} is not a known channel type`,
+    });
   }
 
   let content: string;
   if (raw.content === undefined || raw.content === null) content = "";
   else if (typeof raw.content === "string") content = raw.content;
-  else return { ok: false, reason: `message ${id}: content is not a string` };
+  else return refusal("content-not-string", `${where}: content is not a string`);
 
   // A MISSING timestamp is delivered: it cannot move the resume cursor (which is
   // only advanced by the ISO-8601 value checked below), so it is safe, and it is
@@ -215,49 +243,74 @@ export function parseInboundMessage(
       !ISO_8601_UTC_RE.test(rawTimestamp) ||
       !Number.isFinite(Date.parse(rawTimestamp))
     ) {
-      return { ok: false, reason: `message ${id}: timestamp is not an ISO-8601 timestamp` };
+      return refusal(
+        "timestamp-not-iso",
+        `${where}: timestamp is not an ISO-8601 timestamp`,
+      );
     }
     timestamp = rawTimestamp;
   } else {
-    warnings.push(
-      `message ${id} has no timestamp; it is delivered but cannot advance the resume cursor`,
-    );
+    warnings.push({
+      code: "timestamp-missing",
+      detail: `${where} has no timestamp; it is delivered but cannot advance the resume cursor`,
+    });
   }
 
+  /** Repair notes for the delivered content (never truncated away: appended last). */
+  const notes: string[] = [];
   let attachments: InboundAttachment[] = [];
   if (raw.attachments !== undefined && raw.attachments !== null) {
     if (!Array.isArray(raw.attachments)) {
-      return { ok: false, reason: `message ${id}: attachments is not an array` };
+      return refusal("attachments-not-array", `${where}: attachments is not an array`);
     }
     const usable: InboundAttachment[] = [];
+    let unusable = 0;
     for (const entry of raw.attachments) {
       const attachment = parseAttachment(entry);
       if (attachment) usable.push(attachment);
-      else warnings.push(`message ${id}: dropped a malformed attachment entry`);
+      else unusable++;
+    }
+    if (unusable > 0) {
+      warnings.push({
+        code: "attachment-malformed",
+        detail: `${where}: dropped ${unusable} malformed attachment entr${unusable === 1 ? "y" : "ies"}`,
+      });
+      // Say it in the delivered content too: the agent used to get an
+      // "Attachment unavailable" note for these, and a repair the agent cannot
+      // see is a repair it cannot ask the operator about.
+      notes.push(`${unusable} attachment${unusable === 1 ? "" : "s"} not delivered (unusable)`);
     }
     if (usable.length > MAX_INBOUND_ATTACHMENTS) {
-      warnings.push(
-        `message ${id}: ${usable.length} attachments, keeping the first ${MAX_INBOUND_ATTACHMENTS}`,
-      );
+      const dropped = usable.length - MAX_INBOUND_ATTACHMENTS;
+      warnings.push({
+        code: "attachments-truncated",
+        detail: `${where}: ${usable.length} attachments, keeping the first ${MAX_INBOUND_ATTACHMENTS}`,
+      });
+      notes.push(`${dropped} attachment${dropped === 1 ? "" : "s"} not delivered (over the limit)`);
       attachments = usable.slice(0, MAX_INBOUND_ATTACHMENTS);
     } else {
       attachments = usable;
     }
   }
 
-  if (!content && attachments.length === 0) {
-    return { ok: false, reason: `message ${id} carries neither content nor attachments` };
+  // Nothing to deliver only when there is genuinely nothing: a message whose sole
+  // attachment was unusable still carries a note the operator can act on.
+  if (!content && attachments.length === 0 && notes.length === 0) {
+    return refusal("empty-message", `${where} carries neither content nor attachments`);
   }
 
   const contentBytes = Buffer.byteLength(content, "utf8");
   if (contentBytes > MAX_INBOUND_CONTENT_BYTES) {
-    warnings.push(
-      `message ${id}: content truncated to ${MAX_INBOUND_CONTENT_BYTES} bytes (from ${contentBytes})`,
-    );
+    warnings.push({
+      code: "content-truncated",
+      detail: `${where}: content truncated to ${MAX_INBOUND_CONTENT_BYTES} bytes (from ${contentBytes})`,
+    });
     content =
       truncateUtf8(content, MAX_INBOUND_CONTENT_BYTES) +
       `\n\n[chaos-relay: content truncated at ${MAX_INBOUND_CONTENT_BYTES} bytes, from ${contentBytes} bytes]`;
   }
+  // Delivered last so truncation cannot cut a note away.
+  if (notes.length > 0) content = `${content}\n\n[chaos-relay: ${notes.join("; ")}]`;
 
   const message: ChannelMessage = {
     id,
@@ -274,7 +327,10 @@ export function parseInboundMessage(
     if (typeof raw.metadata === "object" && !Array.isArray(raw.metadata)) {
       message.metadata = raw.metadata as Record<string, unknown>;
     } else {
-      warnings.push(`message ${id}: dropped a non-object metadata field`);
+      warnings.push({
+        code: "metadata-not-object",
+        detail: `${where}: dropped a non-object metadata field`,
+      });
     }
   }
   // Reply context is read through `resolveReplyTo`, which accepts several
@@ -287,23 +343,34 @@ export function parseInboundMessage(
 }
 
 /**
- * Bound how often the same rejection is logged.
+ * Bound how often each KIND of problem is logged.
  *
  * A relay (or a plaintext one being tampered with) can replay one malformed
  * frame forever, and the log is a file on the operator's disk. The first
- * {@link max} occurrences of each distinct reason are reported verbatim, the next
- * one says the rest will be silent, and after that the reason is suppressed —
- * so the first occurrence is never hidden and the line count cannot grow without
- * bound. Reasons are fixed strings built by {@link parseInboundMessage}, so this
- * keys on a finite set.
+ * {@link max} occurrences of each {@link InboundIssue.code} are reported, the
+ * next says the rest will be silent, and after that the code is suppressed — so
+ * the first occurrence is never hidden, and neither the line count nor the size
+ * of the counter map can grow with what the relay sends.
+ *
+ * Keying on the code rather than the message is the point: the detail text
+ * carries the relay's id and byte counts, so keying on it would be unbounded
+ * (and would make every oversized frame a fresh key). The code set is the finite
+ * list of literals this module and `ws-client`/`poller` use, which
+ * `test/inbound-message.test.ts` pins.
  */
-export function frameIssueLimiter(max = 3): (reason: string) => string | undefined {
+export function frameIssueLimiter(
+  max = 3,
+): (code: string, detail: string) => string | undefined {
   const seen = new Map<string, number>();
-  return (reason) => {
-    const count = (seen.get(reason) ?? 0) + 1;
-    seen.set(reason, count);
-    if (count <= max) return reason;
-    if (count === max + 1) return `${reason} (further occurrences of this are not logged)`;
+  return (code, detail) => {
+    const count = (seen.get(code) ?? 0) + 1;
+    seen.set(code, count);
+    if (count <= max) return detail;
+    if (count === max + 1) {
+      // `code` is a literal slug this module owns, never relay text, so it is
+      // safe (and readable) to quote directly.
+      return `${detail} (further "${code}" occurrences are not logged)`;
+    }
     return undefined;
   };
 }

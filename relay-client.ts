@@ -33,7 +33,7 @@ export const DEFAULT_TIMEOUT_MS = 15000;
  * oversized body must be rejected before it is buffered, so peak memory stays
  * bounded. Attachment downloads use the same cap via readBoundedBytes.
  */
-const MAX_CONTROL_PLANE_BYTES = 5 * 1024 * 1024; // 5 MB
+export const MAX_CONTROL_PLANE_BYTES = 5 * 1024 * 1024; // 5 MB
 
 /** True for an AbortError raised by our timeout signal. */
 function isTimeoutError(err: unknown): boolean {

@@ -469,12 +469,21 @@ corrupt the persisted resume cursor) is **dropped and reported** in the log as
 because its id is remembered the replay that follows (the relay resends until
 the cursor passes it) is silent and never reaches the agent.
 
-A message that is merely too big is delivered in a repaired form with a warning:
-content over **256 KiB** is truncated and ends with
-`[chaos-relay: content truncated at 262144 bytes, from <n> bytes]`, only the
-first **3** attachments are fetched, and an inbound WebSocket frame over
-**1 MiB** is dropped before it is even parsed. A missing timestamp is delivered,
-but it cannot advance the resume cursor.
+A message that is merely too big is delivered in a repaired form, with a warning
+in the log **and** a note in the delivered content, because a repair the agent
+cannot see is a repair it cannot ask you about:
+
+- content over **256 KiB** is truncated and ends with
+  `[chaos-relay: content truncated at 262144 bytes, from <n> bytes]`;
+- only the first **3** attachments are fetched, and unusable or over-limit ones
+  add `[chaos-relay: <n> attachments not delivered (…)` to the message;
+- an inbound WebSocket frame over **5 MiB** is dropped before it is parsed — the
+  same bound the HTTP transport already applies to a whole `/messages` response,
+  so the push path never refuses something the poll path would have delivered.
+
+A missing timestamp is delivered, but it cannot advance the resume cursor, and
+the cursor is compared as an instant (so a timestamp with fractional seconds or a
+UTC offset orders correctly).
 
 ## How inbound delivery works
 

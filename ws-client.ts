@@ -130,8 +130,8 @@ export class RelayWebSocket {
    * past a message that was never delivered), so an unbounded log line per replay
    * would let one broken frame fill the operator's log file.
    */
-  private logFrameIssue(detail: string): void {
-    const line = this.limitFrameIssue(detail);
+  private logFrameIssue(code: string, detail: string): void {
+    const line = this.limitFrameIssue(code, detail);
     if (line) this.log(`WARN: ${line}`);
   }
 
@@ -312,6 +312,7 @@ export class RelayWebSocket {
     const frameBytes = Buffer.byteLength(raw, "utf8");
     if (frameBytes > MAX_INBOUND_FRAME_BYTES) {
       this.logFrameIssue(
+        "frame-too-large",
         `dropping relay frame: ${frameBytes} bytes exceeds the ${MAX_INBOUND_FRAME_BYTES} byte limit`,
       );
       return;
@@ -338,15 +339,18 @@ export class RelayWebSocket {
         // transport): a pushed frame is the only input that reaches `onMessage`
         // without passing a poll, so nothing malformed should be handed to the
         // extension's delivery path at all.
-        const parsed = parseInboundMessage(data.message);
-        if (!parsed.ok) {
-          this.logFrameIssue(`dropping inbound message frame: ${parsed.reason}`);
+        //
+        // The verdict is all this layer uses. The message is forwarded UNCHANGED
+        // and repaired in `MessagePoller.accept`, so the repair — and the single
+        // log line for it — happens exactly once, with the original byte counts
+        // still in front of it. Repairing here as well re-truncated the marker it
+        // had just appended and reported the wrong `from <n> bytes` to the agent.
+        const verdict = parseInboundMessage(data.message);
+        if (!verdict.ok) {
+          this.logFrameIssue(verdict.code, `dropping inbound message frame: ${verdict.detail}`);
           break;
         }
-        for (const warning of parsed.warnings) {
-          this.logFrameIssue(`repaired inbound message frame: ${warning}`);
-        }
-        this.opts.onMessage([parsed.message]);
+        this.opts.onMessage([data.message as ChannelMessage]);
         break;
       }
       case "reply_ack": {

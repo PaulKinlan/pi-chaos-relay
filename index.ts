@@ -521,8 +521,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       // WebSocket message-delivery path — never let a disk error here become
       // an uncaughtException that kills pi. Losing an update at worst re-reads
       // a little backlog; the de-dup log filters the rest.
-      onInvalid: (detail) => {
-        const line = limitFrameIssue(detail);
+      onInvalid: (issue) => {
+        const line = limitFrameIssue(issue.code, issue.detail);
         if (line) log(`WARN: ${line}`);
       },
       onPersist: ({ since, seen }) => {

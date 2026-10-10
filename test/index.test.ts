@@ -4228,7 +4228,7 @@ test("the safety poll refuses a malformed message once and still delivers the va
     1,
     `one refusal was reported: ${afterFirst}`,
   );
-  assert.match(afterFirst, /m-bad: attachments is not an array/);
+  assert.match(afterFirst, /message "m-bad": attachments is not an array/);
   assert.equal(sent.length, 1, `only the valid message was delivered: ${JSON.stringify(sent)}`);
   assert.match(sent[0], /deliver me/);
   assert.ok(!sent[0].includes("m-bad"), "the refused message never reached the prompt");
