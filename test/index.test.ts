@@ -3707,3 +3707,91 @@ test("a delivery in flight across session_shutdown is handed back before the rep
     else process.env.CHAOS_RELAY_URL = prevUrl;
   }
 });
+
+test("a safety poll awaiting the relay when the session is replaced does not consume", (t) => {
+  // The WS is down, so the safety poll is the delivery path. poll() is
+  // accept(await pollRaw()): the old gate ran before the await, so a swap landing
+  // mid-poll still let accept() persist the advanced cursor from a dead instance
+  // (and then the delayed delivery requeued, writing again — the round-1 race, on
+  // a narrower path).
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  resetState();
+  writeProfileConfig("default", "ak-pollswap");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origWs = globalThis.WebSocket;
+  const origFetch = globalThis.fetch;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+
+  let releaseGetMessages: (() => void) | undefined;
+  let getMessagesStarted = false;
+  const url = "http://127.0.0.1:9";
+  globalThis.fetch = (async (input: unknown) => {
+    const href = String(input);
+    if (!href.startsWith(`${url}/messages`)) throw new Error(`unexpected fetch: ${href}`);
+    getMessagesStarted = true;
+    await new Promise<void>((resolve) => {
+      releaseGetMessages = resolve;
+    });
+    return new Response(
+      JSON.stringify({
+        messages: [
+          {
+            id: "m-pollswap",
+            channelType: "telegram",
+            channelId: "ch-pollswap",
+            from: "alice",
+            content: "polled while the session was replaced",
+            timestamp: new Date().toISOString(),
+          },
+        ],
+        since: "",
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as unknown as typeof fetch;
+
+  return (async () => {
+    try {
+      const fake = makeFakePi();
+      let injects = 0;
+      fake.pi.sendUserMessage = () => {
+        injects += 1;
+      };
+      chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+      await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-pollswap", fake.notifications));
+      const statePath = config.messageStatePath();
+      const stateBefore = existsSync(statePath) ? readFileSync(statePath, "utf-8") : "";
+
+      // Fire the safety poll; it blocks awaiting the relay.
+      t.mock.timers.tick(120_000);
+      await waitFor(() => getMessagesStarted);
+
+      // The session is replaced while that poll is still in flight.
+      await callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-pollswap", fake.notifications));
+
+      assert.ok(releaseGetMessages, "getMessages was blocked");
+      releaseGetMessages();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+
+      const state = config.loadMessageState();
+      assert.ok(
+        !state.seenIds.includes("m-pollswap"),
+        `the dead instance must not consume the polled message: ${JSON.stringify(state.seenIds)}`,
+      );
+      assert.equal(
+        existsSync(statePath) ? readFileSync(statePath, "utf-8") : "",
+        stateBefore,
+        "and it must not write poller state after the swap",
+      );
+      assert.equal(injects, 0, "nothing is injected into the replaced runtime");
+    } finally {
+      globalThis.WebSocket = origWs;
+      globalThis.fetch = origFetch;
+      if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+      else process.env.CHAOS_RELAY_URL = prevUrl;
+      t.mock.timers.reset();
+    }
+  })();
+});

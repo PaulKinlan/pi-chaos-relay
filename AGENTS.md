@@ -157,4 +157,8 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
   never fetch them. Tracked in `inFlightBatches` from `queueDelivery` until a
   `sendUserMessage` succeeds — a delivered batch is never handed back.
 - Never `accept()` (persist a cursor) from an instance that can no longer deliver:
-  a catch-up or safety poll may still be awaiting the relay when the swap lands.
+  a catch-up or safety poll may still be awaiting the relay when the swap lands, so
+  re-check liveness AFTER the await, immediately before `accept()` — the check
+  before the await is not enough (`pollAndDeliver` awaits `pollRaw()`, then
+  accepts). A batch reaching a replaced runtime early is handed back rather than
+  silently dropped; it may have been accepted before the flag was set.

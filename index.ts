@@ -900,6 +900,16 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   }
 
   async function deliverToAgent(messages: ChannelMessage[]): Promise<void> {
+    // This instance is already known to be gone, so skip the attachment downloads
+    // for a session that cannot receive them. The batch must still be handed back:
+    // it may have been accepted before the flag was set but queued behind a batch
+    // that then failed, in which case nothing else would requeue it. (A no-op when
+    // session_shutdown already did: requeue() returns [] and writes nothing for ids
+    // it has re-opened.)
+    if (runtimeReplaced) {
+      requeueUndelivered(messages, "delivering a batch");
+      return;
+    }
     const c = ensureClient();
     const hydrated = c
       ? await materializeInboundAttachments(c, messages)
@@ -984,6 +994,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     deliveryQueue = deliveryQueue
       .then(() => deliverToAgent(messages))
       .catch((err) => {
+        // A non-stale failure (e.g. the agent refusing the message) already
+        // consumed its chance: drop it from the in-flight set, or a later
+        // shutdown would hand it back and rewind the cursor to a stale timestamp.
+        inFlightBatches.delete(messages);
         log(`attachment delivery failed: ${redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err))}`);
       });
     return deliveryQueue;
@@ -1105,7 +1119,14 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     if (!poller) return;
     if (runtimeReplaced) return; // same reason as onMessage: do not consume
     try {
-      const messages = consumeApprovalReplies(await poller.poll());
+      // poll() is accept(await pollRaw()), and accept() is what advances the
+      // persisted cursor — so the liveness check above is not enough: the swap can
+      // land while the poll is awaiting the relay (the WS being down is exactly
+      // when this safety poll is the delivery path). Splitting the two lets the
+      // batch be dropped instead of being accepted from a dead instance.
+      const raw = await poller.pollRaw();
+      if (runtimeReplaced) return;
+      const messages = consumeApprovalReplies(poller.accept(raw));
       if (messages.length === 0) return;
       log(`delivering ${messages.length} new message(s) to the agent`);
       await queueDelivery(messages);
