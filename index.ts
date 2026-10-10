@@ -1269,7 +1269,16 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     for (const m of fresh) {
       // settle() consumes only messages answering an outstanding request on
       // that channel; everything else is forwarded to the agent as before.
-      if (approvals.settle({ channelId: m.channelId, from: m.from, content: m.content ?? "" })) continue;
+      if (
+        approvals.settle({
+          channelId: m.channelId,
+          from: m.from,
+          content: m.content ?? "",
+          ...(m.inboundMeta ? { inboundMeta: m.inboundMeta } : {}),
+        })
+      ) {
+        continue;
+      }
       out.push(m);
     }
     return out;

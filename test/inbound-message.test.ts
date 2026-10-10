@@ -141,14 +141,21 @@ test("a missing timestamp is delivered as empty with a warning", () => {
   }
 });
 
-test("content over the cap is truncated in place with a visible marker", () => {
+test("content over the cap is truncated, and the marker is a NOTE not body text", () => {
   const content = "x".repeat(MAX_INBOUND_CONTENT_BYTES + 5_000);
   const { message, warnings } = accept(valid({ content }));
   assert.ok(
     Buffer.byteLength(message.content, "utf8") < content.length,
     "the delivered content is smaller than the payload",
   );
-  assert.match(message.content, /\[chaos-relay: content truncated at \d+ bytes, from \d+ bytes\]$/);
+  // The body is the sender's (truncated) text; the fact that it was cut is
+  // metadata, so nothing has to infer it from a marker inside the text.
+  assert.ok(!message.content.includes("[chaos-relay:"), "no marker in the body");
+  assert.equal(message.inboundMeta?.truncated, true);
+  assert.match(
+    message.inboundMeta?.notes.join(" ") ?? "",
+    /content truncated at \d+ bytes, from \d+ bytes/,
+  );
   assert.equal(warnings.filter((w) => w.code === "content-truncated").length, 1);
   assert.match(warnings[0].detail, /content truncated/);
 });
@@ -339,11 +346,12 @@ test("the warning codes are the same for different messages and sizes", () => {
   );
 });
 
-test("an unusable attachment is reported in the delivered content, not only the log", () => {
+test("an unusable attachment is reported as a note, not in the sender's text", () => {
   const { message, warnings } = accept(
     valid({ content: "look at this", attachments: [attachment(), { id: "broken" }] }),
   );
-  assert.match(message.content, /\[chaos-relay: 1 attachment not delivered \(unusable\)\]$/);
+  assert.equal(message.content, "look at this", "the body is exactly what the sender sent");
+  assert.deepEqual(message.inboundMeta?.notes, ["1 attachment not delivered (unusable)"]);
   assert.equal(warnings[0].code, "attachment-malformed");
 });
 
@@ -351,7 +359,8 @@ test("a message whose only attachment was unusable is still delivered, with the 
   // Refusing it would lose the fact that anything arrived at all; the operator
   // and the agent both need to know the attachment could not be used.
   const { message } = accept(valid({ content: "", attachments: [{ filename: "no-id.png" }] }));
-  assert.match(message.content, /1 attachment not delivered \(unusable\)/);
+  assert.deepEqual(message.inboundMeta?.notes, ["1 attachment not delivered (unusable)"]);
+  assert.equal(message.content, "");
   assert.equal(message.attachments, undefined);
 });
 
@@ -361,20 +370,21 @@ test("attachments over the limit are reported in the content", () => {
   );
   const { message, warnings } = accept(valid({ attachments: many }));
   assert.equal(message.attachments?.length, MAX_INBOUND_ATTACHMENTS);
-  assert.match(message.content, /\[chaos-relay: 2 attachments not delivered \(over the limit\)\]$/);
+  assert.deepEqual(message.inboundMeta?.notes, ["2 attachments not delivered (over the limit)"]);
   assert.equal(warnings[0].code, "attachments-truncated");
 });
 
-test("a repair note is delivered after the truncation marker, so it survives", () => {
+test("truncation and dropped attachments are both reported, in that order", () => {
   const { message } = accept(
     valid({
       content: "c".repeat(MAX_INBOUND_CONTENT_BYTES + 10),
       attachments: [{ id: "broken" }],
     }),
   );
-  const marker = message.content.indexOf("[chaos-relay: content truncated");
-  const note = message.content.indexOf("[chaos-relay: 1 attachment not delivered");
-  assert.ok(marker >= 0 && note > marker, "the note comes last");
+  assert.equal(message.inboundMeta?.truncated, true);
+  assert.match(message.inboundMeta?.notes[0] ?? "", /content truncated at/);
+  assert.match(message.inboundMeta?.notes[1] ?? "", /1 attachment not delivered/);
+  assert.ok(!message.content.includes("[chaos-relay:"), "and none of it is in the body");
 });
 
 test("frameIssueLimiter keys on the code, not on the message", () => {
@@ -402,4 +412,24 @@ test("the limiter's map stays bounded however many distinct frames arrive", () =
   // codes come from a finite literal set — so the counters stay tiny.
   const lines = codes.map((code) => limit(code, "again"));
   assert.deepEqual(lines, [undefined, undefined, undefined, undefined]);
+});
+
+test("generated notes never appear in the message body", () => {
+  // The invariant behind two review findings (bead cmo): anything that decides
+  // whether a message answers a question must see only the sender's text, so no
+  // generated note may be written into `content`.
+  const shaped = [
+    valid({ attachments: [{ id: "broken" }] }),
+    valid({ attachments: Array.from({ length: 5 }, (_, i) => attachment({ id: `a${i}` })) }),
+    valid({ content: "z".repeat(MAX_INBOUND_CONTENT_BYTES + 1) }),
+    valid({ content: "z".repeat(MAX_INBOUND_CONTENT_BYTES + 1), attachments: [{ id: "broken" }] }),
+  ];
+  for (const input of shaped) {
+    const { message } = accept(input);
+    assert.ok(
+      !message.content.includes("[chaos-relay:"),
+      `no note in the body: ${JSON.stringify(message.content.slice(-80))}`,
+    );
+    assert.ok((message.inboundMeta?.notes.length ?? 0) > 0, "the note went to the meta instead");
+  }
 });

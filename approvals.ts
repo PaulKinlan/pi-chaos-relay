@@ -140,8 +140,21 @@ export class ApprovalQueue {
    * true when the message was consumed (so the caller does not forward it to
    * the agent), false when it answers nothing pending here.
    */
-  settle(message: { channelId: string; from: string; content: string }): boolean {
+  settle(message: {
+    channelId: string;
+    from: string;
+    content: string;
+    inboundMeta?: { notes: string[]; truncated: boolean };
+  }): boolean {
     if (this.pending.size === 0) return false;
+    if (message.inboundMeta?.truncated) {
+      // The sender's body was cut at 256 KiB, so what arrived is not the whole
+      // message: an answer-shaped prefix cannot be trusted as an answer (a body
+      // of "yes <nonce>" followed by spaces and then "no" arrives looking like
+      // consent). Forward it to the agent; the request times out as a denial.
+      this.log("approval: reply was truncated in transit — forwarded, not treated as an answer");
+      return false;
+    }
     // Two accepted answer forms, and both must keep working:
     //  (1) the nonce form — "yes <nonce>" / "no <nonce>" — which binds the answer
     //      to one exact request AND to the channel and sender it was asked on, so
@@ -150,7 +163,13 @@ export class ApprovalQueue {
     //      tolerated (the original /^\s*#(\d+)\b/ read "#2: yes" as a denial),
     //      resolved against the request that reference names on this channel, and
     //      also bound to the sender who was asked.
-    const answer = /^\s*(yes|no)\s+([0-9a-f]+)[.!]?\s*$/i.exec(message.content);
+    // `content` is the SENDER'S text: the notes the inbound checks generate live
+    // in `inboundMeta` (bead pi-chaos-relay-cmo), so a reply that itself carried
+    // an unusable attachment no longer fails the end-anchored nonce form — and,
+    // just as importantly, a sender cannot write a note-shaped block to have
+    // their own trailing text ignored.
+    const answerText = message.content;
+    const answer = /^\s*(yes|no)\s+([0-9a-f]+)[.!]?\s*$/i.exec(answerText);
     if (answer) {
       const nonce = answer[2].toLowerCase();
       for (const [key, held] of this.pending) {
@@ -199,7 +218,7 @@ export class ApprovalQueue {
           break;
         }
       }
-      body = message.content.slice(addressed[0].length);
+      body = answerText.slice(addressed[0].length);
       if (id === undefined) {
         // Names a request that is not outstanding HERE for this sender (stale,
         // another channel, or another sender's request): not an answer, so

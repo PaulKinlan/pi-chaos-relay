@@ -142,6 +142,11 @@ export interface ChannelMessage {
   attachments?: InboundAttachment[];
   metadata?: Record<string, unknown>;
   /**
+   * What the inbound checks did to this message (notes for the agent, and whether
+   * the sender's body was truncated). NOT sender text: see `inbound-message.ts`.
+   */
+  inboundMeta?: { notes: string[]; truncated: boolean };
+  /**
    * The replied-to message, when this one was sent as a reply. A bare string is
    * the replied-to message id. Read it through {@link resolveReplyTo}, which
    * also covers the snake_case (`reply_to`) and `metadata` spellings the relay

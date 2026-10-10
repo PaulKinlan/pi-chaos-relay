@@ -1254,9 +1254,9 @@ test("a pushed frame repaired end to end reports one repair with the original si
 
   assert.equal(reported.filter((d) => d.includes("content truncated")).length, 1, reported.join(" | "));
   assert.match(
-    fresh[0].content,
-    /\[chaos-relay: content truncated at \d+ bytes, from 600000 bytes\]$/,
-    "the marker quotes the size the relay sent, not the size of our own marker",
+    fresh[0].inboundMeta?.notes[0] ?? "",
+    /content truncated at \d+ bytes, from 600000 bytes/,
+    "the note quotes the size the relay sent, not the size of our own marker",
   );
   assert.equal(h.logs.filter((l) => l.includes("truncated")).length, 0);
   h.ws.stop();
