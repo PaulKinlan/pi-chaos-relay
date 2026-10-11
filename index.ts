@@ -2783,8 +2783,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
               // not evidence about the relay, so the auth advice is only right once a
               // socket exists and keeps failing to open.
               !ws
-                ? "the WebSocket transport is not running — /chaos-relay start (or " +
-                  "/chaos-relay connect) turns push delivery back on"
+                ? // `stop` clears the socket, so this is the deliberate-stop / never-started
+                  // case. Name the real way back: the transport is started by
+                  // setupProfile (`/chaos-relay setup`), a profile switch, or session start.
+                  "the WebSocket transport is not running — run /chaos-relay setup " +
+                  "(or start a new session) to turn push delivery back on"
                 : wsAuth.mode === "header"
                   ? "if the relay does not read an upgrade Authorization header, set " +
                     "CHAOS_RELAY_WS_AUTH=query (or both); if it does, check the apiKey " +

@@ -3495,6 +3495,28 @@ test("status and doctor report the WebSocket auth mode and whether the key is in
       !stoppedDoc.includes("CHAOS_RELAY_WS_AUTH=query"),
       `a transport that never ran is not evidence about the relay: ${stoppedDoc}`,
     );
+    // The fix must name a subcommand that EXISTS. The first version of this line
+    // sent the operator to `/chaos-relay start`, which the switch answers with
+    // "Unknown subcommand" — so the names are checked against the command's own
+    // declared subcommand list in the source, not against prose that happens to
+    // contain the word.
+    const source = readFileSync(join(import.meta.dirname, "..", "index.ts"), "utf-8");
+    const declared = /subcommands:\s*([^"\n]*)\)/.exec(source)?.[1] ?? "";
+    const known = new Set(
+      declared
+        .split(",")
+        .map((part) => part.trim().split(/\s+/)[0] ?? "")
+        .filter(Boolean),
+    );
+    assert.ok(known.size > 3, `the subcommand list is readable: ${declared}`);
+    const named = [...stoppedDoc.matchAll(/\/chaos-relay ([a-z-]+)/g)].map((m) => m[1]);
+    assert.ok(named.length > 0, `the fix names a command: ${stoppedDoc}`);
+    for (const name of new Set(named)) {
+      assert.ok(
+        known.has(name),
+        `the fix names "/chaos-relay ${name}", which is not a subcommand (${[...known].join(", ")})`,
+      );
+    }
 
     // doctor must carry the same fact, and (with the socket down in header mode)
     // the fix that names the other carrier.
