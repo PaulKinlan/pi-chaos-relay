@@ -75,7 +75,7 @@ file > default**. The saved config file is `~/.pi/chaos-relay.json` (written wit
 | `CHAOS_RELAY_AGENT_ID` | `pi` | Connection/session label channels are tagged with |
 | `CHAOS_RELAY_APPROVAL_MODE` | `writes` | Tool-approval policy: `off` / `writes` / `all` (see Tool approvals) |
 | `CHAOS_RELAY_ALLOW_INSECURE_HTTP` | unset | Allow a plaintext `http://` relay on a NON-loopback host (see Relay URL and transport) |
-| `CHAOS_RELAY_WS_AUTH` | `header` | How the WebSocket upgrade authenticates: `header` (default — the API key travels in `Authorization: Bearer`, never in the URL) / `query` (legacy `?token=`, for a relay that cannot read upgrade headers) / `both` |
+| `CHAOS_RELAY_WS_AUTH` | `query` | How the WebSocket upgrade authenticates: `query` (default — the legacy `?token=` the relay reads today, so the API key is visible in URL logs) / `header` (the API key travels in `Authorization: Bearer` and stays out of the URL; use this once your relay reads an upgrade header) / `both` |
 | `CHAOS_RELAY_PROFILE` | `default` | Names a separate config file (`~/.pi/chaos-relay.<profile>.json`) — see Multiple instances |
 | `CHAOS_RELAY_CONFIG` | — | Absolute path to the config file (overrides `CHAOS_RELAY_PROFILE`) |
 
@@ -286,14 +286,23 @@ a malformed URL. Set `CHAOS_RELAY_ALLOW_INSECURE_HTTP=1` to accept it on purpose
 (a LAN relay with no TLS): it is off by default, never implied, and every connect
 over such a URL logs a warning.
 
-The push **WebSocket authenticates with a header**, not with a URL parameter:
-the upgrade request carries `Authorization: Bearer <apiKey>`, so the key cannot
-be picked up by a proxy log, an access log, or an error string that quotes the
-URL. A relay that cannot read upgrade headers can be used with
-`CHAOS_RELAY_WS_AUTH=query`, which sends the legacy `?token=<apiKey>` — that
-reintroduces exactly the exposure this avoids, so it is opt-in, warned about on
-every connect, and an unrecognised value is reported and ignored rather than
-silently taken as "query".
+The push **WebSocket can authenticate with a header instead of a URL
+parameter**: with `CHAOS_RELAY_WS_AUTH=header` the upgrade request carries
+`Authorization: Bearer <apiKey>`, so the key cannot be picked up by a proxy log,
+an access log, or an error string that quotes the URL.
+
+**The default is still the relay's `?token=` parameter**, because that is what
+the relay's `/ws` handler reads today — it completes the upgrade only when the
+query token is present, and a session that switched to a header-only upgrade
+before the relay learned to read one would lose push delivery (leaving the 120s
+safety poll as the only inbound path). While the default is in use, each
+connection logs one warning naming the exposure and pointing at
+`CHAOS_RELAY_WS_AUTH=header`; once your relay accepts an upgrade
+`Authorization` header, that is the setting to use. `CHAOS_RELAY_WS_AUTH=both`
+sends both, for a relay mid-migration. An unrecognised value is reported and
+falls back to the default rather than being silently taken as "query", and
+`/chaos-relay status` reports which mode is in use and whether the key is in
+the URL.
 
 The effective URL is the **first valid** value in precedence order (env → saved
 file → default), so a malformed or refused value is skipped rather than silently

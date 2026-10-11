@@ -365,8 +365,9 @@ export function isLoopbackHostname(hostname: string): boolean {
  * trusted network (a self-hosted or LAN relay with no TLS). It is off by
  * default and never implied by anything else: an http:// URL outside loopback
  * sends the bearer apiKey in the clear in every HTTP request AND in the
- * WebSocket `?token=` query string, so it is a decision an operator has to make
- * on purpose.
+ * WebSocket upgrade (which carries it in the `?token=` query string today;
+ * `CHAOS_RELAY_WS_AUTH=header` moves it into an upgrade header instead, out of
+ * the URL), so it is a decision an operator has to make on purpose.
  */
 export function insecureHttpAllowed(
   env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,

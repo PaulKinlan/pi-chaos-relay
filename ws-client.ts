@@ -8,12 +8,15 @@
  *
  * Auth: the relay authenticates the socket from an `Authorization: Bearer <apiKey>`
  * header on the upgrade request — Node's WebSocket sends a `headers` option — so the
- * key never enters the URL. A relay that cannot read upgrade headers can be
- * accommodated explicitly with `CHAOS_RELAY_WS_AUTH=query`, which sends the key as
- * `?token=`; that form is warned about on every connect, because URLs are recorded by
- * proxies, access logs and error strings. The upgrade handshake is not ECDSA-signed,
- * so the apiKey is the only credential the WS needs. (Registration + HTTP catch-up
- * still use the signed client.)
+ * key can enter the URL at all: `header` sends `Authorization: Bearer <apiKey>` and
+ * keeps it out of every log, `query` is the legacy `?token=` form. The default is
+ * `query` ONLY because the relay's `/ws` handler still reads the token from the query
+ * string and 401s without it (PaulKinlan/chaos, `packages/server/src/main.ts`: the
+ * upgrade branch does `url.searchParams.get("token")`); a URL-carried key is warned
+ * about once per connection lifecycle, and `header` is the documented migration once
+ * the relay accepts an upgrade header. The upgrade handshake is not ECDSA-signed, so
+ * the apiKey is the only credential the WS needs. (Registration + HTTP catch-up still
+ * use the signed client.)
  *
  * Resilience:
  *  - Auto-reconnect with exponential backoff.
@@ -113,8 +116,18 @@ export function toWsUrl(relayUrl: string): string {
 /** How the WebSocket upgrade authenticates. */
 export type WsAuthMode = "header" | "query" | "both";
 
-/** Default: the apiKey travels in the upgrade header, never in the URL. */
-export const DEFAULT_WS_AUTH_MODE: WsAuthMode = "header";
+/**
+ * `query` is the default for one reason: the deployed relay's `/ws` upgrade handler
+ * authenticates from `?token=` and answers 401 "Missing token query parameter"
+ * without it, so defaulting to `header` would silently stop push delivery (the
+ * 120s safety poll would be the only inbound path) for every existing session.
+ *
+ * This flips to `header` once the relay reads `Authorization` on the upgrade — the
+ * server change is a few lines next to `url.searchParams.get("token")` — and
+ * `CHAOS_RELAY_WS_AUTH=header` already gives that behaviour today to anyone whose
+ * relay supports it.
+ */
+export const DEFAULT_WS_AUTH_MODE: WsAuthMode = "query";
 
 export interface WsAuthModeResult {
   mode: WsAuthMode;
@@ -125,9 +138,9 @@ export interface WsAuthModeResult {
 /**
  * The upgrade auth mode, from `CHAOS_RELAY_WS_AUTH`:
  *
- *   header (default) — `Authorization: Bearer <apiKey>`; the key stays out of the URL
- *   query            — the legacy `?token=<apiKey>` for a relay that cannot read
- *                      upgrade headers (the key then reaches proxy/access logs)
+ *   query (default)  — the legacy `?token=<apiKey>`, which is what the relay reads
+ *                      today (the key then reaches proxy/access logs)
+ *   header           — `Authorization: Bearer <apiKey>`; the key stays out of the URL
  *   both             — send both, for a relay mid-migration
  *
  * Anything else falls back to `header` and returns a warning, so a typo cannot
@@ -152,6 +165,30 @@ type WebSocketWithHeaders = new (
   url: string,
   init?: { headers: Record<string, string> },
 ) => WebSocket;
+
+/**
+ * The auth mode plus what to tell an operator about it, for `status` and `doctor`:
+ * which credential carrier is in use, whether that puts the apiKey in the URL, and
+ * the way to the safer one.
+ */
+export function wsAuthSummary(
+  env: { CHAOS_RELAY_WS_AUTH?: string } = process.env,
+): { mode: WsAuthMode; keyInUrl: boolean; detail: string; fix?: string } {
+  const { mode, warning } = wsAuthMode(env);
+  const keyInUrl = mode !== "header";
+  const detail =
+    mode === "header"
+      ? "header (Authorization: Bearer — the apiKey is not in the URL)"
+      : mode === "both"
+        ? "both (header plus the URL query string — the apiKey is still in the URL)"
+        : "query (the apiKey travels in the URL query string, so it reaches proxy and access logs)";
+  const fix = warning
+    ? `CHAOS_RELAY_WS_AUTH is not one of header|query|both — using ${mode}; ${warning}`
+    : keyInUrl
+      ? "set CHAOS_RELAY_WS_AUTH=header once your relay accepts an upgrade Authorization header"
+      : undefined;
+  return fix ? { mode, keyInUrl, detail, fix } : { mode, keyInUrl, detail };
+}
 
 /** What a WebSocket constructor needs for one connect attempt. */
 export interface WsConnectTarget {
@@ -283,11 +320,15 @@ export class RelayWebSocket {
       this.log(`WARN: ${warning}`);
     }
     if (mode !== "header" && !this.warnedQueryToken) {
+      // Once per connection lifecycle, not per connect: the point is to tell the
+      // operator their key is in the URL, and a reconnecting socket would repeat it
+      // for as long as the relay is unreachable.
       this.warnedQueryToken = true;
       this.log(
         `WARN: the WebSocket apiKey is sent in the URL query string ` +
           `(CHAOS_RELAY_WS_AUTH=${mode}); URLs are recorded by proxies, access logs and ` +
-          `error strings — use header auth unless the relay needs this`,
+          `error strings — set CHAOS_RELAY_WS_AUTH=header once your relay accepts an ` +
+          `upgrade Authorization header`,
       );
     }
   }
@@ -313,10 +354,15 @@ export class RelayWebSocket {
       // A runtime whose WebSocket does not accept a `headers` option rejects the
       // second argument (undici then parses it as `protocols`). Name the way out,
       // so this is not mistaken for a dead apiKey and left in a reconnect loop.
+      // Any failure here in header mode is worth the way out: a runtime may reject
+      // the init as a bad `protocols` argument (TypeError, or a SyntaxError from the
+      // WHATWG constructor), and one that accepts it but ignores `headers` shows up
+      // as a failing handshake instead. The fallback is the same in every case.
       const hint =
-        mode === "header" && err instanceof TypeError
-          ? " — this runtime's WebSocket may not accept a headers option;" +
-            " set CHAOS_RELAY_WS_AUTH=query to use the legacy ?token= query form"
+        mode === "header"
+          ? " — if this runtime's WebSocket does not accept a headers option, or the" +
+            " relay does not read one, set CHAOS_RELAY_WS_AUTH=query (or both) to use" +
+            " the legacy ?token= query form"
           : "";
       this.log(`WebSocket construct failed: ${message}${hint}`);
       this.scheduleReconnect();

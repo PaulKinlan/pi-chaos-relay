@@ -207,18 +207,30 @@ class PushWebSocket {
 }
 
 /**
- * The socket THIS test's extension opened. ws-client authenticates the upgrade
- * with `Authorization: Bearer <apiKey>`, so a still-reconnecting socket left
- * behind by an earlier test — its backoff timer can fire between this test's
- * `instances = []` and its `session_start` — can never be picked by accident.
- * Using `instances[0]` made the d8e regression tests flake when the whole file
- * ran, and matching on the URL would no longer identify anything: the apiKey is
- * deliberately absent from it.
+ * Does THIS socket carry the given apiKey, wherever ws-client put it?
+ *
+ * The shipping default is the relay's `?token=` query form (the relay's /ws
+ * handler reads it and 401s without it), and `CHAOS_RELAY_WS_AUTH=header` puts the
+ * key in the upgrade request instead. Matching either carrier keeps socket
+ * selection deterministic without assuming a mode.
+ */
+function socketCarries(socket: PushWebSocket | FailingWebSocket, apiKey: string): boolean {
+  if (socket.headers.Authorization === `Bearer ${apiKey}`) return true;
+  try {
+    return new URL(socket.url).searchParams.get("token") === apiKey;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The socket THIS test's extension opened. Matching on the apiKey — rather than
+ * `instances[0]` — is what makes this deterministic: a still-reconnecting socket
+ * left behind by an earlier test can construct into the shared registry while this
+ * test runs, and that made the d8e regression tests flake.
  */
 function socketForProfile(apiKey: string): PushWebSocket {
-  const socket = PushWebSocket.instances.find(
-    (s) => s.headers.Authorization === `Bearer ${apiKey}`,
-  );
+  const socket = PushWebSocket.instances.find((s) => socketCarries(s, apiKey));
   assert.ok(socket, `no WebSocket was opened for api key ${apiKey}`);
   return socket;
 }
@@ -1267,7 +1279,7 @@ test("auth recovery re-bind logs the webhook origin, not the secret URL", async 
   const origWs = globalThis.WebSocket;
   FailingWebSocket.instances = [];
   const ownSockets = () =>
-    FailingWebSocket.instances.filter((ws) => ws.headers.Authorization === "Bearer old-key");
+    FailingWebSocket.instances.filter((ws) => socketCarries(ws, "old-key"));
   globalThis.fetch = (async (input: unknown, _init?: unknown) => {
     const href = typeof input === "string" ? input : String(input);
     if (href.endsWith("/auth/register")) {
@@ -1395,7 +1407,7 @@ test("auth recovery re-binds every channel concurrently, in one round-trip windo
     await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-concurrent-rebind", fake.notifications));
 
     const ownSockets = () =>
-      FailingWebSocket.instances.filter((ws) => ws.headers.Authorization === "Bearer old-key");
+      FailingWebSocket.instances.filter((ws) => socketCarries(ws, "old-key"));
     assert.ok(ownSockets().length >= 1, "this test's WS was constructed for old-key");
     const first = ownSockets()[ownSockets().length - 1];
     first.failHandshake(1006);
@@ -1495,7 +1507,7 @@ test("auth recovery re-bind keeps record order and one failure does not drop the
     await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-ordered-rebind", fake.notifications));
 
     const ownSockets = () =>
-      FailingWebSocket.instances.filter((ws) => ws.headers.Authorization === "Bearer old-key");
+      FailingWebSocket.instances.filter((ws) => socketCarries(ws, "old-key"));
     const first = ownSockets()[ownSockets().length - 1];
     assert.ok(first, "this test's WS was constructed for old-key");
     first.failHandshake(1006);
@@ -3435,11 +3447,91 @@ test("isStaleRuntimeError recognises the SDK's replacement error and nothing els
   assert.equal(isStaleRuntimeError(undefined), false);
 });
 
-test("the socket the extension opens authenticates with a header, not a URL token", async () => {
+test("status and doctor report the WebSocket auth mode and whether the key is in the URL", async () => {
+  resetState();
+  writeProfileConfig("default", "ak_ws_report");
+  const prevAuth = process.env.CHAOS_RELAY_WS_AUTH;
+  const origFetch = globalThis.fetch;
+  const origWs = globalThis.WebSocket;
+  // A stubbed failing health probe keeps the command offline; only the auth line is
+  // under test here.
+  globalThis.fetch = ((_u: unknown, _i?: unknown) =>
+    Promise.reject(new DOMException("Timed out", "TimeoutError"))) as unknown as typeof fetch;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+  const runStatus = async () => {
+    const fake = makeFakePi();
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    const command = fake.commands.get("chaos-relay");
+    assert.ok(command, "extension registers the /chaos-relay command");
+    await command.handler("status", makeCtx("sess-ws-report", fake.notifications));
+    return fake.notifications.map((n) => n.message).join("\n");
+  };
+  try {
+    // The default carries the key in the URL, and the report says so — without
+    // printing anything URL-shaped that could itself be mistaken for a secret.
+    const def = await runStatus();
+    assert.match(def, /ws auth:\s+query \(the apiKey travels in the URL query string/);
+    assert.ok(!def.includes("?token="), `the report describes the exposure: ${def}`);
+
+    resetState();
+    writeProfileConfig("default", "ak_ws_report");
+    process.env.CHAOS_RELAY_WS_AUTH = "header";
+    const hdr = await runStatus();
+    assert.match(hdr, /ws auth:\s+header \(Authorization: Bearer/);
+
+    // doctor must carry the same fact, and (with the socket down in header mode)
+    // the fix that names the other carrier.
+    resetState();
+    writeProfileConfig("default", "ak_ws_report");
+    const fake = makeFakePi();
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    const command = fake.commands.get("chaos-relay");
+    assert.ok(command, "extension registers the /chaos-relay command");
+    await command.handler("doctor", makeCtx("sess-ws-report-doc", fake.notifications));
+    const doc = fake.notifications.map((n) => n.message).join("\n");
+    assert.match(doc, /WebSocket transport[\s\S]{0,120}auth: header \(Authorization: Bearer/);
+    assert.match(doc, /CHAOS_RELAY_WS_AUTH=query/);
+  } finally {
+    if (prevAuth === undefined) delete process.env.CHAOS_RELAY_WS_AUTH;
+    else process.env.CHAOS_RELAY_WS_AUTH = prevAuth;
+    globalThis.fetch = origFetch;
+    globalThis.WebSocket = origWs;
+  }
+});
+
+test("the default WebSocket auth is the relay's ?token= form, so the upgrade still authenticates", async () => {
+  // The relay's /ws handler reads the token from the query string and answers 401
+  // without it, so this default is what keeps push delivery working against the
+  // deployed relay. It is the compatibility half of the 5wq change.
+  resetState();
+  writeProfileConfig("default", "ak_ws_default");
+  const origWs = globalThis.WebSocket;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+  try {
+    const fake = makeFakePi();
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(
+      fake.handlers,
+      "session_start",
+      { reason: "startup" },
+      makeCtx("sess-ws-default", fake.notifications),
+    );
+    const socket = socketForProfile("ak_ws_default");
+    assert.equal(socket.url, "ws://127.0.0.1:9/ws?token=ak_ws_default");
+    assert.deepEqual(socket.headers, {}, "the deployed relay does not read an upgrade Authorization header");
+  } finally {
+    globalThis.WebSocket = origWs;
+  }
+});
+
+test("CHAOS_RELAY_WS_AUTH=header keeps the apiKey out of the WebSocket URL", async () => {
   resetState();
   writeProfileConfig("default", "ak_ws_header");
-  const prevUrl = process.env.CHAOS_RELAY_URL;
+  const prevAuth = process.env.CHAOS_RELAY_WS_AUTH;
   const origWs = globalThis.WebSocket;
+  process.env.CHAOS_RELAY_WS_AUTH = "header";
   PushWebSocket.instances = [];
   globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
   try {
@@ -3456,8 +3548,8 @@ test("the socket the extension opens authenticates with a header, not a URL toke
     assert.ok(socket.url.endsWith("/ws"), `the URL is the bare endpoint: ${socket.url}`);
     assert.ok(!socket.url.includes("ak_ws_header"), `no apiKey in ${socket.url}`);
   } finally {
-    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
-    else process.env.CHAOS_RELAY_URL = prevUrl;
+    if (prevAuth === undefined) delete process.env.CHAOS_RELAY_WS_AUTH;
+    else process.env.CHAOS_RELAY_WS_AUTH = prevAuth;
     globalThis.WebSocket = origWs;
   }
 });

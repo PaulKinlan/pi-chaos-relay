@@ -118,11 +118,17 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
   command (`setup`/`status`/`poll`/`stop`); owns the poller + WebSocket.
 - `relay-client.ts` — signed HTTP client for the relay (ECDSA P-256 identity).
 - `ws-client.ts` — WebSocket transport (push delivery + reconnect/backoff). The
-  upgrade authenticates with `Authorization: Bearer <apiKey>` (`wsConnectTarget`);
+  upgrade authenticates via `wsConnectTarget` — `Authorization: Bearer <apiKey>` in
+  `header` mode, the legacy `?token=` in `query` mode;
   `toWsUrl` takes no credential, so no URL built here can contain one. The legacy
   `?token=` form exists only behind an explicit `CHAOS_RELAY_WS_AUTH=query|both`,
-  is warned about on every connect, and an unusable value falls back to header auth
-  with a warning — never silently. A runtime that rejects the `headers` option
+  is warned about once per connection lifecycle, and an unusable value falls back to
+  the default with a warning — never silently. The DEFAULT is `query` only because the
+  relay's `/ws` handler reads the token from the query string and 401s without it
+  (PaulKinlan/chaos `packages/server/src/main.ts`, the upgrade branch): defaulting to
+  `header` would silently downgrade every session to the safety poll. Flip the default
+  when the relay reads an upgrade Authorization header. `wsAuthSummary` feeds the
+  `status` line and the doctor fix text. A runtime that rejects the `headers` option
   (TypeError) logs the query-token way out instead of looking like a dead apiKey.
 - `poller.ts` — cursor + dedup; HTTP catch-up and safety poll. `accept()` is also
   the inbound shape gate: both transports hand it raw relay payloads, so it runs
