@@ -75,7 +75,7 @@ import {
   formatReplyConfirmation,
   formatReplyRefusal,
 } from "./reply-format.ts";
-import { RelayWebSocket } from "./ws-client.ts";
+import { RelayWebSocket, wsAuthSummary } from "./ws-client.ts";
 import { parseConnectInput } from "./connect.ts";
 import { safeUrlOrigin, redactUrlSecretsFromMessage } from "./url-redact.ts";
 import { approvalDecision, LOCAL_INSPECTION_TOOLS } from "./approval-policy.ts";
@@ -2504,6 +2504,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       }`,
       `userId:        ${current.userId ?? "(unknown)"}`,
       `transport:     WebSocket (${ws?.connected ? "connected" : ws ? "connecting/reconnecting" : "stopped"}) + ${SAFETY_POLL_MS}ms safety poll`,
+      `ws auth:       ${wsAuthSummary().detail}`,
       `approvals:     ${current.approvalMode} (off=autonomous, writes=shell/edit/write + replies after reads, all=every tool)`,
       `local channels:${current.channels.length ? ` ${current.channels.length} cached record(s)` : " none"}`,
     ];
@@ -2759,15 +2760,42 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       }
     }
 
-    // 5. Transport state.
+    // 5. Transport state. A socket that never opens is the symptom of the relay and
+    // the client disagreeing about where the apiKey goes, so name the switch when
+    // that is possible instead of leaving "connecting/reconnecting" with no fix.
+    const wsAuth = wsAuthSummary();
+    const wsDetail = ws?.connected
+      ? "connected"
+      : ws
+        ? "connecting/reconnecting"
+        : "stopped (polling safety net only)";
     checks.push({
       ok: Boolean(ws?.connected),
       label: "WebSocket transport",
-      detail: ws?.connected
-        ? "connected"
-        : ws
-          ? "connecting/reconnecting"
-          : "stopped (polling safety net only)",
+      detail: `${wsDetail} — auth: ${wsAuth.detail}`,
+      ...(ws?.connected
+        ? wsAuth.fix
+          ? { fix: wsAuth.fix }
+          : {}
+        : {
+            fix:
+              // A transport that was never started — or was stopped on purpose — is
+              // not evidence about the relay, so the auth advice is only right once a
+              // socket exists and keeps failing to open.
+              !ws
+                ? // `stop` clears the socket, so this is the deliberate-stop / never-started
+                  // case. Name the real way back: the transport is started by
+                  // setupProfile (`/chaos-relay setup`), a profile switch, or session start.
+                  "the WebSocket transport is not running — run /chaos-relay setup " +
+                  "(or start a new session) to turn push delivery back on"
+                : wsAuth.mode === "header"
+                  ? "if the relay does not read an upgrade Authorization header, set " +
+                    "CHAOS_RELAY_WS_AUTH=query (or both); if it does, check the apiKey " +
+                    "and run /chaos-relay setup"
+                  : `check the apiKey and relay reachability, or try another auth mode: ${
+                      wsAuth.fix ?? "CHAOS_RELAY_WS_AUTH=header|query|both"
+                    }`,
+          }),
     });
 
     // 6. Channels.

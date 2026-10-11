@@ -117,7 +117,21 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
   `relay_register_telegram`, `relay_register_email`, …) and the `/chaos-relay`
   command (`setup`/`status`/`poll`/`stop`); owns the poller + WebSocket.
 - `relay-client.ts` — signed HTTP client for the relay (ECDSA P-256 identity).
-- `ws-client.ts` — WebSocket transport (push delivery + reconnect/backoff).
+- `ws-client.ts` — WebSocket transport (push delivery + reconnect/backoff). The
+  upgrade authenticates via `wsConnectTarget` — `Authorization: Bearer <apiKey>` in
+  `header` mode, the legacy `?token=` in `query` mode;
+  `toWsUrl` takes no credential, so no URL built here can contain one. The legacy
+  `?token=` form is what ships by default (see below); `CHAOS_RELAY_WS_AUTH=header`
+  moves the key into the upgrade request and out of the URL. A URL-carried key is
+  warned about once per connection lifecycle, and an unusable value uses (and names)
+  the default with a warning — never silently. The DEFAULT is `query` only because the
+  relay's `/ws` handler reads the token from the query string and 401s without it
+  (PaulKinlan/chaos `packages/server/src/main.ts`, the upgrade branch): defaulting to
+  `header` would silently downgrade every session to the safety poll. Flip the default
+  when the relay reads an upgrade Authorization header. `wsAuthSummary` feeds the
+  `status` line and the doctor fix text. A runtime that rejects the `headers` option
+  (any construct failure, not only a TypeError) logs the query-token way out instead
+  of looking like a dead apiKey.
 - `poller.ts` — cursor + dedup; HTTP catch-up and safety poll. `accept()` is also
   the inbound shape gate: both transports hand it raw relay payloads, so it runs
   every message through `inbound-message.ts` before anything reads a field.
@@ -159,7 +173,7 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
 - The relay URL carries the bearer API key, so `isValidRelayUrl` accepts
   `https://` anywhere and `http://` only on loopback (`localhost`, 127.0.0.0/8,
   `[::1]`). Never weaken that to a scheme check: a plaintext external URL sends
-  the key in every request and in the WebSocket `?token=` query string.
+  the key in every request and in the WebSocket upgrade.
   `CHAOS_RELAY_ALLOW_INSECURE_HTTP=1` is the only bypass, it is off unless set,
   and any connect that relies on it logs a warning. A refused plaintext URL must
   fail closed — never fall back to `DEFAULT_RELAY_URL` for a session that is
