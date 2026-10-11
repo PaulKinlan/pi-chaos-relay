@@ -18,7 +18,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { RelayWebSocket, toWsUrl } from "../ws-client.ts";
+import { RelayWebSocket, toWsUrl, wsAuthMode, wsConnectTarget } from "../ws-client.ts";
 import type { RelayWebSocketOptions } from "../ws-client.ts";
 import type { ChannelMessage } from "../relay-client.ts";
 import { MAX_INBOUND_CONTENT_BYTES, MAX_INBOUND_FRAME_BYTES } from "../inbound-message.ts";
@@ -27,6 +27,8 @@ import { MessagePoller } from "../poller.ts";
 /** A scripted stand-in for the WebSocket the transport would get from the host. */
 class FakeWebSocket {
   readonly url: string;
+  /** The upgrade init, so a test can assert the apiKey travelled as a header. */
+  readonly init: { headers: Record<string, string> } | undefined;
   readonly sent: string[] = [];
   readyState = 0; // CONNECTING
   closeCalls = 0;
@@ -37,8 +39,9 @@ class FakeWebSocket {
   /** Set to reproduce a `send` that throws (a socket closing under a reply). */
   sendError: Error | undefined;
 
-  constructor(url: string) {
+  constructor(url: string, init?: { headers: Record<string, string> }) {
     this.url = url;
+    this.init = init;
   }
 
   send(data: string): void {
@@ -80,6 +83,17 @@ interface Harness {
   last: () => FakeWebSocket;
 }
 
+/**
+ * The apiKey a connect attempt authenticated with, wherever it was carried:
+ * the upgrade header by default, the opt-in query token otherwise (or both).
+ * Asserting on the header is what makes "the URL has no secret" meaningful.
+ */
+function socketKey(socket: FakeWebSocket): string | undefined {
+  const auth = socket.init?.headers.Authorization;
+  if (auth?.startsWith("Bearer ")) return auth.slice("Bearer ".length);
+  return new URL(socket.url).searchParams.get("token") ?? undefined;
+}
+
 function harness(opts: Partial<RelayWebSocketOptions> = {}): Harness {
   const sockets: FakeWebSocket[] = [];
   const delivered: ChannelMessage[][] = [];
@@ -89,8 +103,8 @@ function harness(opts: Partial<RelayWebSocketOptions> = {}): Harness {
     apiKey: "test-key",
     onMessage: (messages) => delivered.push(messages),
     log: (message) => logs.push(message),
-    wsFactory: (url) => {
-      const socket = new FakeWebSocket(url);
+    wsFactory: (url, init) => {
+      const socket = new FakeWebSocket(url, init);
       sockets.push(socket);
       return socket as unknown as WebSocket;
     },
@@ -150,41 +164,106 @@ function pendingish(promise: Promise<string>, ms = 15): Promise<string> {
   return Promise.race([promise, flush(ms).then(() => "still pending")]);
 }
 
-// --- toWsUrl ---------------------------------------------------------------
+// --- toWsUrl / ws auth -----------------------------------------------------
 
-test("toWsUrl converts https to wss and appends the token query", () => {
-  assert.equal(
-    toWsUrl("https://relay.example.com", "test-key"),
-    "wss://relay.example.com/ws?token=test-key",
-  );
-  assert.equal(
-    toWsUrl("http://relay.example.com", "test-key"),
-    "ws://relay.example.com/ws?token=test-key",
-  );
+test("toWsUrl converts https to wss and never puts a credential in the URL", () => {
+  assert.equal(toWsUrl("https://relay.example.com"), "wss://relay.example.com/ws");
+  assert.equal(toWsUrl("http://relay.example.com"), "ws://relay.example.com/ws");
 });
 
 test("toWsUrl strips trailing slashes so the path is not doubled", () => {
-  assert.equal(
-    toWsUrl("https://relay.example.com/", "k"),
-    "wss://relay.example.com/ws?token=k",
-  );
-  assert.equal(
-    toWsUrl("https://relay.example.com///", "k"),
-    "wss://relay.example.com/ws?token=k",
-  );
+  assert.equal(toWsUrl("https://relay.example.com/"), "wss://relay.example.com/ws");
+  assert.equal(toWsUrl("https://relay.example.com///"), "wss://relay.example.com/ws");
 });
 
 test("toWsUrl keeps a relay path prefix", () => {
-  assert.equal(
-    toWsUrl("https://relay.example.com/api", "k"),
-    "wss://relay.example.com/api/ws?token=k",
-  );
+  assert.equal(toWsUrl("https://relay.example.com/api"), "wss://relay.example.com/api/ws");
 });
 
-test("toWsUrl percent-encodes the token so query metacharacters survive", () => {
-  assert.equal(
-    toWsUrl("https://relay.example.com", "a b+c/d&e=f?g"),
-    "wss://relay.example.com/ws?token=a%20b%2Bc%2Fd%26e%3Df%3Fg",
+test("header auth is the default: the key is in the upgrade request, not the URL", () => {
+  assert.deepEqual(wsAuthMode({}), { mode: "header" });
+  const target = wsConnectTarget("https://relay.example.com", "k-secret", "header");
+  assert.equal(target.url, "wss://relay.example.com/ws");
+  assert.ok(!target.url.includes("k-secret"), "no apiKey in the URL");
+  assert.deepEqual(target.init, { headers: { Authorization: "Bearer k-secret" } });
+});
+
+test("the legacy query-token form is opt-in, and then the key IS in the URL", () => {
+  assert.deepEqual(wsAuthMode({ CHAOS_RELAY_WS_AUTH: "query" }), { mode: "query" });
+  const target = wsConnectTarget("https://relay.example.com", "a b+c/d&e=f?g", "query");
+  assert.equal(target.url, "wss://relay.example.com/ws?token=a%20b%2Bc%2Fd%26e%3Df%3Fg");
+  assert.equal(target.init, undefined, "query mode sends no Authorization header");
+});
+
+test("both mode sends the header and the query token, for a relay mid-migration", () => {
+  assert.deepEqual(wsAuthMode({ CHAOS_RELAY_WS_AUTH: "BOTH" }), { mode: "both" });
+  const target = wsConnectTarget("https://relay.example.com", "k", "both");
+  assert.equal(target.url, "wss://relay.example.com/ws?token=k");
+  assert.deepEqual(target.init, { headers: { Authorization: "Bearer k" } });
+});
+
+test("an unusable CHAOS_RELAY_WS_AUTH value falls back to header auth with a warning", () => {
+  const result = wsAuthMode({ CHAOS_RELAY_WS_AUTH: "querystring" });
+  assert.equal(result.mode, "header");
+  assert.match(result.warning ?? "", /is not one of header\|query\|both/);
+});
+
+test("a connect sends the apiKey as an upgrade header, and its URL carries no secret", () => {
+  const h = harness();
+  h.ws.start();
+  const socket = h.last();
+  assert.equal(socket.url, "wss://relay.example.com/ws");
+  assert.deepEqual(socket.init, { headers: { Authorization: "Bearer test-key" } });
+});
+
+test("CHAOS_RELAY_WS_AUTH=query keeps the legacy URL token and warns every connect", () => {
+  const prev = process.env.CHAOS_RELAY_WS_AUTH;
+  process.env.CHAOS_RELAY_WS_AUTH = "query";
+  try {
+    const h = harness();
+    h.ws.start();
+    const socket = h.last();
+    assert.equal(socket.url, "wss://relay.example.com/ws?token=test-key");
+    assert.equal(socket.init, undefined, "the legacy form has no header to send");
+    assert.ok(
+      h.logs.some((l) => l.includes("the WebSocket apiKey is sent in the URL query string")),
+      `the exposure is warned about: ${JSON.stringify(h.logs)}`,
+    );
+  } finally {
+    if (prev === undefined) delete process.env.CHAOS_RELAY_WS_AUTH;
+    else process.env.CHAOS_RELAY_WS_AUTH = prev;
+  }
+});
+
+test("a mistyped CHAOS_RELAY_WS_AUTH is reported and does not disable header auth", () => {
+  const prev = process.env.CHAOS_RELAY_WS_AUTH;
+  process.env.CHAOS_RELAY_WS_AUTH = "token";
+  try {
+    const h = harness();
+    h.ws.start();
+    const socket = h.last();
+    assert.equal(socket.url, "wss://relay.example.com/ws", "still no key in the URL");
+    assert.deepEqual(socket.init, { headers: { Authorization: "Bearer test-key" } });
+    assert.ok(
+      h.logs.some((l) => l.includes('CHAOS_RELAY_WS_AUTH="token" is not one of header|query|both')),
+      `the typo is named: ${JSON.stringify(h.logs)}`,
+    );
+  } finally {
+    if (prev === undefined) delete process.env.CHAOS_RELAY_WS_AUTH;
+    else process.env.CHAOS_RELAY_WS_AUTH = prev;
+  }
+});
+
+test("a runtime that rejects the headers option names the query-token way out", () => {
+  const h = harness({
+    wsFactory: (): WebSocket => {
+      throw new TypeError("WebSocket constructor: protocols must be a string or an array of strings");
+    },
+  });
+  h.ws.start();
+  assert.ok(
+    h.logs.some((l) => l.includes("may not accept a headers option") && l.includes("CHAOS_RELAY_WS_AUTH=query")),
+    `the fix is named rather than looking like a dead apiKey: ${JSON.stringify(h.logs)}`,
   );
 });
 
@@ -214,16 +293,15 @@ test("a WebSocket constructor failure logs the origin, not the URL secret", () =
 
 // --- connecting ------------------------------------------------------------
 
-test("connected tracks the socket lifecycle and connect uses toWsUrl", () => {
+test("connected tracks the socket lifecycle and the connect URL carries no apiKey", () => {
   const h = harness();
   assert.equal(h.ws.connected, false, "not connected before start");
 
   h.ws.start();
   assert.equal(h.sockets.length, 1);
-  assert.equal(
-    h.last().url,
-    "wss://relay.example.com/ws?token=test-key",
-  );
+  assert.equal(h.last().url, toWsUrl("https://relay.example.com"), "the URL is toWsUrl's, with no token");
+  assert.ok(!h.last().url.includes("test-key"), "no apiKey in the URL");
+  assert.equal(socketKey(h.last()), "test-key", "it is in the upgrade header instead");
   assert.equal(h.ws.connected, false, "still CONNECTING before the handshake");
 
   h.last().open();
@@ -242,10 +320,8 @@ test("setApiKey is used for the next connection attempt", async () => {
   await flush();
 
   assert.equal(h.sockets.length, 2);
-  assert.ok(
-    h.last().url.includes("token=rotated-key"),
-    `expected the rotated key in ${h.last().url}`,
-  );
+  assert.equal(socketKey(h.last()), "rotated-key", `expected the rotated key on ${h.last().url}`);
+  assert.ok(!h.last().url.includes("rotated-key"), "and not in the URL");
   h.ws.stop();
 });
 
@@ -836,7 +912,7 @@ test("repeated failed handshakes trigger one auth recovery with the fresh key", 
     },
   });
   h.ws.start();
-  assert.ok(h.last().url.includes("token=test-key"));
+  assert.equal(socketKey(h.last()), "test-key");
 
   h.last().drop(1006); // first failed handshake — no recovery yet
   await flush();
@@ -847,10 +923,8 @@ test("repeated failed handshakes trigger one auth recovery with the fresh key", 
   await flush();
   assert.equal(recoveries, 1);
   assert.equal(h.sockets.length, 3);
-  assert.ok(
-    h.last().url.includes("token=fresh-key"),
-    `expected the recovered key in ${h.last().url}`,
-  );
+  assert.equal(socketKey(h.last()), "fresh-key", `expected the recovered key on ${h.last().url}`);
+  assert.ok(!h.last().url.includes("fresh-key"), "the recovered key is not in the URL either");
 
   // One-shot: further failed handshakes do not call onAuthFailure again.
   h.last().drop(1006);
@@ -883,10 +957,7 @@ test("a successful open re-arms auth recovery", async () => {
   h.last().drop(1006); // failed handshake 2 after the reset — recovery
   await flush(); // socket 5
   assert.equal(recoveries, 1);
-  assert.ok(
-    h.last().url.includes("token=key-1"),
-    `expected the recovered key in ${h.last().url}`,
-  );
+  assert.equal(socketKey(h.last()), "key-1", `expected the recovered key on ${h.last().url}`);
   h.ws.stop();
 });
 
@@ -906,7 +977,7 @@ test("auth recovery that returns no key keeps the old key and does not retry", a
   h.last().drop(1006);
   await flush();
   assert.equal(recoveries, 1);
-  assert.ok(h.last().url.includes("token=test-key"));
+  assert.equal(socketKey(h.last()), "test-key");
 
   h.last().drop(1006);
   await flush();

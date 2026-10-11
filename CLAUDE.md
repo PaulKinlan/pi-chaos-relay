@@ -73,7 +73,9 @@ so the replacement re-fetches. See AGENTS.md.
 
 `isValidRelayUrl` accepts `https://` anywhere and `http://` only on loopback
 (`localhost`, 127.0.0.0/8, `[::1]`), because the bearer API key travels in every
-HTTP request and in the WebSocket `?token=` query string. `CHAOS_RELAY_ALLOW_INSECURE_HTTP=1`
+HTTP request and in the WebSocket upgrade (which authenticates with an
+`Authorization: Bearer` header; `CHAOS_RELAY_WS_AUTH=query` is the warned opt-in
+for the legacy `?token=` form). `CHAOS_RELAY_ALLOW_INSECURE_HTTP=1`
 is the only bypass (off by default, warned about at every connect), and a refused
 plaintext URL must fail closed: no fallback to the default relay for a bound
 session, and no "malformed URL" wording for a perfectly well-formed one. See

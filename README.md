@@ -75,6 +75,7 @@ file > default**. The saved config file is `~/.pi/chaos-relay.json` (written wit
 | `CHAOS_RELAY_AGENT_ID` | `pi` | Connection/session label channels are tagged with |
 | `CHAOS_RELAY_APPROVAL_MODE` | `writes` | Tool-approval policy: `off` / `writes` / `all` (see Tool approvals) |
 | `CHAOS_RELAY_ALLOW_INSECURE_HTTP` | unset | Allow a plaintext `http://` relay on a NON-loopback host (see Relay URL and transport) |
+| `CHAOS_RELAY_WS_AUTH` | `header` | How the WebSocket upgrade authenticates: `header` (default — the API key travels in `Authorization: Bearer`, never in the URL) / `query` (legacy `?token=`, for a relay that cannot read upgrade headers) / `both` |
 | `CHAOS_RELAY_PROFILE` | `default` | Names a separate config file (`~/.pi/chaos-relay.<profile>.json`) — see Multiple instances |
 | `CHAOS_RELAY_CONFIG` | — | Absolute path to the config file (overrides `CHAOS_RELAY_PROFILE`) |
 
@@ -279,11 +280,20 @@ older configs or a bad `CHAOS_RELAY_URL` / `--advanced` entry. A URL must be an
 absolute `http(s)://…` **and use TLS unless it is loopback**: `https://` is
 accepted anywhere, `http://` only for `localhost` / `127.0.0.0/8` / `[::1]`.
 Anything else would put the bearer API key on the wire in the clear — in every
-HTTP request and in the WebSocket `?token=` query string — so a plaintext URL to
+HTTP request and in the WebSocket upgrade — so a plaintext URL to
 an external host is refused, and the refusal says so instead of being reported as
 a malformed URL. Set `CHAOS_RELAY_ALLOW_INSECURE_HTTP=1` to accept it on purpose
 (a LAN relay with no TLS): it is off by default, never implied, and every connect
 over such a URL logs a warning.
+
+The push **WebSocket authenticates with a header**, not with a URL parameter:
+the upgrade request carries `Authorization: Bearer <apiKey>`, so the key cannot
+be picked up by a proxy log, an access log, or an error string that quotes the
+URL. A relay that cannot read upgrade headers can be used with
+`CHAOS_RELAY_WS_AUTH=query`, which sends the legacy `?token=<apiKey>` — that
+reintroduces exactly the exposure this avoids, so it is opt-in, warned about on
+every connect, and an unrecognised value is reported and ignored rather than
+silently taken as "query".
 
 The effective URL is the **first valid** value in precedence order (env → saved
 file → default), so a malformed or refused value is skipped rather than silently

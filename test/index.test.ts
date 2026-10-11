@@ -162,13 +162,16 @@ class FailingWebSocket {
    * `instances[0]` belongs to it (stale clients from earlier tests can still
    * construct into the registry while this test is running). */
   readonly url: string;
+  /** The upgrade headers: the apiKey travels here, not in the URL. */
+  readonly headers: Record<string, string>;
   readyState = 0;
   onopen: ((event: unknown) => void) | null = null;
   onmessage: ((event: unknown) => void) | null = null;
   onerror: ((event: unknown) => void) | null = null;
   onclose: ((event: { code: number }) => void) | null = null;
-  constructor(url: string) {
+  constructor(url: string, init?: { headers?: Record<string, string> }) {
     this.url = url;
+    this.headers = init?.headers ?? {};
     FailingWebSocket.instances.push(this);
   }
   send(): void {}
@@ -188,11 +191,14 @@ class PushWebSocket {
   onmessage: ((event: unknown) => void) | null = null;
   onerror: ((event: unknown) => void) | null = null;
   onclose: ((event: { code: number }) => void) | null = null;
-  constructor(url: string) {
+  constructor(url: string, init?: { headers?: Record<string, string> }) {
     this.url = url;
+    this.headers = init?.headers ?? {};
     PushWebSocket.instances.push(this);
   }
   url: string;
+  /** The upgrade headers: the apiKey travels here, not in the URL. */
+  headers: Record<string, string>;
   send(): void {}
   close(): void {}
   pushFrame(data: string): void {
@@ -201,15 +207,18 @@ class PushWebSocket {
 }
 
 /**
- * The socket THIS test's extension opened. ws-client builds the URL from the
- * profile's apiKey (`toWsUrl` puts it in `?token=`), so a still-reconnecting
- * socket left behind by an earlier test — its backoff timer can fire between this
- * test's `instances = []` and its `session_start` — can never be picked by
- * accident. Using `instances[0]` made the d8e regression tests flake when the
- * whole file ran.
+ * The socket THIS test's extension opened. ws-client authenticates the upgrade
+ * with `Authorization: Bearer <apiKey>`, so a still-reconnecting socket left
+ * behind by an earlier test — its backoff timer can fire between this test's
+ * `instances = []` and its `session_start` — can never be picked by accident.
+ * Using `instances[0]` made the d8e regression tests flake when the whole file
+ * ran, and matching on the URL would no longer identify anything: the apiKey is
+ * deliberately absent from it.
  */
 function socketForProfile(apiKey: string): PushWebSocket {
-  const socket = PushWebSocket.instances.find((s) => s.url.includes(apiKey));
+  const socket = PushWebSocket.instances.find(
+    (s) => s.headers.Authorization === `Bearer ${apiKey}`,
+  );
   assert.ok(socket, `no WebSocket was opened for api key ${apiKey}`);
   return socket;
 }
@@ -1258,9 +1267,7 @@ test("auth recovery re-bind logs the webhook origin, not the secret URL", async 
   const origWs = globalThis.WebSocket;
   FailingWebSocket.instances = [];
   const ownSockets = () =>
-    FailingWebSocket.instances.filter((ws) =>
-      ws.url.includes(`token=${encodeURIComponent("old-key")}`),
-    );
+    FailingWebSocket.instances.filter((ws) => ws.headers.Authorization === "Bearer old-key");
   globalThis.fetch = (async (input: unknown, _init?: unknown) => {
     const href = typeof input === "string" ? input : String(input);
     if (href.endsWith("/auth/register")) {
@@ -1287,7 +1294,7 @@ test("auth recovery re-bind logs the webhook origin, not the secret URL", async 
     chaosRelayExtension(fake.pi as unknown as ExtensionApi);
     await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-rebind", fake.notifications));
 
-    assert.ok(ownSockets().length >= 1, "this test's WS was constructed (token=old-key)");
+    assert.ok(ownSockets().length >= 1, "this test's WS was constructed for old-key");
     const first = ownSockets()[0];
     first.failHandshake(1006);
     await waitFor(() => ownSockets().length >= 2);
@@ -1388,8 +1395,8 @@ test("auth recovery re-binds every channel concurrently, in one round-trip windo
     await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-concurrent-rebind", fake.notifications));
 
     const ownSockets = () =>
-      FailingWebSocket.instances.filter((ws) => ws.url.includes(`token=${encodeURIComponent("old-key")}`));
-    assert.ok(ownSockets().length >= 1, "this test's WS was constructed (token=old-key)");
+      FailingWebSocket.instances.filter((ws) => ws.headers.Authorization === "Bearer old-key");
+    assert.ok(ownSockets().length >= 1, "this test's WS was constructed for old-key");
     const first = ownSockets()[ownSockets().length - 1];
     first.failHandshake(1006);
     await waitFor(() => ownSockets().some((ws) => ws !== first));
@@ -1488,9 +1495,9 @@ test("auth recovery re-bind keeps record order and one failure does not drop the
     await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-ordered-rebind", fake.notifications));
 
     const ownSockets = () =>
-      FailingWebSocket.instances.filter((ws) => ws.url.includes(`token=${encodeURIComponent("old-key")}`));
+      FailingWebSocket.instances.filter((ws) => ws.headers.Authorization === "Bearer old-key");
     const first = ownSockets()[ownSockets().length - 1];
-    assert.ok(first, "this test's WS was constructed (token=old-key)");
+    assert.ok(first, "this test's WS was constructed for old-key");
     first.failHandshake(1006);
     await waitFor(() => ownSockets().some((ws) => ws !== first));
     const second = ownSockets().find((ws) => ws !== first);
@@ -3426,6 +3433,33 @@ test("isStaleRuntimeError recognises the SDK's replacement error and nothing els
   assert.equal(isStaleRuntimeError(new Error("Agent is already processing")), false);
   assert.equal(isStaleRuntimeError(new Error("active model rejected image input")), false);
   assert.equal(isStaleRuntimeError(undefined), false);
+});
+
+test("the socket the extension opens authenticates with a header, not a URL token", async () => {
+  resetState();
+  writeProfileConfig("default", "ak_ws_header");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  const origWs = globalThis.WebSocket;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+  try {
+    const fake = makeFakePi();
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(
+      fake.handlers,
+      "session_start",
+      { reason: "startup" },
+      makeCtx("sess-ws-header", fake.notifications),
+    );
+    const socket = socketForProfile("ak_ws_header");
+    assert.deepEqual(socket.headers, { Authorization: "Bearer ak_ws_header" });
+    assert.ok(socket.url.endsWith("/ws"), `the URL is the bare endpoint: ${socket.url}`);
+    assert.ok(!socket.url.includes("ak_ws_header"), `no apiKey in ${socket.url}`);
+  } finally {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.WebSocket = origWs;
+  }
 });
 
 test("a delivery that hits a replaced runtime stops the instance and returns the batch to the poller", async () => {
