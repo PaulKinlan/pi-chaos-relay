@@ -6,10 +6,9 @@
  * and accepts replies on the same socket (`{type:"reply", ...}` ->
  * `{type:"reply_ack"}`). This replaces 15s HTTP polling with near-instant push.
  *
- * Auth: the relay authenticates the socket from an `Authorization: Bearer <apiKey>`
- * header on the upgrade request — Node's WebSocket sends a `headers` option — so the
- * key can enter the URL at all: `header` sends `Authorization: Bearer <apiKey>` and
- * keeps it out of every log, `query` is the legacy `?token=` form. The default is
+ * Auth: the upgrade carries the apiKey either in an `Authorization: Bearer` header
+ * (Node's WebSocket sends a `headers` option) or, by default, in the legacy
+ * `?token=` query parameter. The default is
  * `query` ONLY because the relay's `/ws` handler still reads the token from the query
  * string and 401s without it (PaulKinlan/chaos, `packages/server/src/main.ts`: the
  * upgrade branch does `url.searchParams.get("token")`); a URL-carried key is warned
@@ -143,8 +142,9 @@ export interface WsAuthModeResult {
  *   header           — `Authorization: Bearer <apiKey>`; the key stays out of the URL
  *   both             — send both, for a relay mid-migration
  *
- * Anything else falls back to `header` and returns a warning, so a typo cannot
- * silently disable the protection. Pure given an env object.
+ * Anything else uses `DEFAULT_WS_AUTH_MODE` and returns a warning naming what it
+ * actually fell back to, so a typo cannot be mistaken for a deliberate choice.
+ * Pure given an env object.
  */
 export function wsAuthMode(env: { CHAOS_RELAY_WS_AUTH?: string } = process.env): WsAuthModeResult {
   const raw = (env.CHAOS_RELAY_WS_AUTH ?? "").trim().toLowerCase();
@@ -152,7 +152,9 @@ export function wsAuthMode(env: { CHAOS_RELAY_WS_AUTH?: string } = process.env):
   if (raw === "header" || raw === "query" || raw === "both") return { mode: raw };
   return {
     mode: DEFAULT_WS_AUTH_MODE,
-    warning: `CHAOS_RELAY_WS_AUTH="${raw}" is not one of header|query|both — using header auth`,
+    warning:
+      `CHAOS_RELAY_WS_AUTH="${raw}" is not one of header|query|both — using ` +
+      `${DEFAULT_WS_AUTH_MODE} auth, which sends the apiKey in the URL`,
   };
 }
 
@@ -183,7 +185,7 @@ export function wsAuthSummary(
         ? "both (header plus the URL query string — the apiKey is still in the URL)"
         : "query (the apiKey travels in the URL query string, so it reaches proxy and access logs)";
   const fix = warning
-    ? `CHAOS_RELAY_WS_AUTH is not one of header|query|both — using ${mode}; ${warning}`
+    ? warning
     : keyInUrl
       ? "set CHAOS_RELAY_WS_AUTH=header once your relay accepts an upgrade Authorization header"
       : undefined;

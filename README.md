@@ -300,7 +300,7 @@ connection logs one warning naming the exposure and pointing at
 `CHAOS_RELAY_WS_AUTH=header`; once your relay accepts an upgrade
 `Authorization` header, that is the setting to use. `CHAOS_RELAY_WS_AUTH=both`
 sends both, for a relay mid-migration. An unrecognised value is reported and
-falls back to the default rather than being silently taken as "query", and
+then the default is used — never silently taken as a valid mode — and
 `/chaos-relay status` reports which mode is in use and whether the key is in
 the URL.
 

@@ -3480,6 +3480,22 @@ test("status and doctor report the WebSocket auth mode and whether the key is in
     const hdr = await runStatus();
     assert.match(hdr, /ws auth:\s+header \(Authorization: Bearer/);
 
+    // A transport that was never started must not be reported as a relay/auth
+    // problem: the fix line has to point at starting it.
+    resetState();
+    writeProfileConfig("default", "ak_ws_report");
+    const stoppedFake = makeFakePi();
+    chaosRelayExtension(stoppedFake.pi as unknown as ExtensionApi);
+    const stoppedCmd = stoppedFake.commands.get("chaos-relay");
+    assert.ok(stoppedCmd, "extension registers the /chaos-relay command");
+    await stoppedCmd.handler("doctor", makeCtx("sess-ws-report-stopped", stoppedFake.notifications));
+    const stoppedDoc = stoppedFake.notifications.map((n) => n.message).join("\n");
+    assert.match(stoppedDoc, /the WebSocket transport is not running/);
+    assert.ok(
+      !stoppedDoc.includes("CHAOS_RELAY_WS_AUTH=query"),
+      `a transport that never ran is not evidence about the relay: ${stoppedDoc}`,
+    );
+
     // doctor must carry the same fact, and (with the socket down in header mode)
     // the fix that names the other carrier.
     resetState();
@@ -3488,6 +3504,13 @@ test("status and doctor report the WebSocket auth mode and whether the key is in
     chaosRelayExtension(fake.pi as unknown as ExtensionApi);
     const command = fake.commands.get("chaos-relay");
     assert.ok(command, "extension registers the /chaos-relay command");
+    // A socket that exists and cannot open is the case the auth advice is for.
+    await callHandler(
+      fake.handlers,
+      "session_start",
+      { reason: "startup" },
+      makeCtx("sess-ws-report-doc", fake.notifications),
+    );
     await command.handler("doctor", makeCtx("sess-ws-report-doc", fake.notifications));
     const doc = fake.notifications.map((n) => n.message).join("\n");
     assert.match(doc, /WebSocket transport[\s\S]{0,120}auth: header \(Authorization: Bearer/);

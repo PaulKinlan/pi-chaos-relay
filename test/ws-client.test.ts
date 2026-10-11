@@ -294,9 +294,12 @@ test("a mistyped CHAOS_RELAY_WS_AUTH is reported and falls back to the shipping 
       "wss://relay.example.com/ws?token=test-key",
       "falls back to the shipping default carrier, not to a broken handshake",
     );
+    const typo = h.logs.filter((l) => l.includes('CHAOS_RELAY_WS_AUTH="token"'));
+    assert.equal(typo.length, 1, `the typo is named once: ${JSON.stringify(h.logs)}`);
+    assert.match(typo[0], /is not one of header\|query\|both — using query auth/);
     assert.ok(
-      h.logs.some((l) => l.includes('CHAOS_RELAY_WS_AUTH="token" is not one of header|query|both')),
-      `the typo is named: ${JSON.stringify(h.logs)}`,
+      !typo[0].includes("using header auth"),
+      `the fallback must not claim the key is out of the URL when it is not: ${typo[0]}`,
     );
   });
 });
@@ -374,6 +377,22 @@ test("setApiKey is used for the next connection attempt", async () => {
   assert.equal(h.sockets.length, 2);
   assert.equal(socketKey(h.last()), "rotated-key", `expected the rotated key on ${h.last().url}`);
   h.ws.stop();
+});
+
+test("a rotated key stays out of the URL when header auth is on", async () => {
+  await withWsAuth("header", async () => {
+    const h = harness({ maxBackoffMs: 0 });
+    h.ws.start();
+    h.last().drop(1006);
+    h.ws.setApiKey("rotated-key");
+    await flush();
+    assert.equal(socketKey(h.last()), "rotated-key");
+    assert.ok(
+      !h.last().url.includes("rotated-key"),
+      `header mode must not leak the rotated key into the URL: ${h.last().url}`,
+    );
+    h.ws.stop();
+  });
 });
 
 test("a wsFactory that throws is logged and retried", async () => {
