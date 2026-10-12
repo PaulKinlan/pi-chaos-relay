@@ -76,7 +76,7 @@ file > default**. The saved config file is `~/.pi/chaos-relay.json` (written wit
 | `CHAOS_RELAY_APPROVAL_MODE` | `writes` | Tool-approval policy: `off` / `writes` / `all` (see Tool approvals) |
 | `CHAOS_RELAY_ALLOW_INSECURE_HTTP` | unset | Allow a plaintext `http://` relay on a NON-loopback host (see Relay URL and transport) |
 | `CHAOS_RELAY_WS_AUTH` | `query` | How the WebSocket upgrade authenticates: `query` (default — the legacy `?token=` the relay reads today, so the API key is visible in URL logs) / `header` (the API key travels in `Authorization: Bearer` and stays out of the URL; use this once your relay reads an upgrade header) / `both` |
-| `CHAOS_RELAY_WS_MAX_BACKOFF_MS` | `30000` | Cap on the WebSocket reconnect backoff (the loop sleeps `min(cap, 1000 * 2**attempts)`). An operator knob on a flaky network, and the seam that lets the test suite reach the auth-recovery path in milliseconds instead of sleeping through 2s + 4s of real backoff. Unset, empty, non-numeric or below 1 keeps the client default |
+| `CHAOS_RELAY_WS_MAX_BACKOFF_MS` | `30000` | Cap on the WebSocket reconnect backoff (the loop sleeps `min(cap, 1000 * 2**min(attempts, 5))`, so the exponent is bounded at 5 and any cap above `32000` behaves like `32000`). An operator knob on a flaky network, and the seam that lets the test suite reach the auth-recovery path in milliseconds instead of sleeping through 2s + 4s of real backoff. Unset, empty, non-numeric or below 1 keeps the client default |
 | `CHAOS_RELAY_PROFILE` | `default` | Names a separate config file (`~/.pi/chaos-relay.<profile>.json`) — see Multiple instances |
 | `CHAOS_RELAY_CONFIG` | — | Absolute path to the config file (overrides `CHAOS_RELAY_PROFILE`) |
 
