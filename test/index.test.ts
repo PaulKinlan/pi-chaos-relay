@@ -4103,16 +4103,18 @@ test("auth recovery flushes staged message state before replay so the agent rece
   const origFetch = globalThis.fetch;
   const prevApproval = process.env.CHAOS_RELAY_APPROVAL_MODE;
   delete process.env.CHAOS_RELAY_APPROVAL_MODE;
+  const prevMaxBackoff = process.env.CHAOS_RELAY_WS_MAX_BACKOFF_MS;
+  process.env.CHAOS_RELAY_WS_MAX_BACKOFF_MS = "200";
   PushWebSocket.instances = [];
   globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
-  // Reconnect uses real timeouts (2s), but the 2s state-writer safety interval
-  // must not flush the staged state before recovery gets a chance to replace it.
+  // State-writer safety interval (setInterval) must not flush the staged
+  // state before recovery gets a chance to replace it.
   t.mock.timers.enable({ apis: ["setInterval"] });
   let openDownloads: (() => void) | undefined;
   let downloadStarted = false;
   let catchUpCount = 0;
   const downloadsGate = new Promise<void>((resolve) => { openDownloads = resolve; });
-  globalThis.fetch = (async (input: unknown) => {
+  globalThis.fetch = (async (input: unknown, init?: unknown) => {
     const href = String(input);
     if (href.endsWith("/auth/register")) {
       return Response.json({ userId: "rss-user", apiKey: newKey });
@@ -4125,8 +4127,12 @@ test("auth recovery flushes staged message state before replay so the agent rece
       });
     }
     if (href.includes("/messages")) {
-      catchUpCount++;
-      return Response.json({ messages: [message], since: message.timestamp });
+      const auth = (init as { headers?: Record<string, string> })?.headers?.Authorization;
+      if (auth === `Bearer ${newKey}`) {
+        catchUpCount++;
+        return Response.json({ messages: [message], since: message.timestamp });
+      }
+      return Response.json({ messages: [] });
     }
     throw new Error(`unexpected fetch: ${href}`);
   }) as unknown as typeof fetch;
@@ -4141,6 +4147,7 @@ test("auth recovery flushes staged message state before replay so the agent rece
     chaosRelayExtension(fake.pi as unknown as ExtensionApi);
     await callHandler(fake.handlers, "session_start", { reason: "startup" }, ctx);
     const first = socketForProfile(oldKey);
+    first.open();
     first.pushFrame(JSON.stringify({ type: "message", message }));
     await waitFor(() => downloadStarted);
     const stagedDisk = existsSync(statePath) ? readFileSync(statePath, "utf-8") : "";
@@ -4148,9 +4155,27 @@ test("auth recovery flushes staged message state before replay so the agent rece
     assert.equal(sent.length, 0, "the original delivery is held in attachment hydration");
 
     first.drop();
+    // In ws-client.ts:
+    // 1) When an opened socket closes (openedSinceAttempt === true), failedHandshakes
+    //    is NOT incremented and remains 0.
+    // 2) Sockets that close without opening (openedSinceAttempt === false) increment
+    //    failedHandshakes by 1.
+    // 3) scheduleReconnect() triggers auth recovery only when failedHandshakes >= 2.
+    // With CHAOS_RELAY_WS_MAX_BACKOFF_MS=200, reconnect backoff takes ~200ms rather
+    // than 2s/4s, so two consecutive failed handshake attempts (second and third)
+    // cleanly and cheaply reach the failedHandshakes >= 2 auth recovery threshold.
     await waitFor(() => PushWebSocket.instances.some((socket) => socket !== first && socketCarries(socket, oldKey)));
     const second = PushWebSocket.instances.find((socket) => socket !== first && socketCarries(socket, oldKey))!;
     second.drop();
+    await waitFor(() =>
+      PushWebSocket.instances.some(
+        (socket) => socket !== first && socket !== second && socketCarries(socket, oldKey),
+      ),
+    );
+    const third = PushWebSocket.instances.find(
+      (socket) => socket !== first && socket !== second && socketCarries(socket, oldKey),
+    )!;
+    third.drop();
     await waitFor(() => PushWebSocket.instances.some((socket) => socketCarries(socket, newKey)));
     const recovered = socketForProfile(newKey);
     recovered.open(); // on-connect catch-up replays the same relay message.
@@ -4172,6 +4197,8 @@ test("auth recovery flushes staged message state before replay so the agent rece
     globalThis.fetch = origFetch;
     if (prevApproval === undefined) delete process.env.CHAOS_RELAY_APPROVAL_MODE;
     else process.env.CHAOS_RELAY_APPROVAL_MODE = prevApproval;
+    if (prevMaxBackoff === undefined) delete process.env.CHAOS_RELAY_WS_MAX_BACKOFF_MS;
+    else process.env.CHAOS_RELAY_WS_MAX_BACKOFF_MS = prevMaxBackoff;
   }
 });
 

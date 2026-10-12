@@ -7,6 +7,7 @@ import { basename, dirname, join } from "node:path";
 import {
   DEFAULT_RELAY_URL,
   insecureHttpAllowed,
+  wsMaxBackoffMs,
   isInsecureRelayUrl,
   isLoopbackHostname,
   MIN_POLL_INTERVAL_MS,
@@ -1170,6 +1171,21 @@ test("isLoopbackHostname recognises exactly the loopback forms", () => {
   assert.equal(isLoopbackHostname("127.0.0"), false);
   assert.equal(isLoopbackHostname("127.evil.example"), false);
   assert.equal(isLoopbackHostname(""), false);
+});
+
+test("wsMaxBackoffMs is a cap the suite can lower, undefined when unusable", () => {
+  // Unset or unusable means "let the client decide", so the default lives in exactly one
+  // place (ws-client.ts) and cannot drift between it and this reader.
+  assert.equal(wsMaxBackoffMs({}), undefined, "unset");
+  assert.equal(wsMaxBackoffMs({ CHAOS_RELAY_WS_MAX_BACKOFF_MS: "  " }), undefined, "blank");
+  assert.equal(wsMaxBackoffMs({ CHAOS_RELAY_WS_MAX_BACKOFF_MS: "abc" }), undefined, "not a number");
+  assert.equal(wsMaxBackoffMs({ CHAOS_RELAY_WS_MAX_BACKOFF_MS: "0" }), undefined, "zero would be a reconnect storm");
+  assert.equal(wsMaxBackoffMs({ CHAOS_RELAY_WS_MAX_BACKOFF_MS: "-5" }), undefined, "negative");
+  assert.equal(wsMaxBackoffMs({ CHAOS_RELAY_WS_MAX_BACKOFF_MS: "2.5" }), undefined, "fractional");
+  // Used exactly as given: a small cap is deliberate, not clamped, because the test
+  // suite depends on lowering it and an operator may want it lower too.
+  assert.equal(wsMaxBackoffMs({ CHAOS_RELAY_WS_MAX_BACKOFF_MS: "200" }), 200);
+  assert.equal(wsMaxBackoffMs({ CHAOS_RELAY_WS_MAX_BACKOFF_MS: " 45000 " }), 45000);
 });
 
 test("insecureHttpAllowed is opt-in only", () => {

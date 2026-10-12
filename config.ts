@@ -369,6 +369,34 @@ export function isLoopbackHostname(hostname: string): boolean {
  * `CHAOS_RELAY_WS_AUTH=header` moves it into an upgrade header instead, out of
  * the URL), so it is a decision an operator has to make on purpose.
  */
+/**
+ * Cap on the WebSocket reconnect backoff, from `CHAOS_RELAY_WS_MAX_BACKOFF_MS`.
+ *
+ * It exists because the delay is otherwise real time no test can wait out: the
+ * reconnect loop sleeps `min(cap, 1000 * 2**attempts)`, so the suite's auth-recovery
+ * test spent six seconds of wall clock (2s + 4s) as pure backoff, and worked around it
+ * with a socket state that cannot happen in reality rather than opening the socket
+ * honestly (beads pi-chaos-relay-rss and pi-chaos-relay-pcz). A small cap makes that
+ * test reach the same code in milliseconds.
+ *
+ * It is also a real operator knob: on a flaky network the default 30s cap can leave the
+ * relay disconnected for half a minute.
+ *
+ * Returns undefined when unset or unusable, in which case the client's own default
+ * applies (one source of truth for the number lives in ws-client.ts). A value below a
+ * few hundred milliseconds reconnects aggressively; that is the operator's call, and the
+ * value is used exactly as given rather than silently clamped.
+ */
+export function wsMaxBackoffMs(
+  env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+): number | undefined {
+  const raw = (env.CHAOS_RELAY_WS_MAX_BACKOFF_MS ?? "").trim();
+  if (raw === "") return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) return undefined;
+  return n;
+}
+
 export function insecureHttpAllowed(
   env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
 ): boolean {
