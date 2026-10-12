@@ -333,12 +333,17 @@ to repair by hand.
 
 The cursor and de-dup log are written at the end of a batch (or within a couple of
 seconds), not on every inbound message, so a burst costs one small write instead of
-one per message. A clean shutdown flushes synchronously, and a batch handed back for
-a replacement session is written immediately. If the process is killed hard
-(`SIGKILL`, power loss) the last window may not have reached disk, and the relay's
-replay can then deliver a message the agent already saw. That is a duplicate, never
-a loss: the cursor only ever moves backwards for a hand-back, and it is never
-advanced past a message that has not been delivered.
+one per message. A clean shutdown flushes synchronously, a batch handed back for a
+replacement session is written immediately, and a profile switch flushes before it
+moves the active config.
+
+If the process is killed hard (`SIGKILL`, power loss), the last window may not have
+reached disk, so the relay's replay can deliver a message the agent already saw. A
+kill during a slow delivery has a second, smaller window: the batch has been accepted
+(and may be persisted by the safety interval) but not yet handed to the agent, so
+that batch can be *dropped* rather than re-delivered. Both windows are bounded by the
+same few seconds, and dropping one batch there is the same behaviour as before the
+debounce, when the cursor was persisted as soon as a batch was accepted.
 
 ### "The reply was accepted" does not mean it was delivered
 

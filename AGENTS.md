@@ -137,6 +137,13 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
   for state another process reads — a hand-back. The flush points are the drain edge
   (index.ts's delivery chain, when nothing is queued behind the batch), the 2s
   safety-net interval, `session_shutdown` (flush then dispose), and any urgent write.
+  The writer is created by `makePoller` and PINNED to the profile's state path at
+  that moment: the write is deferred, so resolving the path at flush time would put
+  state staged under one profile into the next profile's side-car (a release at
+  `connectAsProfile` is what makes the pinness sufficient, and both are needed — the
+  pair is the regression the profile-switch test pins). A reset drops the state
+  instead of flushing it (`releaseStateWriter(false)`), or it would recreate the
+  files `resetPersisted("all")` just deleted.
   Do NOT add a `runtimeReplaced` guard to the write: suppressing the hand-back write
   is what the d8e regression test catches. Do not remove the `disposed` check either:
   a superseded instance holding older state must not flush it over the replacement's.

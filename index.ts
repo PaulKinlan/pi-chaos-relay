@@ -52,6 +52,7 @@ import {
   setChannelRecords,
   loadMessageState,
   saveMessageState,
+  messageStatePath,
   getConfigPath,
   setActiveConfigPath,
   profilePathForName,
@@ -522,15 +523,41 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
    * Deliberately NOT guarded on `runtimeReplaced`: the hand-back that a replaced
    * runtime performs (requeueUndelivered) is the one write that MUST land, because
    * the replacement session loads it. A guard here suppressed exactly that write,
-   * which the d8e regression test caught. What stops a dead instance from writing
-   * later is ordering instead: the urgent hand-back is written before the flag is
-   * usable-anyway, no further state is staged once the transport is torn down (the
-   * accept paths refuse), and session_shutdown flushes then disposes this writer.
+   * which the d8e regression test caught.
+   *
+   * `dispose()` is not what keeps a dead instance quiet — it is the call-site gates
+   * (accept refuses once the runtime is replaced, a post-shutdown `requeue` returns
+   * without calling onPersist, and session_shutdown is synchronous). Dispose is the
+   * cleanup for the state those gates can no longer reach.
    */
-  function makeStateWriter(): DebouncedStateWriter<PollerPersistState> {
+  /**
+   * Release the current writer: optionally flush it, then dispose it.
+   *
+   * `write: true` is for a hand-over where the state on disk must be current
+   * first (replacing the poller, tearing the client down, shutdown). `write:
+   * false` is for a reset, where writing would recreate the very files that were
+   * just deleted — the state must be dropped instead.
+   */
+  function releaseStateWriter(write: boolean): void {
+    if (!stateWriter) return;
+    if (write) stateWriter.flushNow();
+    stateWriter.dispose();
+    stateWriter = undefined;
+  }
+
+  /**
+   * The debounced writer for one poller's resume state, pinned to the state file
+   * of the profile that is active NOW.
+   *
+   * The pin is the point: the write is deferred, so resolving the path at flush
+   * time would send state staged under profile A into B.json.state whenever a
+   * profile switch (or a reset) happened in between — see
+   * `saveMessageState(state, statePath)`.
+   */
+  function makeStateWriter(statePath: string): DebouncedStateWriter<PollerPersistState> {
     return new DebouncedStateWriter<PollerPersistState>({
       write: ({ since, seen }) => {
-        saveMessageState({ cursor: since, seenIds: seen });
+        saveMessageState({ cursor: since, seenIds: seen }, statePath);
       },
       onError: (err) =>
         log(
@@ -547,6 +574,13 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // Cursor + de-dup log come from the side-car state file (falling back to
     // the legacy in-config fields on first run after upgrade), so the delivery
     // hot path never rewrites the profile config at all.
+    // A replacement poller must not load state that is older than memory: flush
+    // (and dispose) the previous writer first, then pin a fresh one to this
+    // profile's side-car. recoverApiKey rebuilds the poller in place, so this is
+    // what keeps a reconnect's catch-up from re-delivering messages the agent
+    // already saw.
+    releaseStateWriter(true);
+    stateWriter = makeStateWriter(messageStatePath());
     const state = loadMessageState();
     return new MessagePoller(c, {
       since: state.cursor,
@@ -565,9 +599,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       // writer flush it on its interval, at the next drain edge, or urgently for a
       // hand-back. See state-writer.ts for why those are not the same case.
       onPersist: (state, urgent) => {
-        const writer = stateWriter ?? (stateWriter = makeStateWriter());
-        if (urgent) writer.stageUrgent(state);
-        else writer.stage(state);
+        // Always present: makePoller created it (pinned to this profile) and
+        // nothing but makePoller assigns it.
+        if (!stateWriter) return;
+        if (urgent) stateWriter.stageUrgent(state);
+        else stateWriter.stage(state);
       },
       // Restore the persisted de-dup log so restarts don't re-process the
       // relay's on-connect message replay.
@@ -637,16 +673,14 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     if (blockedByPlaintextRefusal()) {
       client = undefined;
       poller = undefined;
-      stateWriter?.dispose();
-      stateWriter = undefined;
+      releaseStateWriter(true);
       return undefined;
     }
     warnIfConnectingInsecurely(cfg.relayUrl);
     if (!isConfigured(cfg)) {
       client = undefined;
       poller = undefined;
-      stateWriter?.dispose();
-      stateWriter = undefined;
+      releaseStateWriter(true);
       return undefined;
     }
     if (!client) {
@@ -904,6 +938,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     stopPolling();
     client = undefined;
     poller = undefined;
+    // Flush BEFORE the active path moves. The writer is pinned to the outgoing
+    // profile's side-car, so this is where its last staged state belongs.
+    releaseStateWriter(true);
     setActiveConfigPath(profilePath);
     cfg = resolveConfig();
     currentProfile = activeProfileName();
@@ -1474,9 +1511,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // requeueInFlight already wrote any rewound cursor synchronously; this covers
     // everything else staged since the last flush, and dispose stops the timer so
     // this instance cannot write again.
-    stateWriter?.flushNow();
-    stateWriter?.dispose();
-    stateWriter = undefined;
+    releaseStateWriter(true);
     stopPolling();
     stopTyping();
     // Drop any undelivered turn origins and the session read taint so the
@@ -2623,6 +2658,13 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const hadKey = Boolean(before.apiKey);
     stopPolling();
     client = undefined;
+    // `reset all` deletes the config AND the side-car, and writing after that
+    // would recreate both with the old identity's cursor and de-dup log — the
+    // exact "old state carried into a fresh start" that resetPersisted exists to
+    // prevent. So drop the state for `all`; for a URL-only reset the side-car
+    // survives and the state belongs in it.
+    poller = undefined;
+    releaseStateWriter(all ? false : true);
     resetPersisted(all ? "all" : "url");
     cfg = resolveConfig();
     if (all) {
