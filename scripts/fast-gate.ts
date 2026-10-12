@@ -85,6 +85,9 @@ export const MODULE_TESTS: Record<string, string[]> = {
     "test/ws-client.test.ts",
   ],
   "poller.ts": ["test/poller.test.ts", "test/ws-client.test.ts"],
+  // A leaf: index.ts owns the wiring (the drain-edge flush and the urgent path),
+  // so this module's own unit suite is its coverage.
+  "state-writer.ts": ["test/state-writer.test.ts"],
   "profile-lock.ts": ["test/profile-lock.test.ts"],
   "relay-client.ts": [
     "test/approvals.test.ts",

@@ -49,6 +49,12 @@ process.env.HOME = HOME_DIR;
 delete process.env.CHAOS_RELAY_CONFIG;
 delete process.env.CHAOS_RELAY_PROFILE;
 delete process.env.CHAOS_RELAY_API_KEY;
+// Also clear the approval mode: this machine's shell environment (the fleet's
+// ~/.fleet/env) exports CHAOS_RELAY_APPROVAL_MODE=off, and resolveConfig gives the
+// environment precedence over the profile file, so every approval/attribution test
+// in this file silently ran with approvals disabled and failed (bead
+// pi-chaos-relay-wbj). A test suite must not depend on the operator's environment.
+delete process.env.CHAOS_RELAY_APPROVAL_MODE;
 // env beats the persisted file in resolveConfig, so this pins the relay URL for
 // every connect attempt in this file (including doctor's reachability check).
 process.env.CHAOS_RELAY_URL = OFFLINE_RELAY_URL;
@@ -3596,6 +3602,294 @@ test("CHAOS_RELAY_WS_AUTH=header keeps the apiKey out of the WebSocket URL", asy
     if (prevAuth === undefined) delete process.env.CHAOS_RELAY_WS_AUTH;
     else process.env.CHAOS_RELAY_WS_AUTH = prevAuth;
     globalThis.WebSocket = origWs;
+  }
+});
+
+test("a profile switch does not carry deferred state into the other profile's side-car", async () => {
+  // bead pi-chaos-relay-7jp, review round 1 P1: the state write is deferred, so
+  // resolving the side-car path at FLUSH time sent state staged under profile A
+  // into B.json.state whenever the switch happened in between. The writer is now
+  // pinned to the path that was active when it was created; this drives the switch
+  // with a delivery still held in hydration, which is the flow that has no drain
+  // edge to flush it first.
+  resetState();
+  writeProfileConfig("default", "ak_state_switch_a");
+  writeProfileConfig("beta", "ak_state_switch_b");
+  const defaultState = config.messageStatePath();
+  const betaState = `${config.profilePathForName("beta")}.state`;
+  for (const p of [defaultState, betaState]) {
+    try {
+      unlinkSync(p);
+    } catch {
+      /* nothing to remove */
+    }
+  }
+  const origWs = globalThis.WebSocket;
+  const origFetch = globalThis.fetch;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+  let openDownloads: (() => void) | undefined;
+  let downloadStarted = false;
+  const downloadsGate = new Promise<void>((resolve) => {
+    openDownloads = resolve;
+  });
+  globalThis.fetch = (async (input: unknown) => {
+    if (!String(input).includes("/attachments/")) throw new Error(`unexpected fetch: ${input}`);
+    downloadStarted = true;
+    await downloadsGate;
+    return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), {
+      status: 200,
+      headers: { "content-type": "image/png" },
+    });
+  }) as unknown as typeof fetch;
+  const fake = makeFakePi();
+  const ctx = makeCtx("sess-state-switch", fake.notifications);
+  (ctx as { model: unknown }).model = { input: ["text", "image"] };
+  try {
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, ctx);
+    const socket = socketForProfile("ak_state_switch_a");
+    socket.pushFrame(
+      JSON.stringify({
+        type: "message",
+        message: {
+          id: "m-switch-1",
+          channelType: "telegram",
+          channelId: "chan-switch",
+          from: "alice",
+          content: "held in hydration",
+          timestamp: "2026-10-12T00:10:00.000Z",
+          attachments: [
+            { id: "att-1", filename: "photo.png", mimeType: "image/png", size: 8, kind: "image" },
+          ],
+        },
+      }),
+    );
+    await waitFor(() => downloadStarted);
+
+    await fake.commands.get("chaos-relay")!.handler("profile beta", ctx);
+
+    // Read A's side-car BEFORE releasing the held delivery: this is the state the
+    // switch itself must have written, not one a later drain edge could have.
+    const firstState = existsSync(defaultState) ? readFileSync(defaultState, "utf-8") : "";
+    assert.ok(
+      firstState.includes("m-switch-1"),
+      `the outgoing profile's own state is written to its own file at the switch: ${firstState}`,
+    );
+
+    // Now let the held delivery finish. Its drain-edge flush runs after the active
+    // path has moved, so it is the write that would land in the wrong file.
+    openDownloads?.();
+    // Let the released delivery run to completion so its drain-edge flush executes
+    // with the active path already moved.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(
+      existsSync(betaState),
+      false,
+      "the new profile's side-car must not receive the previous profile's state",
+    );
+  } finally {
+    openDownloads?.();
+    await callHandler(fake.handlers, "session_shutdown", {}, ctx).catch(() => {});
+    for (const p of [defaultState, betaState]) {
+      try {
+        unlinkSync(p);
+      } catch {
+        /* nothing was written */
+      }
+    }
+    globalThis.WebSocket = origWs;
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("reset all does not resurrect the state file it just deleted", async () => {
+  // bead pi-chaos-relay-7jp, review round 1 P2: a live, dirty writer flushed after
+  // resetPersisted("all") had deleted the config and the side-car, recreating both
+  // with the old identity's cursor and de-dup log. The reset must drop the state,
+  // not write it.
+  resetState();
+  writeProfileConfig("default", "ak_state_reset");
+  const statePath = config.messageStatePath();
+  const configPath = config.getConfigPath();
+  try {
+    unlinkSync(statePath);
+  } catch {
+    /* nothing to remove */
+  }
+  const origWs = globalThis.WebSocket;
+  const origFetch = globalThis.fetch;
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+  PushWebSocket.instances = [];
+  // Hold the delivery in hydration: that leaves the accepted state STAGED with no
+  // drain edge, which is the dirty-writer condition the reset has to cope with.
+  let openDownloads: (() => void) | undefined;
+  let downloadStarted = false;
+  const downloadsGate = new Promise<void>((resolve) => {
+    openDownloads = resolve;
+  });
+  globalThis.fetch = (async (input: unknown) => {
+    if (!String(input).includes("/attachments/")) throw new Error(`unexpected fetch: ${input}`);
+    downloadStarted = true;
+    await downloadsGate;
+    return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), {
+      status: 200,
+      headers: { "content-type": "image/png" },
+    });
+  }) as unknown as typeof fetch;
+  const fake = makeFakePi();
+  const ctx = makeCtx("sess-state-reset", fake.notifications);
+  (ctx as { model: unknown }).model = { input: ["text", "image"] };
+  try {
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, ctx);
+    socketForProfile("ak_state_reset").pushFrame(
+      JSON.stringify({
+        type: "message",
+        message: {
+          id: "m-reset-1",
+          channelType: "telegram",
+          channelId: "chan-reset",
+          from: "alice",
+          content: "hello",
+          timestamp: "2026-10-12T00:20:00.000Z",
+          attachments: [
+            { id: "att-1", filename: "photo.png", mimeType: "image/png", size: 8, kind: "image" },
+          ],
+        },
+      }),
+    );
+    await waitFor(() => downloadStarted);
+    await fake.commands.get("chaos-relay")!.handler("reset all", ctx);
+    // Longer than the writer's 2s safety interval: a live writer would fire here.
+    await new Promise((resolve) => setTimeout(resolve, 2300));
+    assert.equal(existsSync(statePath), false, "the deleted side-car stays deleted");
+    assert.equal(existsSync(configPath), false, "and the deleted config stays deleted");
+  } finally {
+    openDownloads?.();
+    await callHandler(fake.handlers, "session_shutdown", {}, ctx).catch(() => {});
+    globalThis.WebSocket = origWs;
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("a burst of messages costs one state write, at the drain edge, not one per message", async () => {
+  // bead pi-chaos-relay-7jp: the poller reported state per accepted batch and the
+  // writer persisted each report synchronously, so a push burst was one disk write
+  // per message. The state must still be correct — this pins BOTH halves: the file
+  // lags while the burst is in flight (the debounce is real, not theoretical) and
+  // is complete and current once the queue drains.
+  resetState();
+  writeProfileConfig("default", "ak_state_burst");
+  // resetState() intentionally leaves the message-state side-car alone, and the
+  // cursor it holds only ever advances — so a leftover from an earlier test would
+  // sit above this test's timestamps and the assertions below would be about that
+  // test's state instead of this one's. Start from a known-clean side-car.
+  try {
+    unlinkSync(config.messageStatePath());
+  } catch {
+    /* nothing to remove */
+  }
+  const origWs = globalThis.WebSocket;
+  const origFetch = globalThis.fetch;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+
+  // The first delivery is held inside hydration, so the rest of the burst is
+  // accepted (and staged) while it is still in flight — the shape of a burst.
+  let openDownloads: (() => void) | undefined;
+  let downloadStarted = false;
+  // ONE gate for every download: releasing it lets the whole burst drain.
+  const downloadsGate = new Promise<void>((resolve) => {
+    openDownloads = resolve;
+  });
+  globalThis.fetch = (async (input: unknown) => {
+    const href = String(input);
+    if (!href.includes("/attachments/")) throw new Error(`unexpected fetch: ${href}`);
+    downloadStarted = true;
+    await downloadsGate;
+    return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), {
+      status: 200,
+      headers: { "content-type": "image/png" },
+    });
+  }) as unknown as typeof fetch;
+
+  const ids = ["m-burst-1", "m-burst-2", "m-burst-3", "m-burst-4"];
+  // Declared outside the try so the finally can end the session (see below).
+  const fake = makeFakePi();
+  const ctx = makeCtx("sess-state-burst", fake.notifications);
+  (ctx as { model: unknown }).model = { input: ["text", "image"] };
+  try {
+    const sends: string[] = [];
+    fake.pi.sendUserMessage = (content: unknown) => {
+      sends.push(typeof content === "string" ? content : JSON.stringify(content));
+    };
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, ctx);
+    const socket = socketForProfile("ak_state_burst");
+    const statePath = config.messageStatePath();
+    const withAttachment = (id: string, timestamp: string) => ({
+      type: "message",
+      message: {
+        id,
+        channelType: "telegram",
+        channelId: "chan-state-burst",
+        from: "alice",
+        content: "burst",
+        timestamp,
+        attachments: [
+          { id: "att-1", filename: "photo.png", mimeType: "image/png", size: 8, kind: "image" },
+        ],
+      },
+    });
+
+    socket.pushFrame(JSON.stringify(withAttachment(ids[0], "2026-10-12T00:00:01.000Z")));
+    await waitFor(() => downloadStarted);
+    for (const [i, id] of ids.slice(1).entries()) {
+      socket.pushFrame(JSON.stringify(withAttachment(id, `2026-10-12T00:00:0${i + 2}.000Z`)));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // On the pre-debounce build this file was written synchronously inside accept,
+    // so it already existed here; now nothing has been flushed at all.
+    const midBurst = existsSync(statePath) ? readFileSync(statePath, "utf-8") : "";
+    assert.ok(
+      !ids.some((id) => midBurst.includes(id)),
+      `no per-message write while the burst is in flight: ${midBurst}`,
+    );
+
+    openDownloads?.();
+    await waitFor(() => sends.length === ids.length);
+    const afterDrain = JSON.parse(readFileSync(statePath, "utf-8")) as {
+      cursor: string;
+      seenIds: string[];
+    };
+    for (const id of ids) {
+      assert.ok(
+        afterDrain.seenIds.includes(id),
+        `the drained state has ${id}: ${JSON.stringify(afterDrain.seenIds)}`,
+      );
+    }
+    assert.equal(
+      afterDrain.cursor,
+      "2026-10-12T00:00:04.000Z",
+      "and the cursor is the newest message's",
+    );
+  } finally {
+    openDownloads?.();
+    // End the session so this instance's writer is flushed and disposed: leaving a
+    // live one would let its timer write state during later tests in this file.
+    await callHandler(fake.handlers, "session_shutdown", {}, ctx).catch(() => {});
+    // And remove the side-car this test persisted. resetState() deliberately leaves
+    // it alone, so without this the next test's poller would resume from a cursor
+    // and de-dup log invented here — the machine-state leak that makes a suite
+    // order-dependent.
+    try {
+      unlinkSync(config.messageStatePath());
+    } catch {
+      /* nothing was written */
+    }
+    globalThis.WebSocket = origWs;
+    globalThis.fetch = origFetch;
   }
 });
 

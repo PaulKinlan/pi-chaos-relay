@@ -26,7 +26,7 @@ export class MessagePoller {
   private since: string | undefined;
   private seen: Set<string>;
   private readonly client: RelayClient;
-  private readonly onPersist?: (state: PollerPersistState) => void;
+  private readonly onPersist?: (state: PollerPersistState, urgent?: boolean) => void;
   private readonly onInvalid?: (issue: InboundIssue) => void;
 
   constructor(
@@ -41,7 +41,12 @@ export class MessagePoller {
        * pi-chaos-relay-mlq) — one flush carries both values consistently for
        * half the disk work.
        */
-      onPersist?: (state: PollerPersistState) => void;
+      /**
+       * Report the state to persist. `urgent` marks state another process may read
+       * before this one is asked again — a hand-back rewinds the cursor, and the
+       * replacement session loads it — so the writer must not defer it.
+       */
+      onPersist?: (state: PollerPersistState, urgent?: boolean) => void;
       /** Previously-seen message ids, persisted so dedup survives a restart. */
       seen?: string[];
       /**
@@ -187,6 +192,11 @@ export class MessagePoller {
     // A batch that only remembered a rejected id still changed the de-dup log,
     // and persisting it is what stops the next process from re-reporting the
     // same frame after the relay replays it.
+    //
+    // Not urgent: this state is only ever newer than what is on disk, and the
+    // writer coalesces a burst into one flush at the next drain edge (bead
+    // pi-chaos-relay-7jp). Stale-by-a-window costs a re-read the de-dup log
+    // filters; it cannot lose a message.
     if (fresh.length > 0 || rememberedRejected) {
       this.onPersist?.({ since: this.since, seen: Array.from(this.seen) });
     }
@@ -226,7 +236,10 @@ export class MessagePoller {
       const rewind = new Date(earliest - 1_000).toISOString();
       if (!this.since || rewind < this.since) this.since = rewind;
     }
-    this.onPersist?.({ since: this.since, seen: Array.from(this.seen) });
+    // URGENT: the whole point of a hand-back is that the REPLACEMENT session reads
+    // this state, so it has to be on disk before this instance returns (the race
+    // that lost batches before bead pi-chaos-relay-d8e).
+    this.onPersist?.({ since: this.since, seen: Array.from(this.seen) }, true);
     return back;
   }
 }

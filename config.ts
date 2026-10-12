@@ -842,12 +842,27 @@ let stateMigrated = false;
  * way to tell a never-yet-flushed profile from a lost one. The tombstone
  * makes every LATER loss loud.
  */
-export function saveMessageState(state: MessageTrackingState): void {
+/**
+ * Persist the poller's resume state.
+ *
+ * `statePath` defaults to the ACTIVE profile's side-car, but a caller that staged
+ * this state while a different profile was active must pass the path that was
+ * active then: a debounced caller (see state-writer.ts) can flush after a profile
+ * switch, and resolving the path at write time would put one profile's cursor and
+ * de-dup log into another profile's file.
+ *
+ * The one-time legacy migration below is about the ACTIVE profile's config, so it
+ * is skipped when writing a non-active profile's side-car.
+ */
+export function saveMessageState(
+  state: MessageTrackingState,
+  statePath: string = messageStatePath(),
+): void {
   atomicWriteSync(
-    messageStatePath(),
+    statePath,
     JSON.stringify({ cursor: state.cursor, seenIds: state.seenIds }, null, 2) + "\n",
   );
-  if (stateMigrated) return;
+  if (stateMigrated || statePath !== messageStatePath()) return;
   const persisted = loadPersisted();
   // One-time pass per process/profile: strip any legacy in-config fields, and
   // make sure the tombstone exists even for profiles that migrated before the

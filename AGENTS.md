@@ -132,6 +132,22 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
   `status` line and the doctor fix text. A runtime that rejects the `headers` option
   (any construct failure, not only a TypeError) logs the query-token way out instead
   of looking like a dead apiKey.
+- `state-writer.ts` — debounced persistence for the poller's resume state (bead
+  pi-chaos-relay-7jp). `stage()` coalesces a burst; `stageUrgent()` writes NOW and is
+  for state another process reads — a hand-back. The flush points are the drain edge
+  (index.ts's delivery chain, when nothing is queued behind the batch), the 2s
+  safety-net interval, `session_shutdown` (flush then dispose), and any urgent write.
+  The writer is created by `makePoller` and PINNED to the profile's state path at
+  that moment: the write is deferred, so resolving the path at flush time would put
+  state staged under one profile into the next profile's side-car. The release at
+  `connectAsProfile` and the pin are redundant for that: either alone is sufficient
+  in today's flow, and the profile-switch test only fails when BOTH are removed —
+  that pair is the regression it pins. A reset drops the state
+  instead of flushing it (`releaseStateWriter(false)`), or it would recreate the
+  files `resetPersisted("all")` just deleted.
+  Do NOT add a `runtimeReplaced` guard to the write: suppressing the hand-back write
+  is what the d8e regression test catches. Do not remove the `disposed` check either:
+  a superseded instance holding older state must not flush it over the replacement's.
 - `poller.ts` — cursor + dedup; HTTP catch-up and safety poll. `accept()` is also
   the inbound shape gate: both transports hand it raw relay payloads, so it runs
   every message through `inbound-message.ts` before anything reads a field.
