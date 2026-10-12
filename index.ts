@@ -358,6 +358,11 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   let activeTurn:
     | { channelType: ChannelMessage["channelType"]; channelId: string; from: string }
     | undefined;
+  /** True when this turn started while a relay delivery was pending but its text tied
+   *  to no pending delivery: provenance is unknown, so a gated tool call is blocked
+   *  rather than asked over a channel that did not initiate it (and the pending
+   *  origins are left intact for the deliveries they belong to). */
+  let ambiguousTurn = false;
   /** True once THIS SESSION has inspected local content (read/grep/bash) — from
    *  any turn, channel-driven or terminal/local. Cleared only at session start
    *  and shutdown, never at turn boundaries, so a channel turn cannot text-reply
@@ -1120,17 +1125,21 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   /**
    * Whether a turn's text is the delivery this origin recorded.
    *
-   * Exact when pi hands back what we sent. Tolerant when it appends: pi adds image
-   * "hints" to the user text after the prompt hook, so a message that carries images
-   * arrives as our text plus a suffix. A prefix relation in either direction, with the
-   * shorter side long enough to be distinctive, covers that without letting a short
-   * terminal "hi" match a long delivery.
+   * The turn must START WITH the whole delivered text: exact when pi hands back what we
+   * sent, and tolerant of a suffix because pi appends image "hints" to the user text
+   * after the composition point.
+   *
+   * Deliberately NOT a prefix in the other direction. Review round 2 caught why: every
+   * delivery begins with the same static line ("You have N new message(s) from
+   * chaos-relay. …"), so accepting a PREFIX of a delivery as proof of origin let a
+   * message containing just that line match and CONSUME a pending origin, after which
+   * the real relay turn ran ungated. A truncated match is not evidence of provenance;
+   * it falls into the ambiguous case below instead, which is gated without consuming.
+   * The length floor keeps a short terminal message from matching a long delivery.
    */
   function sameDelivery(sentText: string, turnText: string): boolean {
-    if (sentText === turnText) return true;
-    const shorter = sentText.length <= turnText.length ? sentText : turnText;
-    if (shorter.length < 24) return false;
-    return sentText.startsWith(turnText) || turnText.startsWith(sentText);
+    if (sentText.length < 24) return false;
+    return turnText === sentText || turnText.startsWith(sentText);
   }
 
   function dropOrigin(origin: (typeof pendingOrigins)[number] | undefined): void {
@@ -1482,6 +1491,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // concurrent turn cannot shift a stale origin into a fresh session.
     pendingOrigins = [];
     activeTurn = undefined;
+    ambiguousTurn = false;
     sessionReadLocalFile = false;
     if (poller) poller.reset();
     if (attachmentCleanupTimer) clearInterval(attachmentCleanupTimer);
@@ -1563,6 +1573,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // next session starts clean.
     pendingOrigins = [];
     activeTurn = undefined;
+    ambiguousTurn = false;
     sessionReadLocalFile = false;
     if (attachmentCleanupTimer) {
       clearInterval(attachmentCleanupTimer);
@@ -1597,21 +1608,18 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     const msg = event.message as { role?: string; content?: unknown } | undefined;
     if (!msg || msg.role !== "user") return;
     const text = userMessageText(msg.content);
-    let i = pendingOrigins.findIndex((o) => sameDelivery(o.sentText, text));
-    if (i === -1 && pendingOrigins.length > 0) {
-      // AMBIGUOUS, and this is deliberate: a turn started while a relay delivery is
-      // still pending, whose text we cannot tie to it. It is either that delivery's
-      // turn after an `input` extension transformed the text, or something the
-      // operator typed/steered ahead of it — and we cannot tell which. Gate it over
-      // the pending origin rather than let a possibly-channel-driven turn run
-      // ungated (fail closed: the 04d policy is default-deny, and a wrongly asked
-      // approval is recoverable while a wrongly skipped one is not). The origin is
-      // NOT consumed, so the relay turn still owns it when it arrives — which is the
-      // misattribution this bead is about, one turn earlier.
-      activeTurn = pendingOrigins[0];
-      startTyping();
-      return;
-    }
+    const i = pendingOrigins.findIndex((o) => sameDelivery(o.sentText, text));
+    // AMBIGUOUS: this turn started while a relay delivery is still pending and its text
+    // ties to none of them. It is either that delivery's turn after an `input` extension
+    // rewrote the text, or something the operator typed/steered ahead of it, and those
+    // are indistinguishable. It must not run ungated, and it must not consume an origin
+    // (the relay turn still owns it — the misattribution this bead is about).
+    //
+    // It must also not be ASKED over that pending channel: review round 2 pointed out
+    // that this hands an unrelated recipient the authorization decision for a tool call
+    // they did not initiate, plus its summary — an authorization boundary, not a UX
+    // preference. Unknown provenance blocks the gated call outright and asks nobody.
+    ambiguousTurn = i === -1 && pendingOrigins.length > 0;
     activeTurn = i === -1 ? undefined : pendingOrigins.splice(i, 1)[0];
     if (activeTurn) startTyping();
   });
@@ -1626,6 +1634,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   pi.on("agent_end", () => {
     stopTyping();
     activeTurn = undefined;
+    ambiguousTurn = false;
   });
 
   // Tool approval: when enabled and the turn came from a channel, pause risky
@@ -1648,6 +1657,20 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // (read/grep/bash) there must also taint the session for later channel
     // turns.
     if (!activeTurn) {
+      // Unknown provenance: a relay delivery was pending when this turn started, and
+      // this call cannot be attributed to the operator's own turn any more than to it.
+      // Block the gated tool and ask nobody — the origin stays queued for the delivery
+      // that owns it, so the relay turn is still gated on its own channel when it runs.
+      if (ambiguousTurn) {
+        return {
+          block: true,
+          reason:
+            `This ${event.toolName} call is blocked because a relay message was pending ` +
+            `when the turn started and its provenance could not be established, so it ` +
+            `cannot be approved for you or on behalf of an unrelated channel. Re-run it ` +
+            `after the relay message has been handled, or reply to that message first.`,
+        };
+      }
       if (LOCAL_INSPECTION_TOOLS.has(event.toolName)) {
         sessionReadLocalFile = true;
       }

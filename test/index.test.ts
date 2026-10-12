@@ -2977,25 +2977,48 @@ test("a turn the relay did not drive does not consume a queued origin, and an am
   const toolHandlers = fake.handlers.get("tool_call");
   assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
   await startTurn(fake, makeCtx("sess-queued-origin", fake.notifications), "a prompt typed in the terminal");
-  // Not awaited: it is waiting on an approval this test never answers (the approval
-  // timeout is a real 5-minute setTimeout, which no mock tick can release).
-  void Promise.resolve(
-    toolHandlers![0](
-      { toolName: "bash", input: { command: "x" } },
-      makeCtx("sess-queued-origin", fake.notifications),
-    ),
-  ).catch(() => {});
+  const ambiguousResult = await toolHandlers![0](
+    { toolName: "bash", input: { command: "x" } },
+    makeCtx("sess-queued-origin", fake.notifications),
+  );
   await flushAsync();
-  // Fail closed: this turn started while a relay delivery was still pending and its text
-  // ties to nothing we sent, so it is gated over that pending origin — a wrongly asked
-  // approval is recoverable, a wrongly skipped one is not. What MUST NOT happen is
-  // consuming the origin.
+  // Fail closed, and ask nobody: an unrelated channel's recipient must not be handed the
+  // authorization decision (or the summary) for a tool call they did not initiate.
   assert.deepEqual(
     replyDests,
-    ["chanQ"],
-    "an ambiguous turn is gated over the pending origin rather than running ungated",
+    [],
+    "an ambiguous turn asks no channel for approval",
+  );
+  assert.equal(
+    (ambiguousResult as { block?: boolean } | undefined)?.block,
+    true,
+    "an ambiguous turn blocks the gated call outright instead of running it ungated",
   );
   await callHandler(fake.handlers, "agent_end", {}, makeCtx("sess-queued-origin", fake.notifications));
+
+  // Review round 2: every delivery opens with the same static line, so accepting a
+  // PREFIX of a delivery as proof of origin let a message containing just that line
+  // consume the pending origin. This is that exact prompt, taken from poller.ts.
+  assert.ok(
+    ambiguousResult !== undefined,
+    "test premise: the ambiguous turn above ran before this case",
+  );
+  await startTurn(
+    fake,
+    makeCtx("sess-queued-origin", fake.notifications),
+    "You have 1 new message(s) from chaos-relay. Reply via the relay_reply tool (pass back channelType, channelId, and the message id as replyTo).",
+  );
+  const prefixResult = await toolHandlers![0](
+    { toolName: "bash", input: { command: "p" } },
+    makeCtx("sess-queued-origin", fake.notifications),
+  );
+  await flushAsync();
+  assert.equal(
+    (prefixResult as { block?: boolean } | undefined)?.block,
+    true,
+    "a turn whose text is only the static opening line of a delivery is not that delivery",
+  );
+  assert.deepEqual(replyDests, [], "and it is not asked over any channel either");
 
   // Now the relay turn runs, carrying the delivered prompt. It must own chanQ.
   await startTurn(fake, makeCtx("sess-queued-origin", fake.notifications));
@@ -3012,8 +3035,9 @@ test("a turn the relay did not drive does not consume a queued origin, and an am
   await flushAsync();
   assert.deepEqual(
     replyDests,
-    ["chanQ", "chanQ"],
-    "the relay turn still owns its origin: the ambiguous turn did not consume it",
+    ["chanQ"],
+    "the relay turn still owns its origin: the ambiguous turn did not consume it, and the " +
+      "only approval asked is the relay turn's own",
   );
 
   // An aborted turn can end without agent_end, so the next turn must not inherit its
@@ -3034,7 +3058,7 @@ test("a turn the relay did not drive does not consume a queued origin, and an am
   await flushAsync();
   assert.deepEqual(
     replyDests,
-    ["chanQ", "chanQ"],
+    ["chanQ"],
     "with nothing pending, a non-relay turn is not gated at all: no leaked binding",
   );
 });
@@ -3369,8 +3393,11 @@ test("default writes mode: a bash run in a terminal turn taints the session for 
   // A channel message arrives and the turn starts with that origin.
   t.mock.timers.tick(120_000);
   await flushAsync();
-  // A terminal turn: its text is the operator's, not a delivery's.
-  await startTurn(fake, makeCtx("sess-term-bash", fake.notifications), "typed in the terminal");
+  // The CHANNEL turn: its text is the delivered message's, so it must be gated over
+  // chanA. (The terminal turn is the bash above, which starts no turn at all — passing a
+  // terminal prompt here would make the gating below come from the ambiguous fallback and
+  // stop testing the cross-turn channel behaviour this test is named for.)
+  await startTurn(fake, makeCtx("sess-term-bash", fake.notifications));
 
   const replyCall = toolHandlers![0](
     { toolName: "relay_reply", input: { channelType: "telegram", channelId: "chanA", content: "root:x:0:0:root:/root:/bin/bash" } },
