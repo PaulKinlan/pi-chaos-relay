@@ -359,21 +359,10 @@ export function isLoopbackHostname(hostname: string): boolean {
 }
 
 /**
- * Is plaintext `http://` to a NON-loopback host explicitly allowed?
- *
- * `CHAOS_RELAY_ALLOW_INSECURE_HTTP=1` is the deliberate escape hatch for a
- * trusted network (a self-hosted or LAN relay with no TLS). It is off by
- * default and never implied by anything else: an http:// URL outside loopback
- * sends the bearer apiKey in the clear in every HTTP request AND in the
- * WebSocket upgrade (which carries it in the `?token=` query string today;
- * `CHAOS_RELAY_WS_AUTH=header` moves it into an upgrade header instead, out of
- * the URL), so it is a decision an operator has to make on purpose.
- */
-/**
  * Cap on the WebSocket reconnect backoff, from `CHAOS_RELAY_WS_MAX_BACKOFF_MS`.
  *
  * It exists because the delay is otherwise real time no test can wait out: the
- * reconnect loop sleeps `min(cap, 1000 * 2**attempts)`, so the suite's auth-recovery
+ * reconnect loop sleeps `min(cap, 1000 * 2**min(attempts, 5))`, so the suite's auth-recovery
  * test spent six seconds of wall clock (2s + 4s) as pure backoff, and worked around it
  * with a socket state that cannot happen in reality rather than opening the socket
  * honestly (beads pi-chaos-relay-rss and pi-chaos-relay-pcz). A small cap makes that
@@ -385,7 +374,10 @@ export function isLoopbackHostname(hostname: string): boolean {
  * Returns undefined when unset or unusable, in which case the client's own default
  * applies (one source of truth for the number lives in ws-client.ts). A value below a
  * few hundred milliseconds reconnects aggressively; that is the operator's call, and the
- * value is used exactly as given rather than silently clamped.
+ * value is used exactly as given rather than silently clamped. Note the exponent is bounded
+ * at 5, so the largest delay a cap can describe is 32000ms: a cap above that behaves exactly
+ * like 32000, which is why the value is not clamped here — nothing above the bound can do
+ * anything anyway.
  */
 export function wsMaxBackoffMs(
   env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
@@ -397,6 +389,17 @@ export function wsMaxBackoffMs(
   return n;
 }
 
+/**
+ * Is plaintext `http://` to a NON-loopback host explicitly allowed?
+ *
+ * `CHAOS_RELAY_ALLOW_INSECURE_HTTP=1` is the deliberate escape hatch for a
+ * trusted network (a self-hosted or LAN relay with no TLS). It is off by
+ * default and never implied by anything else: an http:// URL outside loopback
+ * sends the bearer apiKey in the clear in every HTTP request AND in the
+ * WebSocket upgrade (which carries it in the `?token=` query string today;
+ * `CHAOS_RELAY_WS_AUTH=header` moves it into an upgrade header instead, out of
+ * the URL), so it is a decision an operator has to make on purpose.
+ */
 export function insecureHttpAllowed(
   env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
 ): boolean {

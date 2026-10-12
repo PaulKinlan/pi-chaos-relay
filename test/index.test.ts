@@ -4104,7 +4104,6 @@ test("auth recovery flushes staged message state before replay so the agent rece
   const prevApproval = process.env.CHAOS_RELAY_APPROVAL_MODE;
   delete process.env.CHAOS_RELAY_APPROVAL_MODE;
   const prevMaxBackoff = process.env.CHAOS_RELAY_WS_MAX_BACKOFF_MS;
-  process.env.CHAOS_RELAY_WS_MAX_BACKOFF_MS = "200";
   PushWebSocket.instances = [];
   globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
   // State-writer safety interval (setInterval) must not flush the staged
@@ -4144,6 +4143,10 @@ test("auth recovery flushes staged message state before replay so the agent rece
   const ctx = makeCtx("sess-rss-recovery", fake.notifications);
   (ctx as { model: unknown }).model = { input: ["text", "image"] };
   try {
+    // Set inside the try: the client reads it at construction, and anything thrown before
+    // this point must not leave the variable set for later tests (the restore is in the
+    // finally, which only runs once the try is entered).
+    process.env.CHAOS_RELAY_WS_MAX_BACKOFF_MS = "200";
     chaosRelayExtension(fake.pi as unknown as ExtensionApi);
     await callHandler(fake.handlers, "session_start", { reason: "startup" }, ctx);
     const first = socketForProfile(oldKey);
