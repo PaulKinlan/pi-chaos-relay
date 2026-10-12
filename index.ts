@@ -1629,14 +1629,15 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // a turn that is over.
     else stopTyping();
   });
-  pi.on("agent_start", () => {
-    // Nothing to bind here: the origin was matched in before_agent_start, which
-    // pi emits first for the same turn. The session read taint is intentionally
-    // NOT cleared at turn boundaries either: the LLM conversation context
-    // persists across turns, so a file read in turn 1 can still be text-replied
-    // out in turn 2 and must stay gated until the session ends.
-    startTyping();
-  });
+  // No agent_start handler on purpose (bead pi-chaos-relay-a1j). It used to call
+  // startTyping() there, which sends an IMMEDIATE ping — and agent_start fires
+  // before the turn's user message is seen, so after a run that ended without
+  // agent_end the ping went to the PREVIOUS origin's channel, before this turn's
+  // provenance was established. Typing now begins only in the binding path below,
+  // once the turn is known to be relay-driven. The session read taint is likewise
+  // not cleared at turn boundaries: the conversation context persists across turns,
+  // so a file read in turn 1 can still be text-replied out in turn 2 and must stay
+  // gated until the session ends.
   pi.on("agent_end", () => {
     stopTyping();
     activeTurn = undefined;
