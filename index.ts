@@ -348,12 +348,21 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     channelType: ChannelMessage["channelType"];
     channelId: string;
     from: string;
+    /** The exact prompt text this delivery handed to pi. Turn binding matches on
+     *  it (see the before_agent_start handler): `agent_start` fires for EVERY
+     *  turn, so position in this queue cannot identify which turn is ours. */
+    sentText: string;
   }[] = [];
   /** The CURRENT turn's origin, shifted from the queue at turn start and dropped
    *  at turn end. A gated tool call asks — and is answered by — this. */
   let activeTurn:
     | { channelType: ChannelMessage["channelType"]; channelId: string; from: string }
     | undefined;
+  /** True when this turn started while a relay delivery was pending but its text tied
+   *  to no pending delivery: provenance is unknown, so a gated tool call is blocked
+   *  rather than asked over a channel that did not initiate it (and the pending
+   *  origins are left intact for the deliveries they belong to). */
+  let ambiguousTurn = false;
   /** True once THIS SESSION has inspected local content (read/grep/bash) — from
    *  any turn, channel-driven or terminal/local. Cleared only at session start
    *  and shutdown, never at turn boundaries, so a channel turn cannot text-reply
@@ -1096,6 +1105,43 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   /** Take back the turn origin a delivery pushed, when that delivery did not
    *  happen: the origin queue is FIFO and a later turn would otherwise be
    *  attributed to a message that was never injected. */
+  /**
+   * The text of a user message, the way pi composes it: a content array's text parts
+   * joined with "\n" (core/agent-session.js joins them the same way before the
+   * message is built). Images contribute no text here.
+   */
+  function userMessageText(content: unknown): string {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content
+      .filter(
+        (part): part is { type: string; text: string } =>
+          Boolean(part) && (part as { type?: unknown }).type === "text",
+      )
+      .map((part) => part.text)
+      .join("\n");
+  }
+
+  /**
+   * Whether a turn's text is the delivery this origin recorded.
+   *
+   * The turn must START WITH the whole delivered text: exact when pi hands back what we
+   * sent, and tolerant of a suffix because pi appends image "hints" to the user text
+   * after the composition point.
+   *
+   * Deliberately NOT a prefix in the other direction. Review round 2 caught why: every
+   * delivery begins with the same static line ("You have N new message(s) from
+   * chaos-relay. …"), so accepting a PREFIX of a delivery as proof of origin let a
+   * message containing just that line match and CONSUME a pending origin, after which
+   * the real relay turn ran ungated. A truncated match is not evidence of provenance;
+   * it falls into the ambiguous case below instead, which is gated without consuming.
+   * The length floor keeps a short terminal message from matching a long delivery.
+   */
+  function sameDelivery(sentText: string, turnText: string): boolean {
+    if (sentText.length < 24) return false;
+    return turnText === sentText || turnText.startsWith(sentText);
+  }
+
   function dropOrigin(origin: (typeof pendingOrigins)[number] | undefined): void {
     if (origin) pendingOrigins = pendingOrigins.filter((o) => o !== origin);
   }
@@ -1179,6 +1225,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         channelType: first.channelType,
         channelId: first.channelId,
         from: first.from,
+        // The SAME string pi will report back as the turn's prompt: the SDK joins
+        // the text parts of a content array with "\n" and does not expand prompt
+        // templates, so this is exact for both the string and image cases.
+        sentText: text,
       };
       pendingOrigins.push(origin);
       const distinct = new Set(messages.map((m) => `${m.channelId}\u0000${m.from}`));
@@ -1441,6 +1491,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // concurrent turn cannot shift a stale origin into a fresh session.
     pendingOrigins = [];
     activeTurn = undefined;
+    ambiguousTurn = false;
     sessionReadLocalFile = false;
     if (poller) poller.reset();
     if (attachmentCleanupTimer) clearInterval(attachmentCleanupTimer);
@@ -1522,6 +1573,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // next session starts clean.
     pendingOrigins = [];
     activeTurn = undefined;
+    ambiguousTurn = false;
     sessionReadLocalFile = false;
     if (attachmentCleanupTimer) {
       clearInterval(attachmentCleanupTimer);
@@ -1536,18 +1588,59 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
   // Show a "typing" indicator in the active channel while the agent works on a
   // relay-delivered message, and clear it when the run finishes.
+  pi.on("message_start", (event) => {
+    // Bind THIS turn's origin by matching the USER MESSAGE pi reports against the
+    // text each delivery sent, NOT by position in the queue.
+    //
+    // Why message_start and not the hooks that look more obvious:
+    // - `agent_start` fires for EVERY turn, terminal/local ones included, so the old
+    //   `pendingOrigins.shift()` there let a terminal turn consume the origin of a
+    //   relay message still queued behind it: that turn was gated over a channel and
+    //   the relay turn after it ran ungated (bead pi-chaos-relay-pl2).
+    // - `before_agent_start` carries the prompt text and is exact, but the SDK emits
+    //   it from exactly ONE place — the idle `prompt()` path
+    //   (agent-session.js `emitBeforeAgentStart`). A message delivered while the agent
+    //   is streaming goes through `_queueFollowUp` -> `agent.followUp(...)` instead,
+    //   which never reaches it. Since this extension always delivers with
+    //   `deliverAs: "followUp"`, that is the COMMON case: binding there left the
+    //   queued relay turn ungated. `message_start` is an agent event, so it fires for
+    //   both paths, and its user message carries the text the turn actually runs.
+    const msg = event.message as { role?: string; content?: unknown } | undefined;
+    if (!msg || msg.role !== "user") return;
+    const text = userMessageText(msg.content);
+    const i = pendingOrigins.findIndex((o) => sameDelivery(o.sentText, text));
+    // AMBIGUOUS: this turn started while a relay delivery is still pending and its text
+    // ties to none of them. It is either that delivery's turn after an `input` extension
+    // rewrote the text, or something the operator typed/steered ahead of it, and those
+    // are indistinguishable. It must not run ungated, and it must not consume an origin
+    // (the relay turn still owns it — the misattribution this bead is about).
+    //
+    // It must also not be ASKED over that pending channel: review round 2 pointed out
+    // that this hands an unrelated recipient the authorization decision for a tool call
+    // they did not initiate, plus its summary — an authorization boundary, not a UX
+    // preference. Unknown provenance blocks the gated call outright and asks nobody.
+    ambiguousTurn = i === -1 && pendingOrigins.length > 0;
+    activeTurn = i === -1 ? undefined : pendingOrigins.splice(i, 1)[0];
+    if (activeTurn) startTyping();
+    // Review round 3, P2: pi emits agent_start BEFORE message_start, so a run that
+    // ended without agent_end has already restarted typing for its previous origin by
+    // the time this user message is seen. Clearing the binding must therefore stop that
+    // timer too, or the extension keeps pinging the old channel every four seconds for
+    // a turn that is over.
+    else stopTyping();
+  });
   pi.on("agent_start", () => {
-    // Shift this turn's origin off the queue (a terminal/local turn has none).
-    // The session read taint is intentionally NOT cleared here: the LLM
-    // conversation context persists across turns, so a file read in turn 1 can
-    // still be text-replied out in turn 2 and must stay gated until the session
-    // ends.
-    activeTurn = pendingOrigins.shift() ?? undefined;
+    // Nothing to bind here: the origin was matched in before_agent_start, which
+    // pi emits first for the same turn. The session read taint is intentionally
+    // NOT cleared at turn boundaries either: the LLM conversation context
+    // persists across turns, so a file read in turn 1 can still be text-replied
+    // out in turn 2 and must stay gated until the session ends.
     startTyping();
   });
   pi.on("agent_end", () => {
     stopTyping();
     activeTurn = undefined;
+    ambiguousTurn = false;
   });
 
   // Tool approval: when enabled and the turn came from a channel, pause risky
@@ -1570,6 +1663,20 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // (read/grep/bash) there must also taint the session for later channel
     // turns.
     if (!activeTurn) {
+      // Unknown provenance: a relay delivery was pending when this turn started, and
+      // this call cannot be attributed to the operator's own turn any more than to it.
+      // Block the gated tool and ask nobody — the origin stays queued for the delivery
+      // that owns it, so the relay turn is still gated on its own channel when it runs.
+      if (ambiguousTurn) {
+        return {
+          block: true,
+          reason:
+            `This ${event.toolName} call is blocked because a relay message was pending ` +
+            `when the turn started and its provenance could not be established, so it ` +
+            `cannot be approved for you or on behalf of an unrelated channel. Re-run it ` +
+            `after the relay message has been handled, or reply to that message first.`,
+        };
+      }
       if (LOCAL_INSPECTION_TOOLS.has(event.toolName)) {
         sessionReadLocalFile = true;
       }
