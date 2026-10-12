@@ -120,7 +120,8 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
   that delivery sent, and the turn it starts adopts it, so a gated tool call asks over
   the channel that message came from. Binding happens in `message_start` for the user
   message and matches that text — NOT by shifting the queue in `agent_start`, which
-  fires for every turn including terminal ones, so a positional bind let a terminal
+  fires per agent run, including locally initiated runs, but not once per queued
+  follow-up turn, so a positional bind let a terminal
   turn consume the origin of a relay message still queued behind it (bead
   pi-chaos-relay-pl2). `message_start` specifically, because it is an agent event and
   so fires on both delivery paths, while `before_agent_start` — the obvious hook, since
@@ -142,8 +143,8 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
   arrives — that misattribution is what this bead fixes. With nothing pending, a
   non-relay turn is not gated at all, and clears any binding left by a turn that ended
   without `agent_end`.
-  `test/index.test.ts` drives turns through a `startTurn` helper (user `message_start`
-  then `agent_start`), because a test that fires only `agent_start` no longer exercises
+  `test/index.test.ts` drives turns through a `startTurn` helper (`agent_start` then the
+  turn's user `message_start`), because a test that fires only `agent_start` no longer exercises
   binding, and `agent_start` alone cannot model the queued path at all.
 - `relay-client.ts` — signed HTTP client for the relay (ECDSA P-256 identity).
 - `ws-client.ts` — WebSocket transport (push delivery + reconnect/backoff). The

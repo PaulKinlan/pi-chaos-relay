@@ -350,8 +350,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     channelId: string;
     from: string;
     /** The exact prompt text this delivery handed to pi. Turn binding matches on
-     *  it (see the before_agent_start handler): `agent_start` fires for EVERY
-     *  turn, so position in this queue cannot identify which turn is ours. */
+     *  it in the `message_start` handler. `agent_start` is no help for this: it fires
+     *  once per agent RUN (including locally initiated runs), not for each queued
+     *  follow-up turn, and has no handler at all since bead pi-chaos-relay-a1j — so
+     *  queue position cannot establish which turn is ours. */
     sentText: string;
   }[] = [];
   /** The CURRENT turn's origin, shifted from the queue at turn start and dropped
@@ -1597,8 +1599,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // text each delivery sent, NOT by position in the queue.
     //
     // Why message_start and not the hooks that look more obvious:
-    // - `agent_start` fires for EVERY turn, terminal/local ones included, so the old
-    //   `pendingOrigins.shift()` there let a terminal turn consume the origin of a
+    // - `agent_start` fires per agent run, terminal/local ones included, and not once
+    //   per queued follow-up turn, so the old `pendingOrigins.shift()` there let a
+    //   terminal turn consume the origin of a
     //   relay message still queued behind it: that turn was gated over a channel and
     //   the relay turn after it ran ungated (bead pi-chaos-relay-pl2).
     // - `before_agent_start` carries the prompt text and is exact, but the SDK emits
@@ -1626,18 +1629,19 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     ambiguousTurn = i === -1 && pendingOrigins.length > 0;
     activeTurn = i === -1 ? undefined : pendingOrigins.splice(i, 1)[0];
     if (activeTurn) startTyping();
-    // Review round 3, P2: pi emits agent_start BEFORE message_start, so a run that
-    // ended without agent_end has already restarted typing for its previous origin by
-    // the time this user message is seen. Clearing the binding must therefore stop that
-    // timer too, or the extension keeps pinging the old channel every four seconds for
-    // a turn that is over.
+    // Review round 3, P2, reworded for bead pi-chaos-relay-a1j: a run that ends without
+    // agent_end leaves the refresh timer that its previous message_start started still
+    // running (a1j removed the agent_start handler that used to restart typing, so the
+    // timer is now the only thing left to stop here). Clearing the binding must stop it, or
+    // the extension keeps pinging the old channel every four seconds for a turn that is
+    // over.
     else stopTyping();
   });
   // No agent_start handler on purpose (bead pi-chaos-relay-a1j). It used to call
   // startTyping() there, which sends an IMMEDIATE ping — and agent_start fires
   // before the turn's user message is seen, so after a run that ended without
   // agent_end the ping went to the PREVIOUS origin's channel, before this turn's
-  // provenance was established. Typing now begins only in the binding path below,
+  // provenance was established. Typing now begins only in the binding path above,
   // once the turn is known to be relay-driven. The session read taint is likewise
   // not cleared at turn boundaries: the conversation context persists across turns,
   // so a file read in turn 1 can still be text-replied out in turn 2 and must stay

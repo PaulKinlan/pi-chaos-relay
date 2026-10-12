@@ -103,8 +103,10 @@ function makeFakePi() {
   const tools: Array<Record<string, unknown>> = [];
   const notifications: Notification[] = [];
   /**
-   * Each delivered message, as { content, prompt }: `prompt` is the text pi reports
-   * back through before_agent_start for the turn that message starts. The SDK joins
+   * Each delivered message, as { content, prompt }: `prompt` is the text the delivery
+   * handed to pi, which the extension later sees as that turn's user message in
+   * `message_start` — not via `before_agent_start`, which queued follow-ups never reach.
+   * The SDK joins
    * a content array's text parts with "\n" and does not expand prompt templates
    * (dist/core/agent-session.js sendUserMessage), so this mirrors what the
    * extension matches on.
@@ -172,9 +174,13 @@ async function fireLifecycle(
 }
 
 /**
- * Drive one turn the way pi does: `before_agent_start` (carrying the prompt) and
- * then `agent_start`. Bead pi-chaos-relay-pl2: turn binding matches the prompt, so
- * a test that fired only `agent_start` would not be testing the real order.
+ * Simulate a fresh agent run: `agent_start`, then the turn's user `message_start`.
+ * Queued follow-ups within an existing run emit no new `agent_start`, so this models the
+ * start of a run rather than every turn in one.
+ * Bead pi-chaos-relay-pl2: turn binding matches the prompt carried by that user message
+ * rather than by `before_agent_start`, which the SDK emits only from its idle prompt path
+ * (see the note below), so a test that fired only `agent_start` would not be testing the
+ * real order.
  *
  * `prompt` defaults to the text of the most recent delivery — the turn that
  * delivery started. Pass a different string to simulate a turn the relay did not
@@ -193,8 +199,9 @@ async function startTurn(
   // it. Firing it here would model a lifecycle this extension must not depend on.
   // SDK order: agent_start, then the turn's user message (the exported event
   // declarations in types.d.ts carry the ordering contract; review round 3 corrected my
-  // earlier reversal. It matters here: agent_start restarts typing from whatever origin
-  // the PREVIOUS run left bound, so the user message is what clears it.)
+  // earlier reversal. It matters here for typing: agent_start has no handler since bead
+  // pi-chaos-relay-a1j, so it neither starts nor clears the indicator — the timer left
+  // running by the PREVIOUS run is what the user message clears.)
   await fireLifecycle(fake, "agent_start", {}, ctx);
   await callHandler(
     fake.handlers,
@@ -3034,8 +3041,9 @@ test("typing starts only for a bound turn, and stops when the binding is cleared
 });
 
 test("a turn the relay did not drive does not consume a queued origin, and an ambiguous one is gated conservatively", async (t) => {
-  // bead pi-chaos-relay-pl2: `agent_start` fires for EVERY turn, so binding the
-  // origin by shifting the queue there let a terminal/local turn take the origin of
+  // bead pi-chaos-relay-pl2: `agent_start` fires per agent run (not once per queued
+  // follow-up turn), so binding the origin by shifting the queue there let a terminal/local
+  // turn take the origin of
   // a relay message that was still queued behind it. The turn after that then ran
   // ungated (or gated over the wrong channel). Binding matches the turn's prompt
   // instead, so a turn the relay did not drive consumes nothing.
@@ -3189,8 +3197,8 @@ test("a turn the relay did not drive does not consume a queued origin, and an am
   );
 
   // An aborted turn can end without agent_end, so the next turn must not inherit its
-  // binding: before_agent_start clears it whenever the prompt matches no pending
-  // delivery. Without that, a later terminal turn would be gated over the dead turn's
+  // binding: the user message in `message_start` clears it whenever its text matches no
+  // pending delivery. Without that, a later terminal turn would be gated over the dead turn's
   // channel — the same misattribution this bead is about, one turn later.
   await startTurn(
     fake,
