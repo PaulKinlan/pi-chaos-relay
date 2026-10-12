@@ -172,13 +172,17 @@ async function startTurn(
   // `message_start`, because `before_agent_start` is emitted only from the SDK's idle
   // `prompt()` path and a message delivered while the agent is streaming never reaches
   // it. Firing it here would model a lifecycle this extension must not depend on.
+  // SDK order: agent_start, then the turn's user message (the exported event
+  // declarations in types.d.ts carry the ordering contract; review round 3 corrected my
+  // earlier reversal. It matters here: agent_start restarts typing from whatever origin
+  // the PREVIOUS run left bound, so the user message is what clears it.)
+  await callHandler(fake.handlers, "agent_start", {}, ctx);
   await callHandler(
     fake.handlers,
     "message_start",
     { type: "message_start", message: { role: "user", content: [{ type: "text", text }] } },
     ctx,
   );
-  await callHandler(fake.handlers, "agent_start", {}, ctx);
 }
 
 /** Run every handler registered for a lifecycle event, like pi would. */
@@ -2896,6 +2900,91 @@ test("a batch mixing senders is attributed to the earliest message's origin", as
   );
 });
 
+test("an unattributable turn stops the typing a previous run left running", async (t) => {
+  // Review round 3, P2. The SDK emits agent_start BEFORE message_start, so a run that
+  // never reached agent_end (aborted) has a live 4s typing refresh pointed at its
+  // channel when the next user message arrives. If clearing the binding does not stop
+  // that timer, the extension keeps pinging a channel for a turn that is over.
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak", approvalMode: "all" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+  let typingPings = 0;
+  globalThis.fetch = (async (url: unknown) => {
+    const u = String(url);
+    if (u.includes("/typing")) {
+      typingPings++;
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (u.includes("/messages")) {
+      return new Response(
+        JSON.stringify({
+          messages: [
+            {
+              id: "typing1",
+              channelType: "telegram",
+              channelId: "chanT",
+              from: "alice",
+              content: "a relay message whose turn will be abandoned",
+              timestamp: "2026-01-01T00:00:01Z",
+            },
+          ],
+          since: "2026-01-01T00:00:01Z",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(JSON.stringify({}), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+  const flushAsync = async () => {
+    await new Promise((r) => setTimeout(r, 60));
+  };
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(fake.handlers, "session_start", { reason: "startup" }, makeCtx("sess-typing", fake.notifications));
+  t.after(() =>
+    callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-typing", fake.notifications)),
+  );
+
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+  // The relay turn starts and binds chanT: typing begins, and no tool call pauses it.
+  await startTurn(fake, makeCtx("sess-typing", fake.notifications));
+  await flushAsync();
+  const bound = typingPings;
+  assert.ok(bound > 0, `typing started for the bound relay turn (${bound} pings)`);
+
+  // That run is abandoned (no agent_end). A later unattributable message clears the
+  // binding — and must take the typing timer with it.
+  await startTurn(fake, makeCtx("sess-typing", fake.notifications), "typed after an abandoned run");
+  await flushAsync();
+  const afterClear = typingPings;
+  t.mock.timers.tick(20_000); // five typing refreshes, if the timer were still alive
+  await flushAsync();
+  assert.equal(
+    typingPings,
+    afterClear,
+    `no typing ping after an unattributable turn cleared the binding (was ${afterClear})`,
+  );
+  t.mock.timers.reset();
+});
+
 test("a turn the relay did not drive does not consume a queued origin, and an ambiguous one is gated conservatively", async (t) => {
   // bead pi-chaos-relay-pl2: `agent_start` fires for EVERY turn, so binding the
   // origin by shifting the queue there let a terminal/local turn take the origin of
@@ -2918,8 +3007,16 @@ test("a turn the relay did not drive does not consume a queued origin, and an am
   });
 
   const replyDests: string[] = [];
+  let typingPings = 0;
   globalThis.fetch = (async (url: unknown, init?: unknown) => {
     const u = String(url);
+    if (u.includes("/typing")) {
+      typingPings++;
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
     if (u.includes("/messages")) {
       return new Response(
         JSON.stringify({
@@ -2994,6 +3091,9 @@ test("a turn the relay did not drive does not consume a queued origin, and an am
     true,
     "an ambiguous turn blocks the gated call outright instead of running it ungated",
   );
+  // (The typing half of review round 3's P2 is pinned by its own test below: asserting it
+  // here would not bite, because the gated call above already paused typing — so no timer
+  // would be running to leak, and the assertion would pass with or without the fix.)
   await callHandler(fake.handlers, "agent_end", {}, makeCtx("sess-queued-origin", fake.notifications));
 
   // Review round 2: every delivery opens with the same static line, so accepting a

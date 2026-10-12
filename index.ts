@@ -1622,6 +1622,12 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     ambiguousTurn = i === -1 && pendingOrigins.length > 0;
     activeTurn = i === -1 ? undefined : pendingOrigins.splice(i, 1)[0];
     if (activeTurn) startTyping();
+    // Review round 3, P2: pi emits agent_start BEFORE message_start, so a run that
+    // ended without agent_end has already restarted typing for its previous origin by
+    // the time this user message is seen. Clearing the binding must therefore stop that
+    // timer too, or the extension keeps pinging the old channel every four seconds for
+    // a turn that is over.
+    else stopTyping();
   });
   pi.on("agent_start", () => {
     // Nothing to bind here: the origin was matched in before_agent_start, which
