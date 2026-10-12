@@ -580,7 +580,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // what keeps a reconnect's catch-up from re-delivering messages the agent
     // already saw.
     releaseStateWriter(true);
-    stateWriter = makeStateWriter(messageStatePath());
+    const writer = makeStateWriter(messageStatePath());
+    stateWriter = writer;
     const state = loadMessageState();
     return new MessagePoller(c, {
       since: state.cursor,
@@ -599,11 +600,14 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       // writer flush it on its interval, at the next drain edge, or urgently for a
       // hand-back. See state-writer.ts for why those are not the same case.
       onPersist: (state, urgent) => {
-        // Always present: makePoller created it (pinned to this profile) and
-        // nothing but makePoller assigns it.
-        if (!stateWriter) return;
-        if (urgent) stateWriter.stageUrgent(state);
-        else stateWriter.stage(state);
+        // THIS poller's writer, captured at creation rather than read from the
+        // shared variable: a poller that is still mid-call when the profile
+        // switches (a relay_check_messages poll waiting on the network, say)
+        // would otherwise stage its own profile's state into the replacement's
+        // writer, which is pinned to the new profile's side-car. A released
+        // writer refuses the write, which is what we want here.
+        if (urgent) writer.stageUrgent(state);
+        else writer.stage(state);
       },
       // Restore the persisted de-dup log so restarts don't re-process the
       // relay's on-connect message replay.

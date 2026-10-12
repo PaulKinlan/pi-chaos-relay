@@ -3680,7 +3680,8 @@ test("a profile switch does not carry deferred state into the other profile's si
     // Now let the held delivery finish. Its drain-edge flush runs after the active
     // path has moved, so it is the write that would land in the wrong file.
     openDownloads?.();
-    await waitFor(() => fake.notifications.length > 0 || true);
+    // Let the released delivery run to completion so its drain-edge flush executes
+    // with the active path already moved.
     await new Promise((resolve) => setTimeout(resolve, 150));
     assert.equal(
       existsSync(betaState),
