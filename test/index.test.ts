@@ -49,6 +49,12 @@ process.env.HOME = HOME_DIR;
 delete process.env.CHAOS_RELAY_CONFIG;
 delete process.env.CHAOS_RELAY_PROFILE;
 delete process.env.CHAOS_RELAY_API_KEY;
+// Also clear the approval mode: this machine's shell environment (the fleet's
+// ~/.fleet/env) exports CHAOS_RELAY_APPROVAL_MODE=off, and resolveConfig gives the
+// environment precedence over the profile file, so every approval/attribution test
+// in this file silently ran with approvals disabled and failed (bead
+// pi-chaos-relay-wbj). A test suite must not depend on the operator's environment.
+delete process.env.CHAOS_RELAY_APPROVAL_MODE;
 // env beats the persisted file in resolveConfig, so this pins the relay URL for
 // every connect attempt in this file (including doctor's reachability check).
 process.env.CHAOS_RELAY_URL = OFFLINE_RELAY_URL;
