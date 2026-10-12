@@ -1100,6 +1100,39 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   /** Take back the turn origin a delivery pushed, when that delivery did not
    *  happen: the origin queue is FIFO and a later turn would otherwise be
    *  attributed to a message that was never injected. */
+  /**
+   * The text of a user message, the way pi composes it: a content array's text parts
+   * joined with "\n" (core/agent-session.js joins them the same way before the
+   * message is built). Images contribute no text here.
+   */
+  function userMessageText(content: unknown): string {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content
+      .filter(
+        (part): part is { type: string; text: string } =>
+          Boolean(part) && (part as { type?: unknown }).type === "text",
+      )
+      .map((part) => part.text)
+      .join("\n");
+  }
+
+  /**
+   * Whether a turn's text is the delivery this origin recorded.
+   *
+   * Exact when pi hands back what we sent. Tolerant when it appends: pi adds image
+   * "hints" to the user text after the prompt hook, so a message that carries images
+   * arrives as our text plus a suffix. A prefix relation in either direction, with the
+   * shorter side long enough to be distinctive, covers that without letting a short
+   * terminal "hi" match a long delivery.
+   */
+  function sameDelivery(sentText: string, turnText: string): boolean {
+    if (sentText === turnText) return true;
+    const shorter = sentText.length <= turnText.length ? sentText : turnText;
+    if (shorter.length < 24) return false;
+    return sentText.startsWith(turnText) || turnText.startsWith(sentText);
+  }
+
   function dropOrigin(origin: (typeof pendingOrigins)[number] | undefined): void {
     if (origin) pendingOrigins = pendingOrigins.filter((o) => o !== origin);
   }
@@ -1544,23 +1577,43 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
   // Show a "typing" indicator in the active channel while the agent works on a
   // relay-delivered message, and clear it when the run finishes.
-  pi.on("before_agent_start", (event) => {
-    // Bind THIS turn's origin by matching the prompt pi reports against the text
-    // each delivery sent, NOT by position in the queue.
+  pi.on("message_start", (event) => {
+    // Bind THIS turn's origin by matching the USER MESSAGE pi reports against the
+    // text each delivery sent, NOT by position in the queue.
     //
-    // `agent_start` fires for every turn, terminal/local ones included, so the
-    // old `pendingOrigins.shift()` there let a terminal turn consume the origin
-    // of a relay message that was still queued behind it — the relay turn then
-    // ran with no origin (or, worse, with another channel's), so its tool calls
-    // were gated over the wrong channel (bead pi-chaos-relay-pl2). pi emits
-    // before_agent_start per turn with the expanded prompt, and the SDK passes a
-    // content array's text parts joined with "\n" without template expansion,
-    // so this comparison is exact.
-    //
-    // No match means this turn was NOT driven by a relay delivery: it must not
-    // consume one, and it clears any binding a previous turn left behind.
-    const i = pendingOrigins.findIndex((o) => o.sentText === event.prompt);
+    // Why message_start and not the hooks that look more obvious:
+    // - `agent_start` fires for EVERY turn, terminal/local ones included, so the old
+    //   `pendingOrigins.shift()` there let a terminal turn consume the origin of a
+    //   relay message still queued behind it: that turn was gated over a channel and
+    //   the relay turn after it ran ungated (bead pi-chaos-relay-pl2).
+    // - `before_agent_start` carries the prompt text and is exact, but the SDK emits
+    //   it from exactly ONE place — the idle `prompt()` path
+    //   (agent-session.js `emitBeforeAgentStart`). A message delivered while the agent
+    //   is streaming goes through `_queueFollowUp` -> `agent.followUp(...)` instead,
+    //   which never reaches it. Since this extension always delivers with
+    //   `deliverAs: "followUp"`, that is the COMMON case: binding there left the
+    //   queued relay turn ungated. `message_start` is an agent event, so it fires for
+    //   both paths, and its user message carries the text the turn actually runs.
+    const msg = event.message as { role?: string; content?: unknown } | undefined;
+    if (!msg || msg.role !== "user") return;
+    const text = userMessageText(msg.content);
+    let i = pendingOrigins.findIndex((o) => sameDelivery(o.sentText, text));
+    if (i === -1 && pendingOrigins.length > 0) {
+      // AMBIGUOUS, and this is deliberate: a turn started while a relay delivery is
+      // still pending, whose text we cannot tie to it. It is either that delivery's
+      // turn after an `input` extension transformed the text, or something the
+      // operator typed/steered ahead of it — and we cannot tell which. Gate it over
+      // the pending origin rather than let a possibly-channel-driven turn run
+      // ungated (fail closed: the 04d policy is default-deny, and a wrongly asked
+      // approval is recoverable while a wrongly skipped one is not). The origin is
+      // NOT consumed, so the relay turn still owns it when it arrives — which is the
+      // misattribution this bead is about, one turn earlier.
+      activeTurn = pendingOrigins[0];
+      startTyping();
+      return;
+    }
     activeTurn = i === -1 ? undefined : pendingOrigins.splice(i, 1)[0];
+    if (activeTurn) startTyping();
   });
   pi.on("agent_start", () => {
     // Nothing to bind here: the origin was matched in before_agent_start, which

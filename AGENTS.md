@@ -116,17 +116,29 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
 - `index.ts` — pi extension entry: registers tools (`relay_reply`,
   `relay_register_telegram`, `relay_register_email`, …) and the `/chaos-relay`
   command (`setup`/`status`/`poll`/`stop`); owns the poller + WebSocket.
-  A delivered relay message queues its ORIGIN (channel/sender) and the turn it
-  starts adopts it, so a gated tool call asks over the channel that message came
-  from. The adoption happens in `before_agent_start`, matching the prompt pi reports
-  against the exact text that delivery sent (`sentText`), NOT by shifting the queue in
-  `agent_start`: `agent_start` fires for every turn, terminal/local ones included, so a
-  positional bind let a terminal turn consume the origin of a relay message still
-  queued behind it (bead pi-chaos-relay-pl2). A turn whose prompt matches no pending
-  delivery is not a relay turn: it consumes nothing and clears any binding left by a
-  turn that ended without `agent_end`. `test/index.test.ts` drives turns through a
-  `startTurn` helper that fires `before_agent_start` then `agent_start`, in that order,
-  because pi does — a test that fires only `agent_start` no longer exercises binding.
+  A delivered relay message queues its ORIGIN (channel/sender) plus the exact text
+  that delivery sent, and the turn it starts adopts it, so a gated tool call asks over
+  the channel that message came from. Binding happens in `message_start` for the user
+  message and matches that text — NOT by shifting the queue in `agent_start`, which
+  fires for every turn including terminal ones, so a positional bind let a terminal
+  turn consume the origin of a relay message still queued behind it (bead
+  pi-chaos-relay-pl2). `message_start` specifically, because it is an agent event and
+  so fires on both delivery paths, while `before_agent_start` — the obvious hook, since
+  it carries the prompt — is emitted only from the SDK's idle `prompt()` path; a
+  message delivered while the agent is streaming goes through `_queueFollowUp` and
+  never reaches it, and this extension always delivers as a follow-up.
+  Matching tolerates pi appending image hints to the user text (prefix relation, with a
+  floor length so a short terminal message cannot match a long delivery).
+  A turn whose text ties to no pending delivery is either something the operator typed
+  or steered, or a delivery whose text an `input` extension transformed — and those are
+  indistinguishable, so it is gated over the OLDEST pending origin WITHOUT consuming it
+  (fail closed: 04d's default-deny, because a wrongly asked approval is recoverable and
+  a wrongly skipped one is not). Not consuming is the point: the relay turn still owns
+  its origin when it arrives. With nothing pending, a non-relay turn is not gated at
+  all, and clears any binding left by a turn that ended without `agent_end`.
+  `test/index.test.ts` drives turns through a `startTurn` helper (user `message_start`
+  then `agent_start`), because a test that fires only `agent_start` no longer exercises
+  binding, and `agent_start` alone cannot model the queued path at all.
 - `relay-client.ts` — signed HTTP client for the relay (ECDSA P-256 identity).
 - `ws-client.ts` — WebSocket transport (push delivery + reconnect/backoff). The
   upgrade authenticates via `wsConnectTarget` — `Authorization: Bearer <apiKey>` in
