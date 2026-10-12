@@ -69,6 +69,7 @@ import {
   resolveServerKeyPin,
   type ResolvedConfig,
   type RegisteredChannelRecord,
+  wsMaxBackoffMs,
 } from "./config.ts";
 import { MessagePoller, formatMessagesForAgent } from "./poller.ts";
 import { frameIssueLimiter } from "./inbound-message.ts";
@@ -1458,6 +1459,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     ws = new RelayWebSocket({
       relayUrl: cfg.relayUrl,
       apiKey: cfg.apiKey!,
+      // Undefined keeps the client default; see wsMaxBackoffMs for why this is
+      // configurable at all (a test-visible timing seam that is also a real knob).
+      maxBackoffMs: wsMaxBackoffMs(),
       log: (m) => log(m),
       onMessage: (messages) => {
         if (!poller) return;
