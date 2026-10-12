@@ -261,6 +261,14 @@ class PushWebSocket {
   headers: Record<string, string>;
   send(): void {}
   close(): void {}
+  drop(code = 1006): void {
+    this.readyState = 3;
+    this.onclose?.({ code });
+  }
+  open(): void {
+    this.readyState = 1;
+    this.onopen?.({});
+  }
   pushFrame(data: string): void {
     this.onmessage?.({ data } as unknown as MessageEvent);
   }
@@ -4023,6 +4031,107 @@ test("a profile switch does not carry deferred state into the other profile's si
     }
     globalThis.WebSocket = origWs;
     globalThis.fetch = origFetch;
+  }
+});
+
+test("auth recovery flushes staged message state before replay so the agent receives it once", async (t) => {
+  resetState();
+  const keyPair = await generateKeyPair();
+  const oldKey = "ak_rss_old";
+  const newKey = "ak_rss_recovered";
+  const message = {
+    id: "m-rss-replay",
+    channelType: "telegram",
+    channelId: "chan-rss",
+    from: "alice",
+    content: "recover this once",
+    timestamp: "2026-10-12T00:30:00.000Z",
+    attachments: [
+      { id: "att-rss", filename: "photo.png", mimeType: "image/png", size: 8, kind: "image" },
+    ],
+  };
+  writeFileSync(join(PI_DIR, "chaos-relay.json"), JSON.stringify({
+    relayUrl: OFFLINE_RELAY_URL,
+    apiKey: oldKey,
+    userId: "rss-user",
+    keyPair,
+    approvalMode: "all",
+  }) + "\n");
+  const statePath = config.messageStatePath();
+  rmSync(statePath, { force: true });
+  const origWs = globalThis.WebSocket;
+  const origFetch = globalThis.fetch;
+  const prevApproval = process.env.CHAOS_RELAY_APPROVAL_MODE;
+  delete process.env.CHAOS_RELAY_APPROVAL_MODE;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+  // Reconnect uses real timeouts (2s), but the 2s state-writer safety interval
+  // must not flush the staged state before recovery gets a chance to replace it.
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let openDownloads: (() => void) | undefined;
+  let downloadStarted = false;
+  let catchUpCount = 0;
+  const downloadsGate = new Promise<void>((resolve) => { openDownloads = resolve; });
+  globalThis.fetch = (async (input: unknown) => {
+    const href = String(input);
+    if (href.endsWith("/auth/register")) {
+      return Response.json({ userId: "rss-user", apiKey: newKey });
+    }
+    if (href.includes("/attachments/")) {
+      downloadStarted = true;
+      await downloadsGate;
+      return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), {
+        status: 200, headers: { "content-type": "image/png" },
+      });
+    }
+    if (href.includes("/messages")) {
+      catchUpCount++;
+      return Response.json({ messages: [message], since: message.timestamp });
+    }
+    throw new Error(`unexpected fetch: ${href}`);
+  }) as unknown as typeof fetch;
+  const fake = makeFakePi();
+  const sent: string[] = [];
+  fake.pi.sendUserMessage = (content: unknown) => {
+    sent.push(typeof content === "string" ? content : JSON.stringify(content));
+  };
+  const ctx = makeCtx("sess-rss-recovery", fake.notifications);
+  (ctx as { model: unknown }).model = { input: ["text", "image"] };
+  try {
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, ctx);
+    const first = socketForProfile(oldKey);
+    first.pushFrame(JSON.stringify({ type: "message", message }));
+    await waitFor(() => downloadStarted);
+    const stagedDisk = existsSync(statePath) ? readFileSync(statePath, "utf-8") : "";
+    assert.ok(!stagedDisk.includes(message.id), `accepted state is still staged, not persisted: ${stagedDisk}`);
+    assert.equal(sent.length, 0, "the original delivery is held in attachment hydration");
+
+    first.drop();
+    await waitFor(() => PushWebSocket.instances.some((socket) => socket !== first && socketCarries(socket, oldKey)));
+    const second = PushWebSocket.instances.find((socket) => socket !== first && socketCarries(socket, oldKey))!;
+    second.drop();
+    await waitFor(() => PushWebSocket.instances.some((socket) => socketCarries(socket, newKey)));
+    const recovered = socketForProfile(newKey);
+    recovered.open(); // on-connect catch-up replays the same relay message.
+    await waitFor(() => catchUpCount === 1);
+    // Let the catch-up callback finish before releasing hydration, so any
+    // duplicate it accepted must queue behind the original held delivery.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    openDownloads?.();
+    await waitFor(() => sent.length >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const deliveryCount = sent.filter((delivery) => delivery.includes(message.id)).length;
+    assert.equal(deliveryCount, 1, `replayed ${message.id} must reach the agent exactly once (got ${deliveryCount})`);
+  } finally {
+    openDownloads?.();
+    await callHandler(fake.handlers, "session_shutdown", {}, ctx).catch(() => {});
+    rmSync(statePath, { force: true });
+    t.mock.timers.reset();
+    globalThis.WebSocket = origWs;
+    globalThis.fetch = origFetch;
+    if (prevApproval === undefined) delete process.env.CHAOS_RELAY_APPROVAL_MODE;
+    else process.env.CHAOS_RELAY_APPROVAL_MODE = prevApproval;
   }
 });
 
