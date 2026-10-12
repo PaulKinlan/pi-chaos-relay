@@ -139,6 +139,29 @@ test("persisted seen log: a restart does NOT re-process replayed messages", () =
   assert.deepEqual(replayed.map((m) => m.id), ["c"]); // only the genuinely-new one
 });
 
+test("requeue reports the hand-back as URGENT, because the replacement reads it from disk", () => {
+  // The writer debounces routine updates; a hand-back is the one update that
+  // cannot wait, since the replacement session loads the persisted cursor and
+  // de-dup log (bead pi-chaos-relay-d8e). Without the flag the writer would
+  // coalesce it and the replacement could read the pre-hand-back state.
+  const calls: Array<{ state: PollerPersistState; urgent: boolean | undefined }> = [];
+  const poller = new MessagePoller({} as never, {
+    onPersist: (state, urgent) => calls.push({ state, urgent }),
+  });
+  const batch = poller.accept([{ ...msg("u1"), timestamp: "2026-01-01T00:00:05Z" }]);
+  assert.equal(batch.length, 1);
+  assert.deepEqual(calls.map((c) => c.urgent), [undefined], "accept is a routine, deferrable update");
+
+  const back = poller.requeue(batch);
+  assert.equal(back.length, 1, "the batch came back");
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].urgent, true, "the hand-back is urgent");
+  assert.ok(
+    !calls[1].state.seen.includes("u1"),
+    "and it carries the un-seen id that the replacement needs",
+  );
+});
+
 test("accept persists cursor + seen log via ONE onPersist per batch", () => {
   const persists: PollerPersistState[] = [];
   const poller = new MessagePoller({} as never, {

@@ -76,6 +76,8 @@ import {
   formatReplyRefusal,
 } from "./reply-format.ts";
 import { RelayWebSocket, wsAuthSummary } from "./ws-client.ts";
+import { DebouncedStateWriter } from "./state-writer.ts";
+import type { PollerPersistState } from "./poller.ts";
 import { parseConnectInput } from "./connect.ts";
 import { safeUrlOrigin, redactUrlSecretsFromMessage } from "./url-redact.ts";
 import { approvalDecision, LOCAL_INSPECTION_TOOLS } from "./approval-policy.ts";
@@ -283,6 +285,13 @@ export function isStaleRuntimeError(err: unknown): boolean {
 export default function chaosRelayExtension(pi: ExtensionAPI): void {
   let client: RelayClient | undefined;
   let poller: MessagePoller | undefined;
+  /**
+   * Debounces the poller's resume state to one write per burst instead of one per
+   * accepted message (bead pi-chaos-relay-7jp). Lifetime is this instance's:
+   * flushed and disposed at session_shutdown, so a superseded instance can never
+   * flush its older state over the replacement's.
+   */
+  let stateWriter: DebouncedStateWriter<PollerPersistState> | undefined;
   let ws: RelayWebSocket | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   let attachmentCleanupTimer: ReturnType<typeof setInterval> | undefined;
@@ -505,6 +514,33 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   /** (Re)build the relay client from current config. Returns undefined if no API key. */
   // Create a poller that resumes from the persisted cursor and writes the
   // cursor back as it advances, so a restart doesn't re-read the relay backlog.
+  /**
+   * The debounced writer for this instance's resume state. The write itself is the
+   * same best-effort synchronous flush as before — persistence runs on the message
+   * path and must never become an uncaughtException.
+   *
+   * Deliberately NOT guarded on `runtimeReplaced`: the hand-back that a replaced
+   * runtime performs (requeueUndelivered) is the one write that MUST land, because
+   * the replacement session loads it. A guard here suppressed exactly that write,
+   * which the d8e regression test caught. What stops a dead instance from writing
+   * later is ordering instead: the urgent hand-back is written before the flag is
+   * usable-anyway, no further state is staged once the transport is torn down (the
+   * accept paths refuse), and session_shutdown flushes then disposes this writer.
+   */
+  function makeStateWriter(): DebouncedStateWriter<PollerPersistState> {
+    return new DebouncedStateWriter<PollerPersistState>({
+      write: ({ since, seen }) => {
+        saveMessageState({ cursor: since, seenIds: seen });
+      },
+      onError: (err) =>
+        log(
+          `WARN: failed to persist message cursor/seen log: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        ),
+    });
+  }
+
   function makePoller(c: RelayClient): MessagePoller {
     // Bound the log lines a broken relay can produce: see frameIssueLimiter.
     const limitFrameIssue = frameIssueLimiter();
@@ -525,12 +561,13 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         const line = limitFrameIssue(issue.code, issue.detail);
         if (line) log(`WARN: ${line}`);
       },
-      onPersist: ({ since, seen }) => {
-        try {
-          saveMessageState({ cursor: since, seenIds: seen });
-        } catch (err) {
-          log(`WARN: failed to persist message cursor/seen log: ${err instanceof Error ? err.message : String(err)}`);
-        }
+      // One write per burst, not per message: stage the newest state and let the
+      // writer flush it on its interval, at the next drain edge, or urgently for a
+      // hand-back. See state-writer.ts for why those are not the same case.
+      onPersist: (state, urgent) => {
+        const writer = stateWriter ?? (stateWriter = makeStateWriter());
+        if (urgent) writer.stageUrgent(state);
+        else writer.stage(state);
       },
       // Restore the persisted de-dup log so restarts don't re-process the
       // relay's on-connect message replay.
@@ -600,12 +637,16 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     if (blockedByPlaintextRefusal()) {
       client = undefined;
       poller = undefined;
+      stateWriter?.dispose();
+      stateWriter = undefined;
       return undefined;
     }
     warnIfConnectingInsecurely(cfg.relayUrl);
     if (!isConfigured(cfg)) {
       client = undefined;
       poller = undefined;
+      stateWriter?.dispose();
+      stateWriter = undefined;
       return undefined;
     }
     if (!client) {
@@ -1160,6 +1201,14 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         // shutdown would hand it back and rewind the cursor to a stale timestamp.
         inFlightBatches.delete(messages);
         log(`attachment delivery failed: ${redactUrlSecretsFromMessage(err instanceof Error ? err.message : String(err))}`);
+      })
+      .finally(() => {
+        // Drain edge: this batch is done and nothing is queued behind it, so the
+        // staged state is final for this burst — one write covers the whole burst
+        // instead of one per message. A batch that was handed back leaves the
+        // cursor rewound and its id unstaged by requeue's urgent write, so a flush
+        // here cannot resurrect it.
+        if (inFlightBatches.size === 0) stateWriter?.flushNow();
       });
     return deliveryQueue;
   }
@@ -1422,6 +1471,12 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     //    flag false.
     requeueInFlight("session shutting down");
     markRuntimeReplaced("session shutting down");
+    // requeueInFlight already wrote any rewound cursor synchronously; this covers
+    // everything else staged since the last flush, and dispose stops the timer so
+    // this instance cannot write again.
+    stateWriter?.flushNow();
+    stateWriter?.dispose();
+    stateWriter = undefined;
     stopPolling();
     stopTyping();
     // Drop any undelivered turn origins and the session read taint so the

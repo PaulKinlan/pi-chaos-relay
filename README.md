@@ -329,6 +329,17 @@ ignored with one warning naming the file and the error, falling back to
 defaults. `/chaos-relay reset` (or `reset all`) clears a file you don't want
 to repair by hand.
 
+### A hard kill can re-deliver a message
+
+The cursor and de-dup log are written at the end of a batch (or within a couple of
+seconds), not on every inbound message, so a burst costs one small write instead of
+one per message. A clean shutdown flushes synchronously, and a batch handed back for
+a replacement session is written immediately. If the process is killed hard
+(`SIGKILL`, power loss) the last window may not have reached disk, and the relay's
+replay can then deliver a message the agent already saw. That is a duplicate, never
+a loss: the cursor only ever moves backwards for a hand-back, and it is never
+advanced past a message that has not been delivered.
+
 ### "The reply was accepted" does not mean it was delivered
 
 `relay_reply` returning `ok: true` means the relay **resolved and stored** the

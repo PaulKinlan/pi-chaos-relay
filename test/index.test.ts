@@ -3599,6 +3599,126 @@ test("CHAOS_RELAY_WS_AUTH=header keeps the apiKey out of the WebSocket URL", asy
   }
 });
 
+test("a burst of messages costs one state write, at the drain edge, not one per message", async () => {
+  // bead pi-chaos-relay-7jp: the poller reported state per accepted batch and the
+  // writer persisted each report synchronously, so a push burst was one disk write
+  // per message. The state must still be correct — this pins BOTH halves: the file
+  // lags while the burst is in flight (the debounce is real, not theoretical) and
+  // is complete and current once the queue drains.
+  resetState();
+  writeProfileConfig("default", "ak_state_burst");
+  // resetState() intentionally leaves the message-state side-car alone, and the
+  // cursor it holds only ever advances — so a leftover from an earlier test would
+  // sit above this test's timestamps and the assertions below would be about that
+  // test's state instead of this one's. Start from a known-clean side-car.
+  try {
+    unlinkSync(config.messageStatePath());
+  } catch {
+    /* nothing to remove */
+  }
+  const origWs = globalThis.WebSocket;
+  const origFetch = globalThis.fetch;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+
+  // The first delivery is held inside hydration, so the rest of the burst is
+  // accepted (and staged) while it is still in flight — the shape of a burst.
+  let openDownloads: (() => void) | undefined;
+  let downloadStarted = false;
+  // ONE gate for every download: releasing it lets the whole burst drain.
+  const downloadsGate = new Promise<void>((resolve) => {
+    openDownloads = resolve;
+  });
+  globalThis.fetch = (async (input: unknown) => {
+    const href = String(input);
+    if (!href.includes("/attachments/")) throw new Error(`unexpected fetch: ${href}`);
+    downloadStarted = true;
+    await downloadsGate;
+    return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), {
+      status: 200,
+      headers: { "content-type": "image/png" },
+    });
+  }) as unknown as typeof fetch;
+
+  const ids = ["m-burst-1", "m-burst-2", "m-burst-3", "m-burst-4"];
+  // Declared outside the try so the finally can end the session (see below).
+  const fake = makeFakePi();
+  const ctx = makeCtx("sess-state-burst", fake.notifications);
+  (ctx as { model: unknown }).model = { input: ["text", "image"] };
+  try {
+    const sends: string[] = [];
+    fake.pi.sendUserMessage = (content: unknown) => {
+      sends.push(typeof content === "string" ? content : JSON.stringify(content));
+    };
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, ctx);
+    const socket = socketForProfile("ak_state_burst");
+    const statePath = config.messageStatePath();
+    const withAttachment = (id: string, timestamp: string) => ({
+      type: "message",
+      message: {
+        id,
+        channelType: "telegram",
+        channelId: "chan-state-burst",
+        from: "alice",
+        content: "burst",
+        timestamp,
+        attachments: [
+          { id: "att-1", filename: "photo.png", mimeType: "image/png", size: 8, kind: "image" },
+        ],
+      },
+    });
+
+    socket.pushFrame(JSON.stringify(withAttachment(ids[0], "2026-10-12T00:00:01.000Z")));
+    await waitFor(() => downloadStarted);
+    for (const [i, id] of ids.slice(1).entries()) {
+      socket.pushFrame(JSON.stringify(withAttachment(id, `2026-10-12T00:00:0${i + 2}.000Z`)));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // On the pre-debounce build this file was written synchronously inside accept,
+    // so it already existed here; now nothing has been flushed at all.
+    const midBurst = existsSync(statePath) ? readFileSync(statePath, "utf-8") : "";
+    assert.ok(
+      !ids.some((id) => midBurst.includes(id)),
+      `no per-message write while the burst is in flight: ${midBurst}`,
+    );
+
+    openDownloads?.();
+    await waitFor(() => sends.length === ids.length);
+    const afterDrain = JSON.parse(readFileSync(statePath, "utf-8")) as {
+      cursor: string;
+      seenIds: string[];
+    };
+    for (const id of ids) {
+      assert.ok(
+        afterDrain.seenIds.includes(id),
+        `the drained state has ${id}: ${JSON.stringify(afterDrain.seenIds)}`,
+      );
+    }
+    assert.equal(
+      afterDrain.cursor,
+      "2026-10-12T00:00:04.000Z",
+      "and the cursor is the newest message's",
+    );
+  } finally {
+    openDownloads?.();
+    // End the session so this instance's writer is flushed and disposed: leaving a
+    // live one would let its timer write state during later tests in this file.
+    await callHandler(fake.handlers, "session_shutdown", {}, ctx).catch(() => {});
+    // And remove the side-car this test persisted. resetState() deliberately leaves
+    // it alone, so without this the next test's poller would resume from a cursor
+    // and de-dup log invented here — the machine-state leak that makes a suite
+    // order-dependent.
+    try {
+      unlinkSync(config.messageStatePath());
+    } catch {
+      /* nothing was written */
+    }
+    globalThis.WebSocket = origWs;
+    globalThis.fetch = origFetch;
+  }
+});
+
 test("a delivery that hits a replaced runtime stops the instance and returns the batch to the poller", async () => {
   resetState();
   writeProfileConfig("default", "ak_stale");

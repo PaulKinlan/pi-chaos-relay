@@ -132,6 +132,14 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
   `status` line and the doctor fix text. A runtime that rejects the `headers` option
   (any construct failure, not only a TypeError) logs the query-token way out instead
   of looking like a dead apiKey.
+- `state-writer.ts` — debounced persistence for the poller's resume state (bead
+  pi-chaos-relay-7jp). `stage()` coalesces a burst; `stageUrgent()` writes NOW and is
+  for state another process reads — a hand-back. The flush points are the drain edge
+  (index.ts's delivery chain, when nothing is queued behind the batch), the 2s
+  safety-net interval, `session_shutdown` (flush then dispose), and any urgent write.
+  Do NOT add a `runtimeReplaced` guard to the write: suppressing the hand-back write
+  is what the d8e regression test catches. Do not remove the `disposed` check either:
+  a superseded instance holding older state must not flush it over the replacement's.
 - `poller.ts` — cursor + dedup; HTTP catch-up and safety poll. `accept()` is also
   the inbound shape gate: both transports hand it raw relay payloads, so it runs
   every message through `inbound-message.ts` before anything reads a field.
