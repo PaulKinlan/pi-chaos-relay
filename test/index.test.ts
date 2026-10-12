@@ -102,6 +102,14 @@ function makeFakePi() {
   const commands = new Map<string, { handler: Handler }>();
   const tools: Array<Record<string, unknown>> = [];
   const notifications: Notification[] = [];
+  /**
+   * Each delivered message, as { content, prompt }: `prompt` is the text pi reports
+   * back through before_agent_start for the turn that message starts. The SDK joins
+   * a content array's text parts with "\n" and does not expand prompt templates
+   * (dist/core/agent-session.js sendUserMessage), so this mirrors what the
+   * extension matches on.
+   */
+  const sent: Array<{ content: unknown; prompt: string }> = [];
   const pi = {
     on(name: string, handler: Handler) {
       const list = handlers.get(name) ?? [];
@@ -114,9 +122,22 @@ function makeFakePi() {
     registerTool(def: Record<string, unknown>) {
       tools.push(def);
     },
-    sendUserMessage: (_content: unknown, _opts?: unknown) => {},
+    sendUserMessage: (content: unknown, _opts?: unknown) => {
+      sent.push({
+        content,
+        prompt:
+          typeof content === "string"
+            ? content
+            : (Array.isArray(content) ? content : [])
+                .filter((p): p is { type: string; text: string } =>
+                  Boolean(p) && (p as { type?: string }).type === "text",
+                )
+                .map((p) => p.text)
+                .join("\n"),
+      });
+    },
   };
-  return { pi, handlers, commands, tools, notifications };
+  return { pi, handlers, commands, tools, notifications, sent };
 }
 
 function makeCtx(sessionId: string, notifications: Notification[]) {
@@ -129,6 +150,31 @@ function makeCtx(sessionId: string, notifications: Notification[]) {
       },
     },
   };
+}
+
+/**
+ * Drive one turn the way pi does: `before_agent_start` (carrying the prompt) and
+ * then `agent_start`. Bead pi-chaos-relay-pl2: turn binding matches the prompt, so
+ * a test that fired only `agent_start` would not be testing the real order.
+ *
+ * `prompt` defaults to the text of the most recent delivery — the turn that
+ * delivery started. Pass a different string to simulate a turn the relay did not
+ * drive, such as one typed in the terminal.
+ */
+async function startTurn(
+  fake: ReturnType<typeof makeFakePi>,
+  ctx: unknown,
+  prompt?: string,
+): Promise<void> {
+  const last = fake.sent[fake.sent.length - 1];
+  const text = prompt ?? last?.prompt ?? "";
+  await callHandler(
+    fake.handlers,
+    "before_agent_start",
+    { type: "before_agent_start", prompt: text },
+    ctx,
+  );
+  await callHandler(fake.handlers, "agent_start", {}, ctx);
 }
 
 /** Run every handler registered for a lifecycle event, like pi would. */
@@ -2487,7 +2533,7 @@ test("a mid-turn message from another channel does not re-point the approval", a
   t.mock.timers.tick(120_000);
   await flushAsync();
   // The turn begins: snapshot the origin (channel A).
-  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-turn", fake.notifications));
+  await startTurn(fake, makeCtx("sess-turn", fake.notifications));
   // Mid-turn: channel B's message arrives, re-pointing the live lastChannel.
   t.mock.timers.tick(120_000);
   await flushAsync();
@@ -2570,13 +2616,13 @@ test("a message delivered mid-turn produces a gated follow-up turn", async (t) =
   // Turn A: message A arrives and the turn starts.
   t.mock.timers.tick(120_000);
   await flushAsync();
-  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-follow", fake.notifications));
+  await startTurn(fake, makeCtx("sess-follow", fake.notifications));
   // Mid-turn A: message B arrives (its origin is queued, not dropped).
   t.mock.timers.tick(120_000);
   await flushAsync();
   // Turn A ends, then the queued follow-up (B) becomes turn B.
   await callHandler(fake.handlers, "agent_end", {}, makeCtx("sess-follow", fake.notifications));
-  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-follow", fake.notifications));
+  await startTurn(fake, makeCtx("sess-follow", fake.notifications));
 
   // Turn B's gated tool call must be asked over B's channel. Fire it without
   // awaiting the approval answer; the prompt send happens before the wait.
@@ -2644,7 +2690,7 @@ test("default writes mode: a channel turn that reads a local file cannot text-re
   // A channel message arrives and the turn starts with that origin.
   t.mock.timers.tick(120_000);
   await flushAsync();
-  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-egress", fake.notifications));
+  await startTurn(fake, makeCtx("sess-egress", fake.notifications));
 
   const toolHandlers = fake.handlers.get("tool_call");
   assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
@@ -2738,7 +2784,7 @@ test("default writes mode: a file read in one channel turn gates a text-only rep
   // local file (ungated in writes mode) and taints the SESSION.
   t.mock.timers.tick(120_000);
   await flushAsync();
-  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-cross-turn", fake.notifications));
+  await startTurn(fake, makeCtx("sess-cross-turn", fake.notifications));
   const readResult = await toolHandlers![0](
     { toolName: "read", input: { path: "/etc/passwd" } },
     makeCtx("sess-cross-turn", fake.notifications),
@@ -2751,7 +2797,7 @@ test("default writes mode: a file read in one channel turn gates a text-only rep
   // from turn 1, so a text-only relay_reply is gated and asked over the channel.
   t.mock.timers.tick(120_000);
   await flushAsync();
-  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-cross-turn", fake.notifications));
+  await startTurn(fake, makeCtx("sess-cross-turn", fake.notifications));
 
   const replyCall = toolHandlers![0](
     { toolName: "relay_reply", input: { channelType: "telegram", channelId: "chanA", content: "root:x:0:0:root:/root:/bin/bash" } },
@@ -2830,7 +2876,7 @@ test("a batch mixing senders is attributed to the earliest message's origin", as
 
   t.mock.timers.tick(120_000); // mixed batch delivered
   await flushAsync();
-  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-mixed", fake.notifications));
+  await startTurn(fake, makeCtx("sess-mixed", fake.notifications));
 
   const toolHandlers = fake.handlers.get("tool_call");
   assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
@@ -2841,6 +2887,144 @@ test("a batch mixing senders is attributed to the earliest message's origin", as
     replyDests,
     ["chanA"],
     "a mixed batch is attributed to the earliest message's origin (first-wins, documented)",
+  );
+});
+
+test("a terminal turn does not consume a queued relay origin, and the relay turn still gets it", async (t) => {
+  // bead pi-chaos-relay-pl2: `agent_start` fires for EVERY turn, so binding the
+  // origin by shifting the queue there let a terminal/local turn take the origin of
+  // a relay message that was still queued behind it. The turn after that then ran
+  // ungated (or gated over the wrong channel). Binding matches the turn's prompt
+  // instead, so a turn the relay did not drive consumes nothing.
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  resetState();
+  writeFileSync(
+    join(PI_DIR, "chaos-relay.json"),
+    JSON.stringify({ relayUrl: "http://127.0.0.1:9", apiKey: "ak", approvalMode: "all" }) + "\n",
+  );
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origFetch = globalThis.fetch;
+  t.after(() => {
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+    globalThis.fetch = origFetch;
+  });
+
+  const replyDests: string[] = [];
+  globalThis.fetch = (async (url: unknown, init?: unknown) => {
+    const u = String(url);
+    if (u.includes("/messages")) {
+      return new Response(
+        JSON.stringify({
+          messages: [
+            {
+              id: "queued1",
+              channelType: "telegram",
+              channelId: "chanQ",
+              from: "alice",
+              content: "relay message waiting behind a terminal turn",
+              timestamp: "2026-01-01T00:00:01Z",
+            },
+          ],
+          since: "2026-01-01T00:00:01Z",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (u.includes("/reply")) {
+      const body = JSON.parse(String((init as { body?: string })?.body ?? "{}"));
+      replyDests.push(body.channelId);
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({}), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+
+  const flushAsync = async () => {
+    await new Promise((r) => setTimeout(r, 60));
+  };
+  const fake = makeFakePi();
+  chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+  await callHandler(
+    fake.handlers,
+    "session_start",
+    { reason: "startup" },
+    makeCtx("sess-queued-origin", fake.notifications),
+  );
+  t.after(() =>
+    callHandler(fake.handlers, "session_shutdown", {}, makeCtx("sess-queued-origin", fake.notifications)),
+  );
+
+  // The relay message is delivered (its origin is queued) but its turn has not run.
+  t.mock.timers.tick(120_000);
+  await flushAsync();
+  assert.equal(fake.sent.length, 1, "the relay message was delivered and is waiting for its turn");
+
+  // A turn typed in the terminal runs FIRST. It must not be gated (it is not a
+  // channel turn) and must not consume the queued relay origin.
+  const toolHandlers = fake.handlers.get("tool_call");
+  assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
+  await startTurn(fake, makeCtx("sess-queued-origin", fake.notifications), "a prompt typed in the terminal");
+  const terminalToolCall = toolHandlers![0](
+    { toolName: "bash", input: { command: "x" } },
+    makeCtx("sess-queued-origin", fake.notifications),
+  );
+  await flushAsync();
+  assert.deepEqual(
+    replyDests,
+    [],
+    "the terminal turn is not gated and asked nothing over a channel",
+  );
+  await callHandler(fake.handlers, "agent_end", {}, makeCtx("sess-queued-origin", fake.notifications));
+  await terminalToolCall;
+
+  // Now the relay turn runs, carrying the delivered prompt. It must own chanQ.
+  await startTurn(fake, makeCtx("sess-queued-origin", fake.notifications));
+  // Not awaited: the gated call is waiting on a human approval that this test never
+  // answers (the approval timeout is a real 5-minute setTimeout, so a mock tick cannot
+  // release it). Asserting what it ASKED is the point; session_shutdown in t.after
+  // settles it.
+  void Promise.resolve(
+    toolHandlers![0](
+      { toolName: "bash", input: { command: "y" } },
+      makeCtx("sess-queued-origin", fake.notifications),
+    ),
+  ).catch(() => {});
+  await flushAsync();
+  assert.deepEqual(
+    replyDests,
+    ["chanQ"],
+    "the relay turn still owns its origin: its gated tool call asks over its own channel",
+  );
+
+  // An aborted turn can end without agent_end, so the next turn must not inherit its
+  // binding: before_agent_start clears it whenever the prompt matches no pending
+  // delivery. Without that, a later terminal turn would be gated over the dead turn's
+  // channel — the same misattribution this bead is about, one turn later.
+  await callHandler(
+    fake.handlers,
+    "before_agent_start",
+    { type: "before_agent_start", prompt: "typed after a turn that never ended" },
+    makeCtx("sess-queued-origin", fake.notifications),
+  );
+  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-queued-origin", fake.notifications));
+  void Promise.resolve(
+    toolHandlers![0](
+      { toolName: "bash", input: { command: "z" } },
+      makeCtx("sess-queued-origin", fake.notifications),
+    ),
+  ).catch(() => {});
+  await flushAsync();
+  assert.deepEqual(
+    replyDests,
+    ["chanQ"],
+    "the finished turn's origin does not leak into a later non-relay turn",
   );
 });
 
@@ -2922,7 +3106,7 @@ test("a turn that starts during slow attachment hydration does not consume the n
 
   // Another turn starts and ends while hydration is still pending. It must not
   // consume the origin that has not actually been delivered.
-  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-slow", fake.notifications));
+  await startTurn(fake, makeCtx("sess-slow", fake.notifications));
   await callHandler(fake.handlers, "agent_end", {}, makeCtx("sess-slow", fake.notifications));
 
   // Let hydration finish; the followUp is now actually delivered.
@@ -2930,7 +3114,7 @@ test("a turn that starts during slow attachment hydration does not consume the n
   await flushAsync();
 
   // The relay message's own turn starts and must carry chanA's origin.
-  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-slow", fake.notifications));
+  await startTurn(fake, makeCtx("sess-slow", fake.notifications));
 
   const toolHandlers = fake.handlers.get("tool_call");
   assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
@@ -3017,7 +3201,7 @@ test("a hydration failure enqueues no origin and leaves the next turn aligned", 
   t.mock.timers.tick(120_000);
   await flushAsync();
 
-  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-hydfail", fake.notifications));
+  await startTurn(fake, makeCtx("sess-hydfail", fake.notifications));
 
   const toolHandlers = fake.handlers.get("tool_call");
   assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
@@ -3095,7 +3279,7 @@ test("session shutdown and start clear pending origins so a new session cannot i
 
   // A terminal/local turn in the new session must be ungated: the stale origin
   // from the previous session must already be gone.
-  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-reset2", fake.notifications));
+  await startTurn(fake, makeCtx("sess-reset2", fake.notifications));
 
   const toolHandlers = fake.handlers.get("tool_call");
   assert.ok(toolHandlers && toolHandlers.length > 0, "extension registers a tool_call handler");
@@ -3174,7 +3358,7 @@ test("default writes mode: a bash run in a terminal turn taints the session for 
   // A channel message arrives and the turn starts with that origin.
   t.mock.timers.tick(120_000);
   await flushAsync();
-  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-term-bash", fake.notifications));
+  await startTurn(fake, makeCtx("sess-term-bash", fake.notifications));
 
   const replyCall = toolHandlers![0](
     { toolName: "relay_reply", input: { channelType: "telegram", channelId: "chanA", content: "root:x:0:0:root:/root:/bin/bash" } },
@@ -3248,7 +3432,7 @@ test("default writes mode: a channel turn cannot register a channel or switch pr
   // A channel message arrives and the turn is driven from it, so the gate applies.
   t.mock.timers.tick(120_000);
   await flushAsync();
-  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-cp", fake.notifications));
+  await startTurn(fake, makeCtx("sess-cp", fake.notifications));
 
   // The injection: a channel-borne turn tries to register the attacker's own
   // channel. Pre-fix this ran ungated and silently took the session over (the
@@ -3356,7 +3540,7 @@ test("default writes mode: an approved bash in a channel turn taints the session
   // Turn 1: a channel message arrives and the turn starts.
   t.mock.timers.tick(120_000);
   await flushAsync();
-  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-appr-bash", fake.notifications));
+  await startTurn(fake, makeCtx("sess-appr-bash", fake.notifications));
 
   const secret = "ghp_supersecrettoken1234567890abcdef";
   const bashCall = toolHandlers![0](
@@ -3383,7 +3567,7 @@ test("default writes mode: an approved bash in a channel turn taints the session
   // session, so a text-only reply is gated.
   t.mock.timers.tick(120_000);
   await flushAsync();
-  await callHandler(fake.handlers, "agent_start", {}, makeCtx("sess-appr-bash", fake.notifications));
+  await startTurn(fake, makeCtx("sess-appr-bash", fake.notifications));
 
   const replyCall = toolHandlers![0](
     { toolName: "relay_reply", input: { channelType: "telegram", channelId: "chanA", content: "root:x:0:0:root:/root:/bin/bash" } },

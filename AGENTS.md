@@ -116,6 +116,17 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
 - `index.ts` — pi extension entry: registers tools (`relay_reply`,
   `relay_register_telegram`, `relay_register_email`, …) and the `/chaos-relay`
   command (`setup`/`status`/`poll`/`stop`); owns the poller + WebSocket.
+  A delivered relay message queues its ORIGIN (channel/sender) and the turn it
+  starts adopts it, so a gated tool call asks over the channel that message came
+  from. The adoption happens in `before_agent_start`, matching the prompt pi reports
+  against the exact text that delivery sent (`sentText`), NOT by shifting the queue in
+  `agent_start`: `agent_start` fires for every turn, terminal/local ones included, so a
+  positional bind let a terminal turn consume the origin of a relay message still
+  queued behind it (bead pi-chaos-relay-pl2). A turn whose prompt matches no pending
+  delivery is not a relay turn: it consumes nothing and clears any binding left by a
+  turn that ended without `agent_end`. `test/index.test.ts` drives turns through a
+  `startTurn` helper that fires `before_agent_start` then `agent_start`, in that order,
+  because pi does — a test that fires only `agent_start` no longer exercises binding.
 - `relay-client.ts` — signed HTTP client for the relay (ECDSA P-256 identity).
 - `ws-client.ts` — WebSocket transport (push delivery + reconnect/backoff). The
   upgrade authenticates via `wsConnectTarget` — `Authorization: Bearer <apiKey>` in

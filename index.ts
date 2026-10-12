@@ -348,6 +348,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     channelType: ChannelMessage["channelType"];
     channelId: string;
     from: string;
+    /** The exact prompt text this delivery handed to pi. Turn binding matches on
+     *  it (see the before_agent_start handler): `agent_start` fires for EVERY
+     *  turn, so position in this queue cannot identify which turn is ours. */
+    sentText: string;
   }[] = [];
   /** The CURRENT turn's origin, shifted from the queue at turn start and dropped
    *  at turn end. A gated tool call asks — and is answered by — this. */
@@ -1179,6 +1183,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         channelType: first.channelType,
         channelId: first.channelId,
         from: first.from,
+        // The SAME string pi will report back as the turn's prompt: the SDK joins
+        // the text parts of a content array with "\n" and does not expand prompt
+        // templates, so this is exact for both the string and image cases.
+        sentText: text,
       };
       pendingOrigins.push(origin);
       const distinct = new Set(messages.map((m) => `${m.channelId}\u0000${m.from}`));
@@ -1536,13 +1544,30 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
 
   // Show a "typing" indicator in the active channel while the agent works on a
   // relay-delivered message, and clear it when the run finishes.
+  pi.on("before_agent_start", (event) => {
+    // Bind THIS turn's origin by matching the prompt pi reports against the text
+    // each delivery sent, NOT by position in the queue.
+    //
+    // `agent_start` fires for every turn, terminal/local ones included, so the
+    // old `pendingOrigins.shift()` there let a terminal turn consume the origin
+    // of a relay message that was still queued behind it — the relay turn then
+    // ran with no origin (or, worse, with another channel's), so its tool calls
+    // were gated over the wrong channel (bead pi-chaos-relay-pl2). pi emits
+    // before_agent_start per turn with the expanded prompt, and the SDK passes a
+    // content array's text parts joined with "\n" without template expansion,
+    // so this comparison is exact.
+    //
+    // No match means this turn was NOT driven by a relay delivery: it must not
+    // consume one, and it clears any binding a previous turn left behind.
+    const i = pendingOrigins.findIndex((o) => o.sentText === event.prompt);
+    activeTurn = i === -1 ? undefined : pendingOrigins.splice(i, 1)[0];
+  });
   pi.on("agent_start", () => {
-    // Shift this turn's origin off the queue (a terminal/local turn has none).
-    // The session read taint is intentionally NOT cleared here: the LLM
-    // conversation context persists across turns, so a file read in turn 1 can
-    // still be text-replied out in turn 2 and must stay gated until the session
-    // ends.
-    activeTurn = pendingOrigins.shift() ?? undefined;
+    // Nothing to bind here: the origin was matched in before_agent_start, which
+    // pi emits first for the same turn. The session read taint is intentionally
+    // NOT cleared at turn boundaries either: the LLM conversation context
+    // persists across turns, so a file read in turn 1 can still be text-replied
+    // out in turn 2 and must stay gated until the session ends.
     startTyping();
   });
   pi.on("agent_end", () => {
