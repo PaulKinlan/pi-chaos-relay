@@ -153,6 +153,25 @@ function makeCtx(sessionId: string, notifications: Notification[]) {
 }
 
 /**
+ * Fire a lifecycle event the way pi does, whether or not the extension listens.
+ *
+ * `callHandler` asserts that a handler is registered, which is the right check for the
+ * events an extension is supposed to handle — but pi emits lifecycle events regardless,
+ * and bead pi-chaos-relay-a1j deliberately removed the extension's `agent_start`
+ * handler (it used to start the typing indicator there, before turn provenance was
+ * known). So turn-starting must not require a listener.
+ */
+async function fireLifecycle(
+  fake: ReturnType<typeof makeFakePi>,
+  name: string,
+  event: unknown,
+  ctx: unknown,
+): Promise<void> {
+  if (!fake.handlers.has(name)) return;
+  await callHandler(fake.handlers, name, event, ctx);
+}
+
+/**
  * Drive one turn the way pi does: `before_agent_start` (carrying the prompt) and
  * then `agent_start`. Bead pi-chaos-relay-pl2: turn binding matches the prompt, so
  * a test that fired only `agent_start` would not be testing the real order.
@@ -176,7 +195,7 @@ async function startTurn(
   // declarations in types.d.ts carry the ordering contract; review round 3 corrected my
   // earlier reversal. It matters here: agent_start restarts typing from whatever origin
   // the PREVIOUS run left bound, so the user message is what clears it.)
-  await callHandler(fake.handlers, "agent_start", {}, ctx);
+  await fireLifecycle(fake, "agent_start", {}, ctx);
   await callHandler(
     fake.handlers,
     "message_start",
@@ -2908,7 +2927,7 @@ test("a batch mixing senders is attributed to the earliest message's origin", as
   );
 });
 
-test("an unattributable turn stops the typing a previous run left running", async (t) => {
+test("typing starts only for a bound turn, and stops when the binding is cleared", async (t) => {
   // Review round 3, P2. The SDK emits agent_start BEFORE message_start, so a run that
   // never reached agent_end (aborted) has a live 4s typing refresh pointed at its
   // channel when the next user message arrives. If clearing the binding does not stop
@@ -2978,9 +2997,30 @@ test("an unattributable turn stops the typing a previous run left running", asyn
   const bound = typingPings;
   assert.ok(bound > 0, `typing started for the bound relay turn (${bound} pings)`);
 
-  // That run is abandoned (no agent_end). A later unattributable message clears the
-  // binding — and must take the typing timer with it.
-  await startTurn(fake, makeCtx("sess-typing", fake.notifications), "typed after an abandoned run");
+  // That run is abandoned (no agent_end). Two things must hold for the next turn.
+  // (a) bead pi-chaos-relay-a1j: agent_start alone must send NO ping. It used to call
+  // startTyping() there, whose immediate ping went to the abandoned run's channel before
+  // this turn's provenance existed. Drive the two events separately so the assertion can
+  // see the moment between them.
+  const beforeAgentStart = typingPings;
+  await fireLifecycle(fake, "agent_start", {}, makeCtx("sess-typing", fake.notifications));
+  await flushAsync();
+  assert.equal(
+    typingPings,
+    beforeAgentStart,
+    "agent_start alone sends no typing ping: nothing is known about this turn yet",
+  );
+  // (b) An unattributable user message then clears the binding — and must take the typing
+  // timer with it (review round 3's P2).
+  await callHandler(
+    fake.handlers,
+    "message_start",
+    {
+      type: "message_start",
+      message: { role: "user", content: [{ type: "text", text: "typed after an abandoned run" }] },
+    },
+    makeCtx("sess-typing", fake.notifications),
+  );
   await flushAsync();
   const afterClear = typingPings;
   t.mock.timers.tick(20_000); // five typing refreshes, if the timer were still alive
