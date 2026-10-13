@@ -55,6 +55,14 @@ delete process.env.CHAOS_RELAY_API_KEY;
 // in this file silently ran with approvals disabled and failed (bead
 // pi-chaos-relay-wbj). A test suite must not depend on the operator's environment.
 delete process.env.CHAOS_RELAY_APPROVAL_MODE;
+// Inbound attachments are saved under $XDG_RUNTIME_DIR (else tmpdir()), read per
+// call by defaultInboundAttachmentRoot in inbound-attachments.ts — not under HOME.
+// Left unpinned, the image tests wrote into the operator's real runtime dir, and a
+// login shell exporting XDG_RUNTIME_DIR=/run/user/<uid> where that dir is missing
+// made them fail (bead pi-chaos-relay-eho). Keep it inside the sandbox.
+const RUNTIME_DIR = join(HOME_DIR, "run");
+mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
+process.env.XDG_RUNTIME_DIR = RUNTIME_DIR;
 // env beats the persisted file in resolveConfig, so this pins the relay URL for
 // every connect attempt in this file (including doctor's reachability check).
 process.env.CHAOS_RELAY_URL = OFFLINE_RELAY_URL;
@@ -5464,6 +5472,10 @@ test("an emailed image reaches the agent as image content, not as an attachment 
     `no attachment placeholder instead of the image: ${text}`,
   );
   assert.equal(relay.attachmentRequests(), 1, "the attachment was fetched from the relay over HTTP");
+  assert.ok(
+    text.includes(`saved to ${RUNTIME_DIR}/`),
+    `the attachment was saved inside the test sandbox, not the real runtime dir: ${text}`,
+  );
 });
 
 test("a replacement session receives the emailed image after the first session is replaced mid-download", async (t) => {
