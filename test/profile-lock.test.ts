@@ -16,18 +16,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  statSync,
-  symlinkSync,
-  utimesSync,
-  writeFileSync,
-} from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -276,26 +265,37 @@ test("three processes racing one profile: exactly one wins, on the extracted mod
 
 test("rg6: the same explicit config path conflicts, but its ~/.pi namesake does not", () => {
   const explicitDir = mkdtempSync(join(tmpdir(), "rg6-lock-"));
-  const explicit = join(explicitDir, "chaos-relay.staging.json");
-  const namesake = join(PI_DIR, "chaos-relay.staging.json");
-  writeFileSync(explicit, "{}");
-  writeFileSync(namesake, "{}");
-  const first = claimProfileLock("staging", explicit);
+  // The directory removal is the OUTER finally so it cannot be skipped: the setup writes and
+  // the first claim used to sit before the try, so a throw there left the sandbox behind, and
+  // a throw from the lock-release finally would have skipped a removal living in the same
+  // block (review P2).
   try {
-    assert.equal(first.claimed, true);
-    // A foreign live pid simulates a second process; this process's pid is
-    // deliberately reclaimed by the existing stale/self-pid protocol.
-    writeFileSync(first.path, "1");
-    assert.equal(claimProfileLock("staging", explicit).claimed, false);
-    const alias = join(explicitDir, "alias.json");
-    symlinkSync(explicit, alias);
-    assert.equal(claimProfileLock("different-name", alias).claimed, false,
+        const explicit = join(explicitDir, "chaos-relay.staging.json");
+        const namesake = join(PI_DIR, "chaos-relay.staging.json");
+        writeFileSync(explicit, "{}");
+        writeFileSync(namesake, "{}");
+        const first = claimProfileLock("staging", explicit);
+        try {
+      assert.equal(first.claimed, true);
+        // A foreign live pid simulates a second process; this process's pid is
+        // deliberately reclaimed by the existing stale/self-pid protocol.
+        writeFileSync(first.path, "1");
+        assert.equal(claimProfileLock("staging", explicit).claimed, false);
+        const alias = join(explicitDir, "alias.json");
+        symlinkSync(explicit, alias);
+        assert.equal(claimProfileLock("different-name", alias).claimed, false,
       "a symlink alias and different profile label cannot bypass the same-file lock");
-    assert.equal(claimProfileLock("staging", namesake).claimed, true);
-    assert.notEqual(first.path, claimProfileLock("staging", namesake).path);
+        assert.equal(claimProfileLock("staging", namesake).claimed, true);
+        assert.notEqual(first.path, claimProfileLock("staging", namesake).path);
+    } finally {
+      writeFileSync(first.path, String(process.pid));
+      removeProfileLock("staging", explicit);
+      removeProfileLock("staging", namesake);
+    }
   } finally {
-    writeFileSync(first.path, String(process.pid));
-    removeProfileLock("staging", explicit);
-    removeProfileLock("staging", namesake);
+    // Removes the sandbox on EVERY exit path, including a throw from the release block above.
+    // Previously this directory was never removed, so each run left one under /tmp (P3 on
+    // pi-chaos-relay-rg6), and a removal in the inner finally could still be skipped (P2).
+    rmSync(explicitDir, { recursive: true, force: true });
   }
 });
