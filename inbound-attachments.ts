@@ -41,6 +41,23 @@ export function defaultInboundAttachmentRoot(): string {
   return join(runtime, `pi-chaos-relay-inbound-${uid}`);
 }
 
+/** The private temp root used when the preferred runtime root cannot be created. */
+function fallbackInboundAttachmentRoot(): string {
+  const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+  return join(tmpdir(), `pi-chaos-relay-inbound-${uid}`);
+}
+
+const warnedFallbackRoots = new Set<string>();
+
+/** Warn once per distinct failure when an attachment moves off the preferred root. */
+function warnFallbackOnce(preferred: string, fallback: string, error: unknown): void {
+  const why = error instanceof Error ? error.message : String(error);
+  const reason = `attachments: cannot use ${preferred} (${why}); using ${fallback} instead`;
+  if (warnedFallbackRoots.has(reason)) return;
+  warnedFallbackRoots.add(reason);
+  console.warn(`pi-chaos-relay: ${reason}`);
+}
+
 function opaqueDirectory(messageId: string): string {
   return createHash("sha256").update(messageId).digest("hex").slice(0, 24);
 }
@@ -73,9 +90,24 @@ async function savePrivateAttachment(
   root: string,
   messageId: string,
   attachment: DownloadedAttachment,
+  mayFallback = false,
 ): Promise<string> {
-  await ensurePrivateDirectory(root);
-  const dir = join(root, opaqueDirectory(messageId));
+  let target = root;
+  try {
+    await ensurePrivateDirectory(target);
+  } catch (error) {
+    // Only the DEFAULT root may move: a caller that names a root (including a test that
+    // asserts the degraded "Attachment unavailable" note) must see its own failure. If
+    // the fallback ALSO fails this throws, and the caller's Promise.allSettled turns it
+    // into that note — a bad root must never lose the message itself.
+    if (!mayFallback) throw error;
+    const fallback = fallbackInboundAttachmentRoot();
+    if (fallback === target) throw error;
+    await ensurePrivateDirectory(fallback);
+    warnFallbackOnce(target, fallback, error);
+    target = fallback;
+  }
+  const dir = join(target, opaqueDirectory(messageId));
   await ensurePrivateDirectory(dir);
   const nonce = randomBytes(6).toString("hex");
   const path = join(dir, `${nonce}-${safeInboundFilename(attachment.filename)}`);
@@ -146,9 +178,10 @@ async function materializeOne(
   root: string,
   message: ChannelMessage,
   attachment: InboundAttachment,
+  mayFallback = false,
 ): Promise<{ path: string; image?: PiImageContent }> {
   const downloaded = await client.downloadAttachment(message.id, attachment);
-  const path = await savePrivateAttachment(root, message.id, downloaded);
+  const path = await savePrivateAttachment(root, message.id, downloaded, mayFallback);
   const imageMime = imageMimeFromMagic(downloaded.bytes, downloaded.mimeType);
   return {
     path,
@@ -171,8 +204,15 @@ async function materializeOne(
 export async function materializeInboundAttachments(
   client: RelayClient,
   messages: ChannelMessage[],
-  root = defaultInboundAttachmentRoot(),
+  root?: string,
 ): Promise<MaterializedMessages> {
+  // Undefined means "not supplied": the fallback applies ONLY to the default root, so a
+  // caller naming an unusable root on purpose still gets the failure it asked for. This
+  // resolution is deliberately PURE and must stay so — creating the directory here added
+  // an await before the delivery loop, which changed the turn ordering that
+  // index.test.ts's approval assertions pin. Bisecting that out cost a review round.
+  const effectiveRoot = root ?? defaultInboundAttachmentRoot();
+  const mayFallback = root === undefined;
   const images: PiImageContent[] = [];
   const files: string[] = [];
   const hydrated: ChannelMessage[] = [];
@@ -181,7 +221,7 @@ export async function materializeInboundAttachments(
     const annotations: string[] = [];
     const attachments = (message.attachments || []).slice(0, MAX_ATTACHMENTS_PER_MESSAGE);
     const results = await Promise.allSettled(
-      attachments.map((attachment) => materializeOne(client, root, message, attachment)),
+      attachments.map((attachment) => materializeOne(client, effectiveRoot, message, attachment, mayFallback)),
     );
     for (let index = 0; index < results.length; index++) {
       const attachment = attachments[index];
