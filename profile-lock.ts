@@ -16,14 +16,30 @@
  *     window protects a holder that has the file but has not written its pid yet;
  *   - release only unlinks a lock this process wrote.
  */
-import { readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { profilePathForName } from "./config.ts";
 
 // ── Profile lock: detect concurrent pi instances on the same relay profile ──
 
-function lockFilePath(profile: string): string {
-  return join(homedir(), ".pi", `chaos-relay-${profile}.lock`);
+function lockFilePath(profile: string, configPath: string = profilePathForName(profile)): string {
+  // Symlinks to one config file must contend for the same lock.
+  let canonical: string;
+  try {
+    canonical = realpathSync(configPath);
+  } catch {
+    const absolute = resolve(configPath);
+    try {
+      canonical = join(realpathSync(dirname(absolute)), basename(absolute));
+    } catch {
+      canonical = absolute;
+    }
+  }
+  const slug = basename(canonical).replace(/[^a-z0-9._-]/gi, "-").slice(0, 40);
+  const hash = createHash("sha256").update(canonical).digest("hex").slice(0, 16);
+  return join(homedir(), ".pi", `chaos-relay-${slug}-${hash}.lock`);
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -109,13 +125,13 @@ function readLockHolder(path: string): LockHolder {
  * breaking every session on an unwritable ~/.pi). `pid` is the holder's pid
  * when the claim was refused, for the collision message.
  */
-export function claimProfileLock(profile: string): {
+export function claimProfileLock(profile: string, configPath?: string): {
   claimed: boolean;
   pid: number | null;
   path: string;
   lockError?: string;
 } {
-  const path = lockFilePath(profile);
+  const path = lockFilePath(profile, configPath);
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       writeFileSync(path, String(process.pid), { flag: "wx", mode: 0o600 });
@@ -175,9 +191,9 @@ export function claimProfileLock(profile: string): {
 /** Release the profile lock on shutdown — but only a lock this process wrote.
  *  A session that refused a collision stays bound to its previous profile name,
  *  and must not unlock the session that legitimately holds it. */
-export function removeProfileLock(profile: string): void {
+export function removeProfileLock(profile: string, configPath?: string): void {
   try {
-    const path = lockFilePath(profile);
+    const path = lockFilePath(profile, configPath);
     if (readFileSync(path, "utf-8").trim() !== String(process.pid)) return;
     unlinkSync(path);
   } catch { /* ignore */ }

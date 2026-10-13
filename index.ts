@@ -63,6 +63,7 @@ import {
   resolveProfileCreate,
   envProfileName,
   getSessionProfile,
+  getSessionConfigPath,
   setSessionProfile,
   chooseProfile,
   resolveProfileLockCollision,
@@ -938,8 +939,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   async function connectAsProfile(
     name: string,
     notify?: (message: string) => void,
+    selectedPath?: string,
   ): Promise<{ isNew: boolean; connected: boolean }> {
-    const profilePath = profilePathForName(name);
+    const profilePath = selectedPath ?? profilePathForName(name);
     const existedBefore = existsSync(profilePath);
     // Enforce the profile cap at the single creation chokepoint. This covers
     // both relay_switch_profile and a session_start that lands on a brand-new
@@ -949,6 +951,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       profile: profileNameForPath(profilePath),
       exists: existedBefore,
       existingCount: countProfileConfigs(),
+      configPath: profilePath,
     });
     if (creation.action === "refuse") {
       log(`WARN: ${creation.message}`);
@@ -966,7 +969,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     cfg = resolveConfig();
     currentProfile = activeProfileName();
     // Bind the active session → this profile so resume/reload restore it.
-    setSessionProfile(currentSessionId, currentProfile);
+    setSessionProfile(currentSessionId, currentProfile, profilePath);
 
     const isNew = !isConfigured(cfg);
     const c = await ensureConfigured(notify); // provisions a fresh identity if new
@@ -992,13 +995,20 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
   function chooseProfileForSession(
     reason: "startup" | "reload" | "new" | "resume" | "fork",
     sessionId: string | undefined,
-  ): string {
-    return chooseProfile({
+  ): { name: string; path: string } {
+    const envName = envProfileName();
+    const name = chooseProfile({
       reason,
-      envProfile: envProfileName(), // CHAOS_RELAY_CONFIG/PROFILE — pins
+      envProfile: envName, // CHAOS_RELAY_CONFIG/PROFILE — pins
       recordedProfile: getSessionProfile(sessionId), // resume / reload
       inheritedProfile: currentProfile, // inherit on new / fork
     });
+    // Only a resume without an env pin can restore a persisted path. A model
+    // switch always resolves its name anew and cannot inherit this override.
+    const path = reason === "resume" && !envName
+      ? getSessionConfigPath(sessionId) ?? profilePathForName(name)
+      : profilePathForName(name);
+    return { name, path };
   }
 
   /**
@@ -1020,6 +1030,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       profile: slug,
       exists: existsSync(profilePathForName(name)),
       existingCount: countProfileConfigs(),
+      configPath: profilePathForName(name),
     });
     if (creation.action === "refuse") {
       log(`WARN: ${creation.message}`);
@@ -1031,7 +1042,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // live relay registration, so checking (or writing) the lock after it
     // would let two sessions switching to one profile concurrently both
     // connect and share the identity.
-    const claim = claimProfileLock(slug);
+    const targetPath = profilePathForName(name);
+    const claim = claimProfileLock(slug, targetPath);
     if (claim.lockError) {
       log(
         `profile switch: could not create the lock for "${slug}" (${claim.lockError}) — ` +
@@ -1049,6 +1061,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       return decision.message;
     }
     const previousProfile = currentProfile;
+    const previousPath = getConfigPath();
     const { isNew, connected } = await connectAsProfile(name, notify);
     if (!connected) {
       // Release the profile we just left even though the switch FAILED:
@@ -1056,14 +1069,14 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       // holding the old profile's lock would block another session from a
       // profile nobody is using until this process exits. Keep the new claim
       // (the poller keeps retrying the target).
-      if (previousProfile && previousProfile !== slug) removeProfileLock(previousProfile);
+      if (previousProfile && previousPath !== targetPath) removeProfileLock(previousProfile, previousPath);
       return `Switched config to profile "${slug}" but couldn't reach the relay to connect — check your network, then /chaos-relay status.`;
     }
     // Released only after the switch succeeded: this session no longer uses the
     // previous profile, and holding its lock would block another session from
     // taking it for as long as we live. removeProfileLock is pid-guarded, so a
     // profile that is not ours (or not locked) is left alone.
-    if (previousProfile && previousProfile !== slug) removeProfileLock(previousProfile);
+    if (previousProfile && previousPath !== targetPath) removeProfileLock(previousProfile, previousPath);
     const channelCount = cfg.channels.length;
     return isNew
       ? `Created and connected new profile "${slug}" (fresh identity). ` +
@@ -1516,7 +1529,8 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     }
     activeModelAcceptsImages = ctx.model?.input?.includes("image") ?? false;
     currentSessionId = ctx.sessionManager.getSessionId();
-    const chosenProfile = chooseProfileForSession(event.reason, currentSessionId);
+    const selected = chooseProfileForSession(event.reason, currentSessionId);
+    const chosenProfile = selected.name;
 
     // Detect concurrent pi instances on the same relay profile. Two live
     // sessions on one profile fight over the WebSocket push, but auto-creating a
@@ -1528,7 +1542,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     // exclusive create means exactly one of two racing processes can win, so
     // the collision refusal can no longer be defeated by the TOCTOU that
     // existed when the lock was written only after an awaited connect.
-    const claim = claimProfileLock(chosenProfile);
+    const claim = claimProfileLock(chosenProfile, selected.path);
     if (claim.lockError) {
       log(
         `session ${event.reason}: could not create the profile lock (${claim.lockError}) — ` +
@@ -1548,7 +1562,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
     }
     const profile = decision.profile;
 
-    const result = await connectAsProfile(profile, (m) => ctx.ui.notify(m, "warning"));
+    const result = await connectAsProfile(profile, (m) => ctx.ui.notify(m, "warning"), selected.path);
     if (!result.connected) {
       // The profile stays claimed: this session selected the identity, and the
       // poller keeps retrying. Releasing it here would reopen the race.
@@ -1590,7 +1604,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
       clearInterval(attachmentCleanupTimer);
       attachmentCleanupTimer = undefined;
     }
-    removeProfileLock(currentProfile);
+    removeProfileLock(currentProfile, getConfigPath());
   });
 
   pi.on("model_select", (event) => {

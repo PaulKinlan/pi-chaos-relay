@@ -25,6 +25,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   rmSync,
   statSync,
@@ -32,9 +33,11 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { generateKeyPair } from "../crypto.ts";
+import type { SessionBinding } from "../config.ts";
 import { RelayError } from "../relay-client.ts";
 import type { ChannelMessage, GetMessagesResult, RelayClient } from "../relay-client.ts";
 import { MessagePoller } from "../poller.ts";
@@ -244,7 +247,10 @@ function isAlive(pid: number): boolean {
 
 /** Lock path index.ts uses: ~/.pi/chaos-relay-<profile>.lock (homedir() at call time). */
 function lockPath(profile: string): string {
-  return join(PI_DIR, `chaos-relay-${profile}.lock`);
+  const path = config.profilePathForName(profile);
+  const canonical = existsSync(path) ? realpathSync(path) : join(realpathSync(dirname(path)), basename(path));
+  const hash = createHash("sha256").update(canonical).digest("hex").slice(0, 16);
+  return join(PI_DIR, `chaos-relay-${basename(canonical)}-${hash}.lock`);
 }
 
 /** A stand-in WebSocket that can be forced to fail its handshake, so the
@@ -372,9 +378,9 @@ function makeInflightProbe(expected: number, timeoutMs: number) {
 
 const SESSIONS_PATH = join(PI_DIR, "chaos-relay-sessions.json");
 
-function readSessionMap(): Record<string, string> {
+function readSessionMap(): Record<string, SessionBinding> {
   if (!existsSync(SESSIONS_PATH)) return {};
-  return JSON.parse(readFileSync(SESSIONS_PATH, "utf-8")) as Record<string, string>;
+  return JSON.parse(readFileSync(SESSIONS_PATH, "utf-8")) as Record<string, SessionBinding>;
 }
 
 /** Relay-owned files directly under ~/.pi (config files, locks, session map). */
@@ -536,7 +542,7 @@ test("session_start connects as the session's recorded profile when its lock is 
   assert.equal(fake.notifications.length, 0, "no refusal warning when the lock is free");
   assert.equal(config.getConfigPath(), profileFile, "connected as the chosen profile");
   assert.equal(readFileSync(lock, "utf-8"), String(process.pid), "lock claimed by this process");
-  assert.equal(readSessionMap()[sid], "work", "session bound to the chosen profile");
+  assert.equal(readSessionMap()[sid], "work", "legacy name-only binding is preserved");
 
   await callHandler(fake.handlers, "session_shutdown", {}, makeCtx(sid, fake.notifications));
   assert.equal(existsSync(lock), false, "own lock released on shutdown");
@@ -2160,6 +2166,23 @@ test("relay_switch_profile refuses a new profile beyond the cap without writing 
     ),
     `refusal was surfaced as a warning notification (${JSON.stringify(fake.notifications)})`,
   );
+
+  const outsideDir = mkdtempSync(join(tmpdir(), "rg6-cap-"));
+  const explicit = join(outsideDir, "chaos-relay.outside.json");
+  process.env.CHAOS_RELAY_CONFIG = explicit;
+  const outside = makeFakePi();
+  const ctx = makeCtx("rg6-cap-explicit", outside.notifications);
+  try {
+    chaosRelayExtension(outside.pi as unknown as ExtensionApi);
+    await callHandler(outside.handlers, "session_start", { reason: "startup" }, ctx);
+    assert.equal(config.getConfigPath(), explicit, "the full ~/.pi cap does not reject an outside file");
+    assert.equal(outside.notifications.some((n) => n.message.includes("profile cap")), false);
+    await callHandler(outside.handlers, "session_shutdown", {}, ctx);
+  } finally {
+    delete process.env.CHAOS_RELAY_CONFIG;
+    rmSync(outsideDir, { recursive: true, force: true });
+    resetState();
+  }
 });
 
 // ── pi-chaos-relay-bw5: /chaos-relay profile claims the lock before connect ──
@@ -5616,4 +5639,52 @@ test("a replacement session receives the emailed image after the first session i
     2,
     "the replacement re-fetched the attachment: the image was DELAYED, not dropped",
   );
+});
+
+test("rg6: a persisted explicit path resumes without env; a missing path degrades to name", async () => {
+  resetState();
+  const namesake = writeProfileConfig("staging", "ak_rg6_namesake");
+  const outsideDir = mkdtempSync(join(tmpdir(), "rg6-resume-"));
+  const explicit = join(outsideDir, "chaos-relay.staging.json");
+  writeFileSync(explicit, JSON.stringify({ relayUrl: OFFLINE_RELAY_URL, apiKey: "ak_rg6_explicit" }));
+  const sid = "rg6-explicit-resume";
+  process.env.CHAOS_RELAY_CONFIG = explicit;
+  const first = makeFakePi();
+  const ctx = makeCtx(sid, first.notifications);
+  try {
+    chaosRelayExtension(first.pi as unknown as ExtensionApi);
+    await callHandler(first.handlers, "session_start", { reason: "startup" }, ctx);
+    assert.deepEqual(readSessionMap()[sid], { profile: "staging", path: explicit });
+    await callHandler(first.handlers, "session_shutdown", {}, ctx);
+    delete process.env.CHAOS_RELAY_CONFIG;
+    const resumed = makeFakePi();
+    chaosRelayExtension(resumed.pi as unknown as ExtensionApi);
+    await callHandler(resumed.handlers, "session_start", { reason: "resume" }, ctx);
+    assert.equal(config.getConfigPath(), explicit);
+    assert.equal(config.messageStatePath(), `${explicit}.state`);
+    // A model-requested switch is name-based even while the resumed session
+    // holds a recorded explicit path for that same name.
+    const switchTool = resumed.tools.find((tool) => tool.name === "relay_switch_profile");
+    assert.ok(switchTool);
+    const execute = switchTool.execute as (id: string, params: { name: string }, signal: unknown,
+      onUpdate: unknown, ctx: unknown) => Promise<unknown>;
+    await execute("rg6-switch", { name: "staging" }, undefined, undefined,
+      { ui: { notify: () => {} } });
+    assert.equal(config.getConfigPath(), namesake, "model switch resolves the name, not the recorded path");
+    await callHandler(resumed.handlers, "session_shutdown", {}, ctx);
+
+    rmSync(explicit);
+    config.setSessionProfile(sid, "staging", explicit);
+    // The saved record is not rewritten or dropped merely because its file
+    // vanished. Resolution falls back to the existing ~/.pi namesake.
+    const fallback = makeFakePi();
+    chaosRelayExtension(fallback.pi as unknown as ExtensionApi);
+    await callHandler(fallback.handlers, "session_start", { reason: "resume" }, ctx);
+    assert.equal(config.getConfigPath(), namesake);
+    await callHandler(fallback.handlers, "session_shutdown", {}, ctx);
+  } finally {
+    delete process.env.CHAOS_RELAY_CONFIG;
+    rmSync(outsideDir, { recursive: true, force: true });
+    resetState();
+  }
 });
