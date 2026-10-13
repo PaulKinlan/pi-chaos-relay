@@ -870,7 +870,11 @@ function mergeLegacyMessageState(
       ? [...sidecarIds, ...legacyOnlyIds]
       : [...legacyOnlyIds, ...sidecarIds]
   ).slice(-MERGED_SEEN_MAX);
-  const reason = `message-state side-car ${messageStatePath()} is behind the legacy in-config state`;
+  // "differs from", not "is behind": since the equal-cursor tie fix this merge also
+  // runs when the cursors are EQUAL and only the id logs differ, where "behind" is
+  // not strictly true and misleads an operator investigating a re-delivery. The
+  // details below already say whether the legacy cursor is the newer one.
+  const reason = `message-state side-car ${messageStatePath()} differs from the legacy in-config state`;
   if (!warnedCorruptStates.has(reason)) {
     warnedCorruptStates.add(reason);
     const details: string[] = [];

@@ -1169,7 +1169,7 @@ test("7vk: a stale side-car never rewinds the cursor or drops newer legacy de-du
       seenIds: NEWER_LEGACY_IDS,
     });
     assert.equal(warnings.length, 1);
-    assert.ok(warnings[0].includes("behind the legacy in-config state"), warnings[0]);
+    assert.ok(warnings[0].includes("differs from the legacy in-config state"), warnings[0]);
     assert.ok(warnings[0].includes("MERGED rather than replaced"), warnings[0]);
     // Warn once per path, not once per load.
     loadMessageState();
