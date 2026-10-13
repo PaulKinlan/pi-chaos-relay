@@ -1318,6 +1318,41 @@ test("7vk: a requeue's deliberate rewind is never undone by the legacy-fields me
   });
 });
 
+test("dri: a LATER side-car cursor is not reported as 'the same instant'", () => {
+  // Both cursors parse and the legacy one is not newer, but the side-car is LATER and there
+  // are legacy-only ids, so the merge still runs. Inferring equality from "not legacy-newer"
+  // reported "the same instant" for cursors a day apart (review round 1, P1).
+  const sidecarIds = Array.from({ length: 10 }, (_, i) => `s${i}`);
+  const legacyIds = Array.from({ length: 10 }, (_, i) => `l${i}`);
+  withTempConfig((path, warnings) => {
+    savePersisted({ messagesCursor: "2026-01-01T00:00:00Z", seenMessageIds: legacyIds });
+    writeFileSync(
+      `${path}.state`,
+      JSON.stringify({ cursor: "2026-01-02T00:00:00Z", seenIds: sidecarIds }),
+    );
+    const merged = loadMessageState();
+    assert.equal(merged.cursor, "2026-01-02T00:00:00Z", "the later cursor still wins");
+    const said = warnings.join(" ");
+    assert.doesNotMatch(said, /same instant/, "a later side-car must not be called 'the same instant'");
+    assert.match(said, /the side-car cursor .* is newer than the legacy cursor/, said);
+  });
+});
+
+test("dri: equal instants written differently are not claimed to be identical text", () => {
+  const ids = Array.from({ length: 5 }, (_, i) => `x${i}`);
+  withTempConfig((path, warnings) => {
+    savePersisted({ messagesCursor: "2026-01-01T00:00:00Z", seenMessageIds: ids });
+    writeFileSync(
+      `${path}.state`,
+      JSON.stringify({ cursor: "2025-12-31T19:00:00-05:00", seenIds: [] }),
+    );
+    loadMessageState();
+    const said = warnings.join(" ");
+    assert.match(said, /represent the same instant/, said);
+    assert.doesNotMatch(said, /only the de-dup logs differ/, "Z and -05:00 are equal instants, not equal text");
+  });
+});
+
 test("7vk: equal or unparseable cursors keep the side-car's log, not the older legacy one", () => {
   const sidecarIds = Array.from({ length: 1000 }, (_, i) => `s${i}`);
   const legacyIds = Array.from({ length: 500 }, (_, i) => `l${i}`);
@@ -1332,6 +1367,11 @@ test("7vk: equal or unparseable cursors keep the side-car's log, not the older l
     const merged = loadMessageState();
     assert.equal(merged.seenIds.length, 1000);
     assert.deepEqual(merged.seenIds, sidecarIds, "equal cursors must not evict the side-car's log");
+    assert.match(
+      warnings.join(" "),
+      /the two cursors represent the same instant/,
+      "the merge warning must say WHICH case applied, not leave it to be guessed",
+    );
   });
   // Neither cursor parses: the same rule applies.
   withTempConfig((path, warnings) => {
