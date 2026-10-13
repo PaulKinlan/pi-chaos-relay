@@ -542,6 +542,74 @@ test("session_start connects as the session's recorded profile when its lock is 
   assert.equal(existsSync(lock), false, "own lock released on shutdown");
 });
 
+test("0tf: session_start binds an explicit CHAOS_RELAY_CONFIG path outside ~/.pi, and reads and writes land there", async () => {
+  // pi-chaos-relay-0tf: session_start reduced the explicit path to the profile name
+  // "staging" and connectAsProfile rebuilt it as ~/.pi/chaos-relay.staging.json. A
+  // decoy of that name with a DIFFERENT apiKey shows which file the session used.
+  resetState();
+  writeProfileConfig("default", "ak_0tf_default");
+  const decoyFile = writeProfileConfig("staging", "ak_0tf_decoy");
+  const decoyState = `${decoyFile}.state`;
+  rmSync(decoyState, { force: true });
+  const outsideDir = mkdtempSync(join(tmpdir(), "pi-chaos-relay-0tf-outside-"));
+  const explicitFile = join(outsideDir, "chaos-relay.staging.json");
+  writeFileSync(
+    explicitFile,
+    JSON.stringify({ relayUrl: OFFLINE_RELAY_URL, apiKey: "ak_0tf_explicit" }) + "\n",
+  );
+  process.env.CHAOS_RELAY_CONFIG = explicitFile;
+  const origWs = globalThis.WebSocket;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+  const fake = makeFakePi();
+  const sid = "sess-0tf-explicit";
+  const ctx = makeCtx(sid, fake.notifications);
+  let shutDown = false;
+  try {
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, ctx);
+
+    assert.equal(config.getConfigPath(), explicitFile, "the session is bound to the explicit file");
+    assert.equal(config.messageStatePath(), `${explicitFile}.state`);
+    // READ: the live connection carries the explicit file's apiKey, never the decoy's.
+    const socket = socketForProfile("ak_0tf_explicit");
+    assert.equal(
+      PushWebSocket.instances.some((s) => socketCarries(s, "ak_0tf_decoy")),
+      false,
+      "no connection was opened with the ~/.pi namesake's apiKey",
+    );
+
+    // WRITE: a delivered message's de-dup state lands beside the explicit file.
+    socket.pushFrame(
+      JSON.stringify({
+        type: "message",
+        message: {
+          id: "m-0tf-1",
+          channelType: "telegram",
+          channelId: "chan-0tf",
+          from: "alice",
+          content: "which file?",
+          timestamp: "2026-10-13T00:00:01.000Z",
+        },
+      }),
+    );
+    await waitFor(() => fake.sent.length > 0);
+    shutDown = true;
+    await callHandler(fake.handlers, "session_shutdown", {}, ctx);
+    const state = JSON.parse(readFileSync(`${explicitFile}.state`, "utf-8")) as { seenIds: string[] };
+    assert.ok(state.seenIds.includes("m-0tf-1"), `state written beside the explicit file: ${JSON.stringify(state)}`);
+    assert.equal(existsSync(decoyState), false, "nothing was written to the ~/.pi namesake's side-car");
+  } finally {
+    if (!shutDown) await callHandler(fake.handlers, "session_shutdown", {}, ctx).catch(() => {});
+    globalThis.WebSocket = origWs;
+    delete process.env.CHAOS_RELAY_CONFIG;
+    rmSync(decoyState, { force: true });
+    rmSync(decoyFile, { force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+    resetState();
+  }
+});
+
 test("session_start refusal leaves an unbound session unbound and mints no identity", async (t) => {
   resetState();
   const defaultFile = writeProfileConfig("default", "ak_default_offline");

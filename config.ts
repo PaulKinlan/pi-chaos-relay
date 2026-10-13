@@ -10,7 +10,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 
 import type { KeyPairJwk } from "./crypto.ts";
 
@@ -25,7 +25,8 @@ export const CONFIG_DIR = join(homedir(), ".pi");
  * (its own ECDSA keypair → userId → message queue), so two pi instances on the
  * same machine can hold distinct connections instead of sharing one:
  *
- *   CHAOS_RELAY_CONFIG=/abs/path.json   explicit file (highest precedence)
+ *   CHAOS_RELAY_CONFIG=/abs/path.json   explicit file (highest precedence;
+ *                                       a leading ~/ expands to the home dir)
  *   CHAOS_RELAY_PROFILE=work            → ~/.pi/chaos-relay.work.json
  *   (unset / "default")                 → ~/.pi/chaos-relay.json  (back-compat)
  *
@@ -36,13 +37,33 @@ export function configPathFor(
   dir: string = CONFIG_DIR,
 ): string {
   const explicit = env.CHAOS_RELAY_CONFIG?.trim();
-  if (explicit) return explicit;
+  if (explicit) return explicitConfigPath(env) ?? explicit;
   const profile = (env.CHAOS_RELAY_PROFILE ?? "").trim().toLowerCase()
     .replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
   const file = profile && profile !== "default"
     ? `chaos-relay.${profile}.json`
     : "chaos-relay.json";
   return join(dir, file);
+}
+
+/**
+ * The file CHAOS_RELAY_CONFIG names when its value is an explicit PATH — it
+ * starts with `/` or `~/`, or contains a path separator — with a leading `~/`
+ * expanded to the home directory. Undefined for an unset value and for a bare
+ * value (`staging`, `chaos-relay.staging.json`), which keeps its older meaning:
+ * a profile name that profilePathForName resolves under CONFIG_DIR.
+ *
+ * The operator sets this path, so it may point anywhere. A profile NAME, which
+ * relay_switch_profile accepts from the model, still cannot pick a path: names
+ * are slugified by configPathFor, and profilePathForName returns this path only
+ * for the one name it derives to.
+ */
+function explicitConfigPath(env: Record<string, string | undefined>): string | undefined {
+  const explicit = env.CHAOS_RELAY_CONFIG?.trim();
+  if (!explicit) return undefined;
+  if (explicit.startsWith("~/")) return join(homedir(), explicit.slice(2));
+  if (explicit.includes("/") || explicit.includes(sep)) return explicit;
+  return undefined;
 }
 
 function envOf(): Record<string, string | undefined> {
@@ -231,9 +252,28 @@ export function setActiveConfigPath(path: string): void {
   stateMigrated = false;
 }
 
-/** Absolute path for a named profile ("default" → chaos-relay.json). */
-export function profilePathForName(name: string): string {
-  return configPathFor({ CHAOS_RELAY_PROFILE: name }, CONFIG_DIR);
+/**
+ * Config file path for a named profile ("default" → chaos-relay.json).
+ *
+ * When CHAOS_RELAY_CONFIG is an explicit path, the name envProfileName derives
+ * from it maps back to THAT file, not to a namesake under CONFIG_DIR. Session
+ * start and profile switches pass names, so without this the operator's file
+ * (and its `.state` side-car) was swapped for ~/.pi/chaos-relay.<name>.json
+ * (pi-chaos-relay-0tf). Every other name resolves under CONFIG_DIR as before.
+ */
+export function profilePathForName(
+  name: string,
+  env: Record<string, string | undefined> = envOf(),
+): string {
+  const underConfigDir = configPathFor({ CHAOS_RELAY_PROFILE: name }, CONFIG_DIR);
+  const explicitPath = explicitConfigPath(env);
+  if (explicitPath) {
+    const explicitName = profileNameForPath(explicitPath);
+    if (name === explicitName || profileNameForPath(underConfigDir) === explicitName) {
+      return explicitPath;
+    }
+  }
+  return underConfigDir;
 }
 
 /** Profile name for a config path ("default" for the base chaos-relay.json). */

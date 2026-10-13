@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync, copyFileSync, mkdirSync, rmSync, rmdirSync, statSync, symlinkSync, lstatSync, mkdtempSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
   DEFAULT_RELAY_URL,
@@ -13,7 +13,10 @@ import {
   MIN_POLL_INTERVAL_MS,
   getConfigPath,
   configPathFor,
+  CONFIG_DIR,
   envProfileName,
+  messageStatePath,
+  profilePathForName,
   applySessionProfile,
   chooseProfile,
   isConfigured,
@@ -140,6 +143,85 @@ test("envProfileName: derives the name from env profile / config", () => {
     envProfileName({ CHAOS_RELAY_CONFIG: "/abs/chaos-relay.staging.json" }),
     "staging",
   );
+});
+
+// --- pi-chaos-relay-0tf: an explicit CHAOS_RELAY_CONFIG path survives the name round trip
+// Session start and profile switches pass a profile NAME to connectAsProfile, which
+// rebuilds the path with profilePathForName. These pin that the name derived from an
+// explicit path maps back to that path, not to a namesake under CONFIG_DIR.
+
+const OUTSIDE_PI = "/srv/relay-0tf/chaos-relay.staging.json";
+
+test("0tf: an explicit absolute CHAOS_RELAY_CONFIG outside ~/.pi binds exactly that file", () => {
+  const env = { CHAOS_RELAY_CONFIG: OUTSIDE_PI };
+  const name = envProfileName(env);
+  assert.equal(name, "staging");
+  assert.equal(profilePathForName(name!, env), OUTSIDE_PI);
+  assert.notEqual(profilePathForName(name!, env), join(CONFIG_DIR, "chaos-relay.staging.json"));
+});
+
+test("0tf: the explicit file's state side-car is <that file>.state", () => {
+  const env = { CHAOS_RELAY_CONFIG: OUTSIDE_PI };
+  const before = getConfigPath();
+  try {
+    setActiveConfigPath(profilePathForName(envProfileName(env)!, env));
+    assert.equal(getConfigPath(), OUTSIDE_PI);
+    assert.equal(messageStatePath(), `${OUTSIDE_PI}.state`);
+  } finally {
+    setActiveConfigPath(before);
+  }
+});
+
+test("0tf: a ~/-prefixed CHAOS_RELAY_CONFIG expands to the home directory", () => {
+  const env = { CHAOS_RELAY_CONFIG: "~/relay-0tf/chaos-relay.work.json" };
+  const expanded = join(homedir(), "relay-0tf", "chaos-relay.work.json");
+  assert.equal(configPathFor(env, "/cfg"), expanded);
+  assert.equal(envProfileName(env), "work");
+  assert.equal(profilePathForName("work", env), expanded);
+});
+
+test("0tf: a relative CHAOS_RELAY_CONFIG with a separator is kept verbatim", () => {
+  const env = { CHAOS_RELAY_CONFIG: "conf/chaos-relay.staging.json" };
+  assert.equal(configPathFor(env, "/cfg"), "conf/chaos-relay.staging.json");
+  assert.equal(profilePathForName("staging", env), "conf/chaos-relay.staging.json");
+});
+
+test("0tf: an explicit basename that is not chaos-relay[.x].json still maps back to its file", () => {
+  const env = { CHAOS_RELAY_CONFIG: "/etc/relay-0tf/custom.json" };
+  assert.equal(envProfileName(env), "custom.json");
+  assert.equal(profilePathForName(envProfileName(env)!, env), "/etc/relay-0tf/custom.json");
+});
+
+test("0tf: back-compat — a bare name or bare basename in CHAOS_RELAY_CONFIG resolves as before", () => {
+  // configPathFor keeps the value verbatim, and the session binds the CONFIG_DIR
+  // profile of the derived name: both unchanged from the pre-0tf behaviour.
+  for (const value of ["staging", "chaos-relay.staging.json"]) {
+    const env = { CHAOS_RELAY_CONFIG: value };
+    assert.equal(configPathFor(env, "/cfg"), value);
+    assert.equal(envProfileName(env), "staging");
+    assert.equal(
+      profilePathForName(envProfileName(env)!, env),
+      join(CONFIG_DIR, "chaos-relay.staging.json"),
+    );
+  }
+});
+
+test("0tf: other names, and CHAOS_RELAY_PROFILE alone, still resolve under CONFIG_DIR", () => {
+  const env = { CHAOS_RELAY_CONFIG: OUTSIDE_PI };
+  assert.equal(profilePathForName("work", env), join(CONFIG_DIR, "chaos-relay.work.json"));
+  assert.equal(profilePathForName("default", env), join(CONFIG_DIR, "chaos-relay.json"));
+  // A model-supplied name still cannot steer the path: it is slugified under CONFIG_DIR.
+  assert.equal(dirname(profilePathForName("../../etc/passwd", env)), CONFIG_DIR);
+  const profileOnly = { CHAOS_RELAY_PROFILE: "staging" };
+  assert.equal(envProfileName(profileOnly), "staging");
+  assert.equal(
+    profilePathForName("staging", profileOnly),
+    join(CONFIG_DIR, "chaos-relay.staging.json"),
+  );
+  // Both set: CHAOS_RELAY_CONFIG wins (it names a file, the profile only a name).
+  const both = { CHAOS_RELAY_CONFIG: OUTSIDE_PI, CHAOS_RELAY_PROFILE: "work" };
+  assert.equal(envProfileName(both), "staging");
+  assert.equal(profilePathForName(envProfileName(both)!, both), OUTSIDE_PI);
 });
 
 test("applySessionProfile: records and updates a session's profile", () => {
