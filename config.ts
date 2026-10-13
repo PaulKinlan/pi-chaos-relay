@@ -878,10 +878,41 @@ function mergeLegacyMessageState(
   if (!warnedCorruptStates.has(reason)) {
     warnedCorruptStates.add(reason);
     const details: string[] = [];
+    // Name WHICH case this is, not just the legacy-newer one: the merge also runs when the
+    // side-car is later, when the cursors are the same instant, and when neither parses.
+    // An operator who sees "differs from" and nothing else cannot tell which side won.
+    const sidecarCursor = sidecar.cursor;
+    const parses = (value: string | undefined): boolean =>
+      typeof value === "string" && value !== "" && !Number.isNaN(Date.parse(value));
     if (legacyCursorNewer) {
       details.push(
-        `the legacy cursor ${legacyCursor} is newer than the side-car cursor ${sidecar.cursor ?? "(none)"}`,
+        `the legacy cursor ${legacyCursor} is newer than the side-car cursor ${sidecarCursor ?? "(none)"}`,
       );
+    } else {
+      // Compare the parsed INSTANTS rather than inferring equality from "not legacy-newer":
+      // a LATER side-car with legacy-only ids also merges, and calling that "the same
+      // instant" would be flatly wrong (review round 1, P1). Equal instants are separate
+      // from equal text, too: Z and +00:00 are the same moment, so the wording must not
+      // claim the id logs are the only difference (P2).
+      const sidecarMs = parses(sidecarCursor) ? Date.parse(sidecarCursor as string) : undefined;
+      const legacyMs = parses(legacyCursor) ? Date.parse(legacyCursor as string) : undefined;
+      if (sidecarMs !== undefined && legacyMs !== undefined && sidecarMs === legacyMs) {
+        details.push(
+          `the two cursors represent the same instant (${sidecarCursor} / ${legacyCursor}); the merge is about the differing de-dup logs`,
+        );
+      } else if (sidecarMs !== undefined && (legacyMs === undefined || sidecarMs > legacyMs)) {
+        details.push(
+          `the side-car cursor ${sidecarCursor} is newer than the legacy cursor ${legacyCursor ?? "(none)"}`,
+        );
+      } else if (legacyMs !== undefined) {
+        details.push(
+          `the legacy cursor ${legacyCursor} is the usable one; the side-car cursor ${sidecarCursor ?? "(none)"} is not a parseable timestamp`,
+        );
+      } else {
+        details.push(
+          `neither cursor is a parseable timestamp (side-car ${sidecarCursor ?? "(none)"}, legacy ${legacyCursor ?? "(none)"}); the side-car was kept`,
+        );
+      }
     }
     if (legacyOnlyIds.length > 0) {
       details.push(`${legacyOnlyIds.length} de-dup id(s) exist only in the legacy fields`);
