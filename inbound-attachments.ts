@@ -145,11 +145,17 @@ function imageMimeFromMagic(bytes: Uint8Array, claimed: string): string | undefi
   return undefined;
 }
 
-/** Remove only stale children from the extension-owned private temp root. */
+/** Remove only stale children from each extension-owned private temp root. */
 export async function cleanupStaleInboundAttachments(
   root = defaultInboundAttachmentRoot(),
   now = Date.now(),
 ): Promise<void> {
+  await cleanupOneInboundAttachmentRoot(root, now);
+  const fallback = fallbackInboundAttachmentRoot();
+  if (fallback !== root) await cleanupOneInboundAttachmentRoot(fallback, now);
+}
+
+async function cleanupOneInboundAttachmentRoot(root: string, now: number): Promise<void> {
   let entries;
   try {
     const rootInfo = await lstat(root);
