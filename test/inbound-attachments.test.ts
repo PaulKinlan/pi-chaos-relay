@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -215,19 +215,81 @@ test("materializer refuses more than three descriptors per message", async () =>
   assert.equal(calls, 3);
 });
 
+test("0p3: cleanup removes stale children in both roots while preserving fresh children", async () => {
+  const sandbox = await mkdtemp(join(tmpdir(), "relay-inbound-0p3-"));
+  const runtime = join(sandbox, "runtime");
+  const temp = join(sandbox, "temp");
+  await mkdir(runtime);
+  await mkdir(temp);
+  try {
+    await withEnv({ XDG_RUNTIME_DIR: runtime, TMPDIR: temp }, async () => {
+      const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+      const preferred = join(runtime, `pi-chaos-relay-inbound-${uid}`);
+      const fallback = join(temp, `pi-chaos-relay-inbound-${uid}`);
+      const now = Date.now();
+      const old = new Date(now - 25 * 60 * 60 * 1000);
+      for (const root of [preferred, fallback]) {
+        await mkdir(root);
+        await mkdir(join(root, "a".repeat(24)));
+        await utimes(join(root, "a".repeat(24)), old, old);
+        await mkdir(join(root, "b".repeat(24)));
+        await mkdir(join(root, "do-not-touch"));
+      }
+      await cleanupStaleInboundAttachments(undefined, now);
+      for (const root of [preferred, fallback]) {
+        await assert.rejects(stat(join(root, "a".repeat(24))), { code: "ENOENT" });
+        assert.equal((await stat(join(root, "b".repeat(24)))).isDirectory(), true);
+        assert.equal((await stat(join(root, "do-not-touch"))).isDirectory(), true);
+      }
+    });
+  } finally {
+    await rm(sandbox, { recursive: true, force: true });
+  }
+});
+
+test("0p3: cleanup does not create an unused fallback root", async () => {
+  const sandbox = await mkdtemp(join(tmpdir(), "relay-inbound-0p3-empty-"));
+  const runtime = join(sandbox, "runtime");
+  const temp = join(sandbox, "temp");
+  await mkdir(runtime);
+  await mkdir(temp);
+  try {
+    await withEnv({ XDG_RUNTIME_DIR: runtime, TMPDIR: temp }, async () => {
+      const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+      const fallback = join(temp, `pi-chaos-relay-inbound-${uid}`);
+      await cleanupStaleInboundAttachments();
+      await assert.rejects(stat(fallback), { code: "ENOENT" });
+    });
+  } finally {
+    await rm(sandbox, { recursive: true, force: true });
+  }
+});
+
 test("cleanup removes stale owned directories but leaves fresh and unrelated entries", async () => {
-  const root = await mkdtemp(join(tmpdir(), "relay-inbound-test-"));
-  const stale = join(root, "a".repeat(24));
-  const fresh = join(root, "b".repeat(24));
-  const unrelated = join(root, "do-not-touch");
-  await mkdir(stale);
-  await mkdir(fresh);
-  await mkdir(unrelated);
-  await writeFile(join(stale, "x"), "x");
-  const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
-  await utimes(stale, old, old);
-  await cleanupStaleInboundAttachments(root);
-  await assert.rejects(stat(stale));
-  assert.equal((await stat(fresh)).isDirectory(), true);
-  assert.equal((await stat(unrelated)).isDirectory(), true);
+  const sandbox = await mkdtemp(join(tmpdir(), "relay-inbound-test-"));
+  const runtime = join(sandbox, "runtime");
+  const temp = join(sandbox, "temp");
+  await mkdir(runtime);
+  await mkdir(temp);
+  try {
+    await withEnv({ XDG_RUNTIME_DIR: runtime, TMPDIR: temp }, async () => {
+      const root = join(runtime, "custom-root");
+      await mkdir(root);
+      const stale = join(root, "a".repeat(24));
+      const fresh = join(root, "b".repeat(24));
+      const unrelated = join(root, "do-not-touch");
+      await mkdir(stale);
+      await mkdir(fresh);
+      await mkdir(unrelated);
+      await writeFile(join(stale, "x"), "x");
+      const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+      await utimes(stale, old, old);
+      await cleanupStaleInboundAttachments(root);
+      await assert.rejects(stat(stale));
+      assert.equal((await stat(fresh)).isDirectory(), true);
+      assert.equal((await stat(unrelated)).isDirectory(), true);
+    });
+  } finally {
+    await rm(sandbox, { recursive: true, force: true });
+  }
 });
