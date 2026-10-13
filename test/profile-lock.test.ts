@@ -13,7 +13,7 @@
  * resolves homedir() per call, so every path here stays inside a throwaway
  * directory and the real ~/.pi is never touched.
  */
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
@@ -25,6 +25,13 @@ const HOME_DIR = mkdtempSync(join(tmpdir(), "pi-chaos-relay-lock-test-"));
 const PI_DIR = join(HOME_DIR, ".pi");
 mkdirSync(PI_DIR, { recursive: true });
 process.env.HOME = HOME_DIR;
+
+// mkx: this directory was never removed, so every run of this file left one behind under the
+// temp dir. after() covers the normal path and still runs when a test fails; the exit handler
+// covers a run that is cut short, which works here because rmSync is synchronous.
+const removeHomeDir = () => rmSync(HOME_DIR, { recursive: true, force: true });
+after(removeHomeDir);
+process.once("exit", removeHomeDir);
 
 const { claimProfileLock, removeProfileLock } = await import("../profile-lock.ts");
 
