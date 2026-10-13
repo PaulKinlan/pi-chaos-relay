@@ -43,8 +43,9 @@ test("importing fast-gate does not run the gate", () => {
 test("a mapped module selects its own tests and its importers' tests", () => {
   const selection = selectTests(["config.ts"]);
   assert.equal(selection.mode, "affected");
-  // approval-policy.ts imports config.ts, so its test can catch a config change.
-  assert.deepEqual(selection.tests, ["test/approval-policy.test.ts", "test/config.test.ts"]);
+  // approval-policy.ts and profile-lock.ts import config.ts, so their tests
+  // can catch a config change.
+  assert.deepEqual(selection.tests, ["test/approval-policy.test.ts", "test/config.test.ts", "test/profile-lock.test.ts"]);
 
   // relay-client is imported by poller, ws-client, inbound-attachments and
   // inbound-message, so a change there can change their behaviour too — all five
@@ -78,7 +79,7 @@ test("several isolated modules union their tests, sorted and deduped", () => {
   assert.equal(selection.mode, "affected");
   // url-redact fans out to every module that imports it (relay-client, ws-client,
   // inbound-attachments and poller through relay-client); config reaches
-  // approval-policy. The closure guard test proves these edges are complete:
+  // approval-policy and profile-lock. The closure guard test proves these edges are complete:
   // it is what caught the two new edges when approvals.ts extracted the summary
   // (approvals.ts imports parseConnectInput and redactCommandSecrets, so connect
   // and url-redact changes can now affect the approvals tests).
@@ -90,6 +91,7 @@ test("several isolated modules union their tests, sorted and deduped", () => {
     "test/inbound-attachments.test.ts",
     "test/inbound-message.test.ts",
     "test/poller.test.ts",
+    "test/profile-lock.test.ts",
     "test/relay-client.test.ts",
     "test/url-redact.test.ts",
     "test/ws-client.test.ts",
@@ -158,6 +160,7 @@ test("paths are normalised before matching (./ prefix, backslashes)", () => {
   assert.deepEqual(selectTests(["./config.ts"]).tests, [
     "test/approval-policy.test.ts",
     "test/config.test.ts",
+    "test/profile-lock.test.ts",
   ]);
   // A Windows-style separator still lands under test/ and must force the full suite.
   assert.equal(selectTests(["test\\config.test.ts"]).mode, "full");

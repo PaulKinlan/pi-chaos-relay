@@ -61,7 +61,7 @@ export const INTEGRATION_TEST = "test/index.test.ts";
 export const MODULE_TESTS: Record<string, string[]> = {
   "approval-policy.ts": ["test/approval-policy.test.ts"],
   "approvals.ts": ["test/approvals.test.ts"],
-  "config.ts": ["test/approval-policy.test.ts", "test/config.test.ts"],
+  "config.ts": ["test/approval-policy.test.ts", "test/config.test.ts", "test/profile-lock.test.ts"],
   "connect.ts": ["test/approvals.test.ts", "test/connect.test.ts"],
   "crypto.ts": [
     "test/approval-policy.test.ts",
@@ -71,6 +71,7 @@ export const MODULE_TESTS: Record<string, string[]> = {
     "test/inbound-attachments.test.ts",
     "test/inbound-message.test.ts",
     "test/poller.test.ts",
+    "test/profile-lock.test.ts",
     "test/relay-client.test.ts",
     "test/ws-client.test.ts",
   ],

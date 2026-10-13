@@ -18,6 +18,7 @@ import {
   messageStatePath,
   profilePathForName,
   applySessionProfile,
+  type SessionBinding,
   chooseProfile,
   isConfigured,
   isValidRelayUrl,
@@ -225,7 +226,7 @@ test("0tf: other names, and CHAOS_RELAY_PROFILE alone, still resolve under CONFI
 });
 
 test("applySessionProfile: records and updates a session's profile", () => {
-  let map: Record<string, string> = {};
+  let map: Record<string, SessionBinding> = {};
   map = applySessionProfile(map, "sess-A", "work");
   map = applySessionProfile(map, "sess-B", "home");
   assert.deepEqual(map, { "sess-A": "work", "sess-B": "home" });
@@ -236,7 +237,7 @@ test("applySessionProfile: records and updates a session's profile", () => {
 });
 
 test("applySessionProfile: trims oldest beyond the cap (LRU by write)", () => {
-  let map: Record<string, string> = {};
+  let map: Record<string, SessionBinding> = {};
   for (let i = 0; i < 5; i++) map = applySessionProfile(map, `s${i}`, "p", 3);
   // Only the 3 most recently written survive.
   assert.deepEqual(Object.keys(map), ["s2", "s3", "s4"]);
@@ -1617,4 +1618,11 @@ test("resolveConfig: a plaintext external URL is skipped like any invalid candid
       );
     },
   );
+});
+
+test("rg6: an explicit path outside ~/.pi is outside the profile cap", () => {
+  assert.equal(resolveProfileCreate({ profile: "staging", exists: false,
+    existingCount: MAX_PROFILE_CONFIGS, configPath: "/srv/relay/chaos-relay.staging.json" }).action, "allow");
+  assert.equal(resolveProfileCreate({ profile: "staging", exists: false,
+    existingCount: MAX_PROFILE_CONFIGS, configPath: join(CONFIG_DIR, "chaos-relay.staging.json") }).action, "refuse");
 });

@@ -128,7 +128,11 @@ two instances with `CHAOS_RELAY_PROFILE=<name>` as above.
 **Profiles are bound to the pi session.** Each session remembers the profile it
 was using (in `~/.pi/chaos-relay-sessions.json`, keyed by pi's session id), so
 **resuming a session reconnects as the same identity** — not a machine-global
-guess. The profile a session connects as is chosen, in order:
+guess. New records store both the profile name and resolved config path. On resume
+without an env pin, an existing recorded path wins; if its file has disappeared,
+the name resolves under `~/.pi` instead. Older name-only records still work.
+Interactive profile switches always resolve by name, never by a recorded path.
+The profile a session connects as is chosen, in order:
 
 1. **Explicit env** — `CHAOS_RELAY_CONFIG` / `CHAOS_RELAY_PROFILE` (and it pins:
    the session is recorded as that profile)
@@ -149,11 +153,16 @@ the extension **refuses to connect** rather than switching identity:
 
 ```
 Relay profile "default" is already held by another live pi session (PID 12345).
-Lock file: /home/you/.pi/chaos-relay-default.lock. This session will not switch
-to a new identity. Resolve it by closing that session, or give this one its own
-profile: launch with CHAOS_RELAY_PROFILE=<name> pi, or run /chaos-relay profile
-<name> here.
+Lock file: /home/you/.pi/chaos-relay-chaos-relay.json-<path-hash>.lock.
+This session will not switch to a new identity. Resolve it by closing that
+session, or give this one its own profile: launch with
+CHAOS_RELAY_PROFILE=<name> pi, or run /chaos-relay profile <name> here.
 ```
+
+Locks are keyed by the canonical config-file path: two sessions using the same
+file conflict, while an explicit file and its `~/.pi` namesake do not.
+The 100-file profile cap applies only to new files under `~/.pi`, not to explicit
+config paths outside it.
 
 You get that as a `ctx.ui.notify` at `session_start` and in
 `~/.pi/agent/logs/chaos-relay.log`. The session is left **unbound** — on the

@@ -10,7 +10,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, dirname, join, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 
 import type { KeyPairJwk } from "./crypto.ts";
 
@@ -90,14 +90,16 @@ let activeConfigPath = configPathFor(envOf());
 // ── Session → profile map ─────────────────────────────────────────────────
 // Which relay profile each pi SESSION is bound to, so resuming a session
 // reconnects as the identity it was using (not a machine-global guess). Keyed by
-// pi's stable session id. Holds profile names only — not secrets.
+// pi's stable session id. Holds profile names and resolved config paths, not secrets.
 const SESSION_MAP_PATH = join(CONFIG_DIR, "chaos-relay-sessions.json");
 const SESSION_MAP_MAX = 200; // LRU cap so the map can't grow unbounded
 
 /** (path, reason) pairs already warned about for the session→profile map. */
 const warnedCorruptSessionMaps = new Set<string>();
 
-function warnCorruptSessionMap(reason: string): Record<string, string> {
+export type SessionBinding = string | { profile: string; path: string };
+
+function warnCorruptSessionMap(reason: string): Record<string, SessionBinding> {
   if (!warnedCorruptSessionMaps.has(reason)) {
     warnedCorruptSessionMaps.add(reason);
     console.warn(`pi-chaos-relay: ${reason} — ignoring the session→profile map.`);
@@ -112,7 +114,7 @@ function warnCorruptSessionMap(reason: string): Record<string, string> {
  * (an interrupted or concurrent write) degrades to an empty map with ONE warning
  * instead of throwing on the session-start path.
  */
-export function loadSessionMap(): Record<string, string> {
+export function loadSessionMap(): Record<string, SessionBinding> {
   let raw: string;
   try {
     raw = readFileSync(SESSION_MAP_PATH, "utf-8");
@@ -134,12 +136,18 @@ export function loadSessionMap(): Record<string, string> {
       `Failed to parse ${SESSION_MAP_PATH}: expected a JSON object, got ${got}`,
     );
   }
-  // Drop non-string values: a corrupt entry must not leak a non-string profile
-  // name into getSessionProfile → chooseProfile → configPathFor, where it would
-  // hit .trim() and crash a session start.
-  const map: Record<string, string> = {};
-  for (const [sessionId, profile] of Object.entries(parsed as Record<string, unknown>)) {
-    if (typeof profile === "string") map[sessionId] = profile;
+  // Legacy strings remain readable; reject malformed objects rather than
+  // letting an untrusted profile value crash session startup.
+  const map: Record<string, SessionBinding> = {};
+  for (const [sessionId, binding] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof binding === "string") map[sessionId] = binding;
+    else if (binding && typeof binding === "object" && !Array.isArray(binding)) {
+      const value = binding as Record<string, unknown>;
+      if (typeof value.profile === "string" && typeof value.path === "string" &&
+          value.path.length > 0 && resolve(value.path) === value.path) {
+        map[sessionId] = { profile: value.profile, path: value.path };
+      }
+    }
   }
   return map;
 }
@@ -147,7 +155,16 @@ export function loadSessionMap(): Record<string, string> {
 /** The profile bound to a pi session, or undefined if none recorded. */
 export function getSessionProfile(sessionId: string | undefined): string | undefined {
   if (!sessionId) return undefined;
-  return loadSessionMap()[sessionId];
+  const binding = loadSessionMap()[sessionId];
+  return typeof binding === "string" ? binding : binding?.profile;
+}
+
+/** Only resume uses a recorded path; missing files fall back to the name. */
+export function getSessionConfigPath(sessionId: string | undefined): string | undefined {
+  if (!sessionId) return undefined;
+  const binding = loadSessionMap()[sessionId];
+  return binding && typeof binding !== "string" && existsSync(binding.path)
+    ? binding.path : undefined;
 }
 
 /**
@@ -155,17 +172,18 @@ export function getSessionProfile(sessionId: string | undefined): string | undef
  * oldest beyond the cap. Exported for testing.
  */
 export function applySessionProfile(
-  map: Record<string, string>,
+  map: Record<string, SessionBinding>,
   sessionId: string,
   profile: string,
   cap: number = SESSION_MAP_MAX,
-): Record<string, string> {
-  const next: Record<string, string> = {};
+  path?: string,
+): Record<string, SessionBinding> {
+  const next: Record<string, SessionBinding> = {};
   // Re-insert all except this id (preserves order), then append this id last.
   for (const [k, v] of Object.entries(map)) {
     if (k !== sessionId) next[k] = v;
   }
-  next[sessionId] = profile;
+  next[sessionId] = path ? { profile, path: resolve(path) } : profile;
   const keys = Object.keys(next);
   if (keys.length > cap) {
     for (const k of keys.slice(0, keys.length - cap)) delete next[k];
@@ -227,10 +245,16 @@ export function resolveProfileLockCollision(opts: {
 }
 
 /** Persist `sessionId → profile` atomically (best-effort). Bounded by an LRU cap. */
-export function setSessionProfile(sessionId: string | undefined, profile: string): void {
+export function setSessionProfile(sessionId: string | undefined, profile: string, path?: string): void {
   if (!sessionId) return;
   try {
-    const next = applySessionProfile(loadSessionMap(), sessionId, profile);
+    const map = loadSessionMap();
+    // A legacy binding that still resolves by its original name needs no
+    // migration just because it was resumed. Preserve its on-disk shape.
+    const keepLegacy = map[sessionId] === profile &&
+      path !== undefined && resolve(path) === configPathFor({ CHAOS_RELAY_PROFILE: profile });
+    const next = applySessionProfile(map, sessionId, profile, SESSION_MAP_MAX,
+      keepLegacy ? undefined : path);
     // Temp-file + rename so an interrupted/concurrent write can never leave a
     // truncated map at the target; the previous complete map survives instead.
     atomicWriteSync(SESSION_MAP_PATH, JSON.stringify(next, null, 2) + "\n");
@@ -338,6 +362,7 @@ export function resolveProfileCreate(opts: {
   profile: string;
   exists: boolean;
   existingCount: number;
+  configPath?: string;
   limit?: number;
 }): ProfileCreateOutcome {
   // ACCEPTED RESIDUAL (pi-chaos-relay-icj): the count is read before an async
@@ -352,7 +377,9 @@ export function resolveProfileCreate(opts: {
   // 100-cap bound is harmless, and the next creation attempt sees the true
   // count. Revisit if the cap ever becomes a security control.
   const limit = opts.limit ?? MAX_PROFILE_CONFIGS;
-  if (opts.exists) return { action: "allow", profile: opts.profile };
+  if (opts.exists || (opts.configPath && dirname(resolve(opts.configPath)) !== resolve(CONFIG_DIR))) {
+    return { action: "allow", profile: opts.profile };
+  }
   if (opts.existingCount >= limit) {
     return {
       action: "refuse",
