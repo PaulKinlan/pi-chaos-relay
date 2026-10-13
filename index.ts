@@ -98,6 +98,9 @@ import {
 export { claimProfileLock, removeProfileLock, ApprovalQueue, summarizeToolCall };
 export type { PendingApprovalEntry };
 
+/** The poller's state as staged for a write; `requeue` marks a hand-back. */
+type StagedPersistState = PollerPersistState & { requeue?: boolean };
+
 /**
  * Slow safety poll. The WebSocket is the primary transport (instant push);
  * this only runs as a backstop in case a push is missed between reconnects.
@@ -293,7 +296,7 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
    * flushed and disposed at session_shutdown, so a superseded instance can never
    * flush its older state over the replacement's.
    */
-  let stateWriter: DebouncedStateWriter<PollerPersistState> | undefined;
+  let stateWriter: DebouncedStateWriter<StagedPersistState> | undefined;
   let ws: RelayWebSocket | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   let attachmentCleanupTimer: ReturnType<typeof setInterval> | undefined;
@@ -566,10 +569,10 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
    * profile switch (or a reset) happened in between — see
    * `saveMessageState(state, statePath)`.
    */
-  function makeStateWriter(statePath: string): DebouncedStateWriter<PollerPersistState> {
-    return new DebouncedStateWriter<PollerPersistState>({
-      write: ({ since, seen }) => {
-        saveMessageState({ cursor: since, seenIds: seen }, statePath);
+  function makeStateWriter(statePath: string): DebouncedStateWriter<StagedPersistState> {
+    return new DebouncedStateWriter<StagedPersistState>({
+      write: ({ since, seen, requeue }) => {
+        saveMessageState({ cursor: since, seenIds: seen }, statePath, { requeue });
       },
       onError: (err) =>
         log(
@@ -618,7 +621,9 @@ export default function chaosRelayExtension(pi: ExtensionAPI): void {
         // would otherwise stage its own profile's state into the replacement's
         // writer, which is pinned to the new profile's side-car. A released
         // writer refuses the write, which is what we want here.
-        if (urgent) writer.stageUrgent(state);
+        // An urgent write is the poller's hand-back (a deliberate rewind), and is
+        // marked so saveMessageState never lets legacy in-config state undo it.
+        if (urgent) writer.stageUrgent({ ...state, requeue: true });
         else writer.stage(state);
       },
       // Restore the persisted de-dup log so restarts don't re-process the

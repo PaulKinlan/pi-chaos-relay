@@ -1019,8 +1019,8 @@ test("a corrupt side-car degrades to the legacy values without throwing", () => 
     assert.deepEqual(loadMessageState(), { cursor: undefined, seenIds: ["legacy"] });
     assert.ok(warnings.some((w) => w.includes("Failed to parse")));
     // The next save self-heals the file.
-    saveMessageState({ cursor: "c", seenIds: ["s"] });
-    assert.deepEqual(loadMessageState(), { cursor: "c", seenIds: ["s"] });
+    saveMessageState({ cursor: "2026-01-02T00:00:00Z", seenIds: ["s"] });
+    assert.deepEqual(loadMessageState(), { cursor: "2026-01-02T00:00:00Z", seenIds: ["s"] });
   });
 });
 
@@ -1049,8 +1049,251 @@ test("an empty side-car file degrades silently to the legacy values", () => {
       seenIds: ["legacy"],
     });
     assert.deepEqual(warnings, []);
+    // Never destroy the newer copy (bead pi-chaos-relay-7vk): a save whose
+    // cursor is not a comparable timestamp cannot be shown to be newer than the
+    // legacy 2026-01-01 cursor, so it must NOT strip the legacy fields.
     saveMessageState({ cursor: "c", seenIds: ["s"] });
-    assert.deepEqual(loadMessageState(), { cursor: "c", seenIds: ["s"] });
+    const kept = JSON.parse(readFileSync(path, "utf-8"));
+    assert.equal(kept.messagesCursor, "2026-01-01T00:00:00Z");
+    assert.deepEqual(kept.seenMessageIds, ["legacy"]);
+    assert.equal(kept.messageStateMigrated, undefined);
+    saveMessageState({ cursor: "2026-01-02T00:00:00Z", seenIds: ["s"] });
+    assert.deepEqual(loadMessageState(), { cursor: "2026-01-02T00:00:00Z", seenIds: ["s"] });
+  });
+});
+
+// ── Stale side-car vs newer legacy fields (bead pi-chaos-relay-7vk) ────────────
+//
+// A parseable side-car used to win over the legacy in-config fields with no
+// comparison, and the next save stripped those fields: a stale or empty
+// side-car rewound the cursor and erased the de-dup log, so a catch-up could
+// re-offer already-delivered messages.
+
+const STALE_SIDECAR = { cursor: "2026-10-13T19:30:53Z", seenIds: [] as string[] };
+const NEWER_LEGACY_CURSOR = "2026-10-13T21:35:00Z";
+const NEWER_LEGACY_IDS = ["a", "b", "c"];
+
+test("7vk: a stale side-car never rewinds the cursor or drops newer legacy de-dup ids", () => {
+  withTempConfig((path, warnings) => {
+    savePersisted({
+      apiKey: "k",
+      messagesCursor: NEWER_LEGACY_CURSOR,
+      seenMessageIds: NEWER_LEGACY_IDS,
+    });
+    writeFileSync(`${path}.state`, JSON.stringify(STALE_SIDECAR));
+    // The later cursor wins and the de-dup log is the union.
+    assert.deepEqual(loadMessageState(), {
+      cursor: NEWER_LEGACY_CURSOR,
+      seenIds: NEWER_LEGACY_IDS,
+    });
+    assert.equal(warnings.length, 1);
+    assert.ok(warnings[0].includes("behind the legacy in-config state"), warnings[0]);
+    assert.ok(warnings[0].includes("MERGED rather than replaced"), warnings[0]);
+    // Warn once per path, not once per load.
+    loadMessageState();
+    assert.equal(warnings.length, 1);
+  });
+  withTempConfig((path) => {
+    // Union order: side-car ids first, then legacy-only ids appended.
+    savePersisted({ messagesCursor: NEWER_LEGACY_CURSOR, seenMessageIds: NEWER_LEGACY_IDS });
+    writeFileSync(`${path}.state`, JSON.stringify({ cursor: STALE_SIDECAR.cursor, seenIds: ["x", "b"] }));
+    assert.deepEqual(loadMessageState(), {
+      cursor: NEWER_LEGACY_CURSOR,
+      seenIds: ["x", "b", "a", "c"],
+    });
+  });
+  withTempConfig((path) => {
+    // An EMPTY parseable side-car (`{}`) no longer wipes the legacy state.
+    savePersisted({ messagesCursor: NEWER_LEGACY_CURSOR, seenMessageIds: NEWER_LEGACY_IDS });
+    writeFileSync(`${path}.state`, "{}");
+    assert.deepEqual(loadMessageState(), {
+      cursor: NEWER_LEGACY_CURSOR,
+      seenIds: NEWER_LEGACY_IDS,
+    });
+  });
+  withTempConfig((path) => {
+    // The merged log stays bounded: the LAST 1000 ids are kept.
+    const sidecarIds = Array.from({ length: 900 }, (_, i) => `s${i}`);
+    const legacyIds = Array.from({ length: 200 }, (_, i) => `l${i}`);
+    savePersisted({ messagesCursor: NEWER_LEGACY_CURSOR, seenMessageIds: legacyIds });
+    writeFileSync(`${path}.state`, JSON.stringify({ cursor: STALE_SIDECAR.cursor, seenIds: sidecarIds }));
+    const merged = loadMessageState().seenIds;
+    assert.equal(merged.length, 1000);
+    assert.deepEqual(merged, [...sidecarIds, ...legacyIds].slice(-1000));
+  });
+});
+
+test("7vk: saving stale state does not strip the newer legacy fields or set the tombstone", () => {
+  withTempConfig((path, warnings) => {
+    savePersisted({
+      apiKey: "k",
+      messagesCursor: NEWER_LEGACY_CURSOR,
+      seenMessageIds: NEWER_LEGACY_IDS,
+    });
+    writeFileSync(`${path}.state`, JSON.stringify(STALE_SIDECAR));
+    // A writer that persists the stale side-car's state (e.g. staged before
+    // the merge) must not destroy the newer legacy copy.
+    saveMessageState(STALE_SIDECAR);
+    const cfg = JSON.parse(readFileSync(path, "utf-8"));
+    assert.equal(cfg.messagesCursor, NEWER_LEGACY_CURSOR);
+    assert.deepEqual(cfg.seenMessageIds, NEWER_LEGACY_IDS);
+    assert.equal(cfg.messageStateMigrated, undefined);
+    const skip = warnings.find((w) => w.includes("kept the legacy message state"));
+    assert.ok(skip, `expected the refused-strip warning, got: ${JSON.stringify(warnings)}`);
+    assert.ok(skip.includes(STALE_SIDECAR.cursor) && skip.includes(NEWER_LEGACY_CURSOR), skip);
+    // So the next load still sees the newer state.
+    assert.deepEqual(loadMessageState(), {
+      cursor: NEWER_LEGACY_CURSOR,
+      seenIds: NEWER_LEGACY_IDS,
+    });
+    // Same cursor but legacy ids missing: still refused (not provably aged out).
+    saveMessageState({ cursor: NEWER_LEGACY_CURSOR, seenIds: ["a"] });
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf-8")).seenMessageIds, NEWER_LEGACY_IDS);
+    // A caught-up flush whose cursor is strictly later completes the forward
+    // migration even though the poller aged the legacy ids out of its log —
+    // and that ordinary path raises no refused-strip warning.
+    const warningsBefore = warnings.length;
+    saveMessageState({ cursor: "2026-10-13T21:40:00Z", seenIds: ["z"] });
+    const migrated = JSON.parse(readFileSync(path, "utf-8"));
+    assert.equal("messagesCursor" in migrated, false);
+    assert.equal("seenMessageIds" in migrated, false);
+    assert.equal(migrated.messageStateMigrated, true);
+    assert.equal(migrated.apiKey, "k");
+    assert.equal(warnings.length, warningsBefore);
+    assert.deepEqual(loadMessageState(), { cursor: "2026-10-13T21:40:00Z", seenIds: ["z"] });
+  });
+});
+
+test("7vk no-regression: a side-car newer than the legacy fields wins and the legacy fields are stripped", () => {
+  withTempConfig((path, warnings) => {
+    savePersisted({
+      apiKey: "k",
+      messagesCursor: "2026-01-01T00:00:00Z",
+      seenMessageIds: ["old1", "old2"],
+    });
+    const newer = { cursor: "2026-01-02T00:00:00Z", seenIds: ["old1", "old2", "new1"] };
+    writeFileSync(`${path}.state`, JSON.stringify(newer));
+    assert.deepEqual(loadMessageState(), newer);
+    saveMessageState(newer);
+    const cfg = JSON.parse(readFileSync(path, "utf-8"));
+    assert.equal("messagesCursor" in cfg, false);
+    assert.equal("seenMessageIds" in cfg, false);
+    assert.equal(cfg.messageStateMigrated, true);
+    assert.equal(cfg.apiKey, "k");
+    assert.deepEqual(loadMessageState(), newer);
+    assert.deepEqual(warnings, []);
+  });
+});
+
+test("7vk: a requeue's deliberate rewind is never undone by the legacy-fields merge", () => {
+  // The poller's hand-back (MessagePoller.requeue) rewinds the cursor to just
+  // before an accepted-but-undelivered message so the replacement session
+  // re-fetches it. If that message's timestamp is at or before a legacy
+  // messagesCursor that is still in the config, the merge must not prefer the
+  // legacy cursor over the rewind: a strict `since` fetch would skip the
+  // message forever.
+  const rewound = { cursor: "2026-10-13T20:59:59.000Z", seenIds: ["a", "b", "c"] };
+  withTempConfig((path, warnings) => {
+    savePersisted({ apiKey: "k", messagesCursor: NEWER_LEGACY_CURSOR, seenMessageIds: NEWER_LEGACY_IDS });
+    saveMessageState(rewound, `${path}.state`, { requeue: true });
+    assert.deepEqual(loadMessageState(), rewound, "the rewound cursor stands");
+    // The requeue write completed the migration: the side-car is authoritative.
+    const cfg = JSON.parse(readFileSync(path, "utf-8"));
+    assert.equal("messagesCursor" in cfg, false);
+    assert.equal("seenMessageIds" in cfg, false);
+    assert.equal(cfg.messageStateMigrated, true);
+    assert.equal(cfg.apiKey, "k");
+    assert.equal(warnings.some((w) => w.includes("kept the legacy message state")), false);
+  });
+  withTempConfig((path) => {
+    // Bypassing the refusal must not lose what the refusal protected: the
+    // poller's log is the load-side union, so after a requeue write every id
+    // either source contributed is in the persisted side-car.
+    savePersisted({ apiKey: "k", messagesCursor: NEWER_LEGACY_CURSOR, seenMessageIds: NEWER_LEGACY_IDS });
+    writeFileSync(`${path}.state`, JSON.stringify({ cursor: STALE_SIDECAR.cursor, seenIds: ["x"] }));
+    const loaded = loadMessageState();
+    assert.equal(loaded.cursor, NEWER_LEGACY_CURSOR);
+    saveMessageState({ cursor: rewound.cursor, seenIds: loaded.seenIds }, `${path}.state`, { requeue: true });
+    const cfg = JSON.parse(readFileSync(path, "utf-8"));
+    assert.equal("messagesCursor" in cfg, false);
+    assert.equal("seenMessageIds" in cfg, false);
+    assert.equal(cfg.messageStateMigrated, true);
+    const onDisk = JSON.parse(readFileSync(`${path}.state`, "utf-8"));
+    assert.equal(onDisk.cursor, rewound.cursor);
+    assert.deepEqual([...onDisk.seenIds].sort(), ["a", "b", "c", "x"]);
+    assert.deepEqual(loadMessageState(), { cursor: rewound.cursor, seenIds: onDisk.seenIds });
+  });
+  withTempConfig((path) => {
+    // Control: the SAME write without the requeue mark is genuine stale state,
+    // and the merge still corrects it.
+    savePersisted({ apiKey: "k", messagesCursor: NEWER_LEGACY_CURSOR, seenMessageIds: NEWER_LEGACY_IDS });
+    saveMessageState(rewound);
+    const kept = JSON.parse(readFileSync(path, "utf-8"));
+    assert.equal(kept.messagesCursor, NEWER_LEGACY_CURSOR);
+    assert.deepEqual(kept.seenMessageIds, NEWER_LEGACY_IDS);
+    assert.equal(kept.messageStateMigrated, undefined);
+    assert.equal(loadMessageState().cursor, NEWER_LEGACY_CURSOR);
+  });
+});
+
+test("7vk: equal or unparseable cursors keep the side-car's log, not the older legacy one", () => {
+  const sidecarIds = Array.from({ length: 1000 }, (_, i) => `s${i}`);
+  const legacyIds = Array.from({ length: 500 }, (_, i) => `l${i}`);
+  const same = "2026-10-13T21:35:00Z";
+  // Equal cursors: neither log is provably newer, so the side-car — the
+  // authoritative store — is the one the cap must keep. Ordering by asking the
+  // cursor question a second way put the legacy ids last and evicted 500 of the
+  // side-car's (review round 2, P1).
+  withTempConfig((path, warnings) => {
+    savePersisted({ messagesCursor: same, seenMessageIds: legacyIds });
+    writeFileSync(`${path}.state`, JSON.stringify({ cursor: same, seenIds: sidecarIds }));
+    const merged = loadMessageState();
+    assert.equal(merged.seenIds.length, 1000);
+    assert.deepEqual(merged.seenIds, sidecarIds, "equal cursors must not evict the side-car's log");
+  });
+  // Neither cursor parses: the same rule applies.
+  withTempConfig((path, warnings) => {
+    savePersisted({ messagesCursor: "not-a-timestamp", seenMessageIds: legacyIds });
+    writeFileSync(`${path}.state`, JSON.stringify({ cursor: "also-not-a-timestamp", seenIds: sidecarIds }));
+    const merged = loadMessageState();
+    assert.equal(merged.seenIds.length, 1000);
+    assert.deepEqual(merged.seenIds, sidecarIds, "unparseable cursors must not evict the side-car's log");
+  });
+});
+
+test("7vk: a union over the 1000-id cap drops the OLDER log's ids, in both cursor directions", () => {
+  const sidecarIds = Array.from({ length: 1000 }, (_, i) => `s${i}`);
+  const legacyIds = Array.from({ length: 500 }, (_, i) => `l${i}`);
+  const earlier = "2026-10-13T19:30:53Z";
+  const later = "2026-10-13T21:35:00Z";
+  withTempConfig((path) => {
+    // Side-car cursor LATER (the normal case): the side-car's ids are the newer
+    // ones, so every one of them survives and the older legacy-only ids are
+    // what the cap drops. They sit BEFORE the side-car's, so the poller's own
+    // trim (which keeps the tail) also ages the legacy ids out first.
+    savePersisted({ messagesCursor: earlier, seenMessageIds: legacyIds });
+    writeFileSync(`${path}.state`, JSON.stringify({ cursor: later, seenIds: sidecarIds }));
+    const merged = loadMessageState();
+    assert.equal(merged.cursor, later);
+    assert.equal(merged.seenIds.length, 1000);
+    assert.deepEqual(merged.seenIds, sidecarIds, "no newer side-car id is evicted by an older legacy id");
+  });
+  withTempConfig((path) => {
+    // Partial overflow, side-car later: the surviving legacy ids precede the
+    // side-car's.
+    const sidecarSome = sidecarIds.slice(0, 800);
+    savePersisted({ messagesCursor: earlier, seenMessageIds: legacyIds });
+    writeFileSync(`${path}.state`, JSON.stringify({ cursor: later, seenIds: sidecarSome }));
+    assert.deepEqual(loadMessageState().seenIds, [...legacyIds.slice(-200), ...sidecarSome]);
+  });
+  withTempConfig((path) => {
+    // Legacy cursor LATER: the legacy ids are the newer ones, so they are kept
+    // and the side-car's oldest ids are dropped (the existing order).
+    savePersisted({ messagesCursor: later, seenMessageIds: legacyIds });
+    writeFileSync(`${path}.state`, JSON.stringify({ cursor: earlier, seenIds: sidecarIds }));
+    const merged = loadMessageState();
+    assert.equal(merged.cursor, later);
+    assert.deepEqual(merged.seenIds, [...sidecarIds.slice(500), ...legacyIds]);
   });
 });
 
@@ -1079,9 +1322,9 @@ test("reset all re-arms the one-time legacy migration for a restored config", ()
     // Simulate restoring a pre-0.17.5 backup over the fresh start.
     writeFileSync(
       path,
-      JSON.stringify({ apiKey: "k2", messagesCursor: "old-cursor", seenMessageIds: ["old"] }, null, 2) + "\n",
+      JSON.stringify({ apiKey: "k2", messagesCursor: "2026-01-01T00:00:00Z", seenMessageIds: ["old"] }, null, 2) + "\n",
     );
-    saveMessageState({ cursor: "new", seenIds: ["n"] });
+    saveMessageState({ cursor: "2026-01-02T00:00:00Z", seenIds: ["n"] });
     const cfg = JSON.parse(readFileSync(path, "utf-8"));
     assert.equal("seenMessageIds" in cfg, false); // legacy fields stripped again
     assert.equal("messagesCursor" in cfg, false);
