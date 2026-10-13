@@ -4497,6 +4497,87 @@ test("a delivery that hits a replaced runtime stops the instance and returns the
   }
 });
 
+test("7vk: a hand-back is not undone by legacy in-config state that is still present", async () => {
+  resetState();
+  const path = writeProfileConfig("default", "ak_legacy_hb");
+  // A profile that has not migrated yet: its legacy cursor is LATER than the
+  // message that will be handed back, so the old-cursor-wins merge would undo
+  // the deliberate rewind and a strict `since` fetch would skip the message.
+  const ts = new Date().toISOString();
+  const legacyCursor = new Date(Date.now() + 3_600_000).toISOString();
+  const cfg = JSON.parse(readFileSync(path, "utf-8"));
+  writeFileSync(
+    path,
+    JSON.stringify({ ...cfg, messagesCursor: legacyCursor, seenMessageIds: ["m-legacy-old", "m-legacy-old2"] }) + "\n",
+  );
+  // And an older side-car, so the poller's de-dup log is the load-side UNION.
+  const statePath = `${path}.state`;
+  const sidecarCursor = new Date(Date.now() - 3_600_000).toISOString();
+  writeFileSync(statePath, JSON.stringify({ cursor: sidecarCursor, seenIds: ["m-sidecar-old"] }) + "\n");
+  const prevUrl = process.env.CHAOS_RELAY_URL;
+  delete process.env.CHAOS_RELAY_URL;
+  const origWs = globalThis.WebSocket;
+  PushWebSocket.instances = [];
+  globalThis.WebSocket = PushWebSocket as unknown as typeof WebSocket;
+  const fake = makeFakePi();
+  const ctx = makeCtx("sess-legacy-hb", fake.notifications);
+
+  try {
+    let injects = 0;
+    fake.pi.sendUserMessage = () => {
+      injects += 1;
+      throw new Error(STALE_RUNTIME_MESSAGE);
+    };
+    chaosRelayExtension(fake.pi as unknown as ExtensionApi);
+    await callHandler(fake.handlers, "session_start", { reason: "startup" }, ctx);
+    const socket = socketForProfile("ak_legacy_hb");
+    const logPath = join(PI_DIR, "agent", "logs", "chaos-relay.log");
+    const logBefore = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+    // Unrecognised (not in the de-dup log) and at or before the legacy cursor.
+    pushMessage(socket, "m-legacy-hb", ts);
+    const deferred = () =>
+      readFileSync(logPath, "utf-8").slice(logBefore.length).split("inbound delivery deferred").length - 1;
+    await waitFor(() => deferred() >= 1 && injects === 1);
+
+    // What the replacement session loads.
+    const state = config.loadMessageState();
+    assert.ok(!state.seenIds.includes("m-legacy-hb"), `not marked delivered: ${JSON.stringify(state.seenIds)}`);
+    assert.ok(
+      state.cursor !== undefined && state.cursor < ts,
+      `the rewind before the handed-back message stands (cursor=${state.cursor}, ts=${ts}, legacy=${legacyCursor})`,
+    );
+    // The requeue write completed the migration: the legacy fields are gone and
+    // the tombstone is set, so no rival cursor is left to override the rewind...
+    const after = JSON.parse(readFileSync(path, "utf-8"));
+    assert.equal("messagesCursor" in after, false, "legacy cursor stripped");
+    assert.equal("seenMessageIds" in after, false, "legacy ids stripped");
+    assert.equal(after.messageStateMigrated, true, "tombstone set");
+    // ...and bypassing the refusal lost nothing: every id the load-side union
+    // contributed (side-car AND legacy) is in the persisted side-car.
+    const persisted = JSON.parse(readFileSync(statePath, "utf-8"));
+    for (const id of ["m-sidecar-old", "m-legacy-old", "m-legacy-old2"]) {
+      assert.ok(persisted.seenIds.includes(id), `${id} survives the requeue write: ${JSON.stringify(persisted.seenIds)}`);
+    }
+    assert.ok(!persisted.seenIds.includes("m-legacy-hb"), "the handed-back id is not persisted as seen");
+    assert.equal(persisted.cursor, state.cursor);
+    const fresh = windowedClient([
+      { id: "m-legacy-hb", channelType: "telegram", channelId: "ch-stale", from: "alice", content: "hi", timestamp: ts },
+    ]);
+    const replay = await new MessagePoller(fresh.client, { since: state.cursor, seen: state.seenIds }).poll();
+    assert.deepEqual(replay.map((m) => m.id), ["m-legacy-hb"], "the replacement session re-fetches it");
+  } finally {
+    await callHandler(fake.handlers, "session_shutdown", {}, ctx).catch(() => {});
+    try {
+      unlinkSync(config.messageStatePath());
+    } catch {
+      /* nothing was written */
+    }
+    globalThis.WebSocket = origWs;
+    if (prevUrl === undefined) delete process.env.CHAOS_RELAY_URL;
+    else process.env.CHAOS_RELAY_URL = prevUrl;
+  }
+});
+
 test("a live runtime still delivers, and logs no replaced-runtime warning", async () => {
   resetState();
   writeProfileConfig("default", "ak_live");

@@ -779,9 +779,85 @@ export function messageStatePath(): string {
 /** (path, reason) pairs already warned about, for the side-car's hot-path reads. */
 const warnedCorruptStates = new Set<string>();
 
+/** Same cap as the poller's de-dup log hard cap, so a merged log stays bounded. */
+const MERGED_SEEN_MAX = 1000;
+
+/**
+ * Whether cursor `a` is strictly LATER than cursor `b`, by instant
+ * (`Date.parse`), not by string. A missing or unparseable cursor always loses:
+ * a parseable `a` beats an unusable `b`, and an unusable `a` never wins.
+ */
+function isCursorLater(a: string | undefined, b: string | undefined): boolean {
+  const at = a === undefined ? Number.NaN : Date.parse(a);
+  if (!Number.isFinite(at)) return false;
+  const bt = b === undefined ? Number.NaN : Date.parse(b);
+  return !Number.isFinite(bt) || at > bt;
+}
+
+/**
+ * Merge a parseable side-car with legacy in-config fields that are STILL
+ * present (a profile whose migration strip has not happened yet). Never
+ * rewinds the cursor (the later instant wins) and never drops a de-dup id (the
+ * union, the log with the later cursor last, capped to the last
+ * MERGED_SEEN_MAX). Warns once when the legacy copy was ahead in a way that
+ * the old side-car-always-wins precedence would have silently lost.
+ */
+function mergeLegacyMessageState(
+  sidecar: MessageTrackingState,
+  persisted: PersistedConfig,
+): MessageTrackingState {
+  const legacyCursor = persisted.messagesCursor;
+  const legacyIds = persisted.seenMessageIds ?? [];
+  if (legacyCursor === undefined && legacyIds.length === 0) return sidecar;
+  const legacyCursorNewer = isCursorLater(legacyCursor, sidecar.cursor);
+  const sidecarIds = new Set(sidecar.seenIds);
+  const legacyOnlyIds = [...new Set(legacyIds)].filter((id) => !sidecarIds.has(id));
+  if (!legacyCursorNewer && legacyOnlyIds.length === 0) return sidecar;
+  const cursor = legacyCursorNewer ? legacyCursor : sidecar.cursor;
+  // The cap keeps the TAIL, so the newer log goes last: when the side-car's
+  // cursor is later its ids are the newer ones, and appending the older
+  // legacy-only ids after them would evict newer side-car ids (and the
+  // poller's own trim, which also keeps the tail, would then age the newer
+  // ids out first) — re-delivering recent messages.
+  // The cap keeps the TAIL, so the NEWER log must go last. Which log is newer is
+  // the same question the cursor choice above answers, so it uses that answer
+  // rather than asking it a second way: only a STRICTLY later legacy cursor makes
+  // the legacy ids the newer ones. Ties and unparseable cursors go to the
+  // side-car, the authoritative store — asking the question twice is how the
+  // equal-cursor case came to evict recent side-car ids (review round 2, P1).
+  const seenIds = (
+    legacyCursorNewer
+      ? [...sidecarIds, ...legacyOnlyIds]
+      : [...legacyOnlyIds, ...sidecarIds]
+  ).slice(-MERGED_SEEN_MAX);
+  const reason = `message-state side-car ${messageStatePath()} is behind the legacy in-config state`;
+  if (!warnedCorruptStates.has(reason)) {
+    warnedCorruptStates.add(reason);
+    const details: string[] = [];
+    if (legacyCursorNewer) {
+      details.push(
+        `the legacy cursor ${legacyCursor} is newer than the side-car cursor ${sidecar.cursor ?? "(none)"}`,
+      );
+    }
+    if (legacyOnlyIds.length > 0) {
+      details.push(`${legacyOnlyIds.length} de-dup id(s) exist only in the legacy fields`);
+    }
+    console.warn(
+      `pi-chaos-relay: ${reason} (${details.join("; ")}). Preferred the later ` +
+        `cursor (${cursor ?? "(none)"}) and the union of both de-dup logs: the ` +
+        `de-dup log and cursor were MERGED rather than replaced, so already-` +
+        `delivered messages stay filtered and the cursor does not rewind.`,
+    );
+  }
+  return { cursor, seenIds };
+}
+
 /**
  * Read the message-tracking state. Precedence:
- *  1. the side-car file (`<config>.state`), when present and parseable;
+ *  1. the side-car file (`<config>.state`), when present and parseable —
+ *     MERGED with any legacy in-config fields still present (later cursor
+ *     wins, de-dup ids are unioned), so a stale or empty side-car can never
+ *     rewind the cursor or drop ids that only the newer legacy copy holds;
  *  2. the legacy in-config fields (`messagesCursor` / `seenMessageIds`), so a
  *     profile written by an older version keeps its cursor + de-dup log
  *     across the upgrade (the first save migrates them to the side-car).
@@ -811,12 +887,13 @@ export function loadMessageState(): MessageTrackingState {
         seenIds?: unknown;
       };
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return {
+        const sidecar: MessageTrackingState = {
           cursor: typeof parsed.cursor === "string" ? parsed.cursor : undefined,
           seenIds: Array.isArray(parsed.seenIds)
             ? parsed.seenIds.filter((id): id is string => typeof id === "string")
             : [],
         };
+        return mergeLegacyMessageState(sidecar, loadPersisted());
       }
     } catch {
       /* fall through to the legacy fields; warn-once below */
@@ -884,10 +961,19 @@ let stateMigrated = false;
  *
  * The one-time legacy migration below is about the ACTIVE profile's config, so it
  * is skipped when writing a non-active profile's side-car.
+ *
+ * `opts.requeue` marks the poller's hand-back write (MessagePoller.requeue): a
+ * cursor rewound ON PURPOSE to before an accepted-but-undelivered message, so
+ * the replacement session re-fetches it. That state is the poller's memory,
+ * which was loaded through loadMessageState's union and then rewound — it is
+ * not stale, so it completes the migration instead of being refused. Keeping
+ * the legacy fields would let the next load prefer their later cursor and
+ * skip the handed-back message.
  */
 export function saveMessageState(
   state: MessageTrackingState,
   statePath: string = messageStatePath(),
+  opts: { requeue?: boolean } = {},
 ): void {
   atomicWriteSync(
     statePath,
@@ -895,6 +981,38 @@ export function saveMessageState(
   );
   if (stateMigrated || statePath !== messageStatePath()) return;
   const persisted = loadPersisted();
+  // Never destroy the newer copy: only strip legacy fields the side-car now
+  // supersedes. The written cursor must not be older than `messagesCursor`,
+  // and every legacy id must be in the written log UNLESS the written cursor
+  // is strictly later — then the state already went through
+  // loadMessageState's union and a missing legacy id can only have been aged
+  // out by the poller's trim. Otherwise skip the strip AND the tombstone
+  // (leave the flag unarmed so a later, caught-up flush migrates). A requeue
+  // write is exempt: see `opts.requeue` above.
+  const legacyIds = persisted.seenMessageIds ?? [];
+  const writtenIds = new Set(state.seenIds);
+  const cursorOlder = isCursorLater(persisted.messagesCursor, state.cursor);
+  const idsLost =
+    legacyIds.some((id) => !writtenIds.has(id)) &&
+    !isCursorLater(state.cursor, persisted.messagesCursor);
+  if (!opts.requeue && (cursorOlder || idsLost)) {
+    const reason = `kept the legacy message state in ${activeConfigPath}`;
+    if (!warnedCorruptStates.has(reason)) {
+      warnedCorruptStates.add(reason);
+      const why = cursorOlder
+        ? `the cursor being written (${state.cursor ?? "(none)"}) is older than ` +
+          `the legacy messagesCursor (${persisted.messagesCursor})`
+        : `legacy de-dup ids would be lost and the cursor being written ` +
+          `(${state.cursor ?? "(none)"}) is not later than the legacy ` +
+          `messagesCursor (${persisted.messagesCursor ?? "(none)"})`;
+      console.warn(
+        `pi-chaos-relay: ${reason} — ${why}. Refused to strip the newer legacy ` +
+          `fields; the next load merges them with ${statePath} (later cursor, ` +
+          `union of de-dup ids) and a caught-up flush completes the migration.`,
+      );
+    }
+    return;
+  }
   // One-time pass per process/profile: strip any legacy in-config fields, and
   // make sure the tombstone exists even for profiles that migrated before the
   // tombstone was introduced (otherwise their side-car loss would stay
