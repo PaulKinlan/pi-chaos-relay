@@ -57,6 +57,74 @@ test("sanitizes traversal and control characters from inbound names", () => {
   assert.equal(safeInboundFilename(".."), "attachment");
 });
 
+function withEnv(env: Record<string, string | undefined>, body: () => Promise<void>): Promise<void> {
+  const saved = new Map(Object.keys(env).map((key) => [key, process.env[key]]));
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  return body().finally(() => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+}
+
+function fakeImageClient(): RelayClient {
+  return fakeClient(async (item) => ({
+    bytes: PNG,
+    filename: item.filename,
+    mimeType: item.mimeType,
+  }));
+}
+
+test("zh9: an unusable XDG_RUNTIME_DIR falls back to the temp dir instead of dropping the image", async () => {
+  const sandbox = await mkdtemp(join(tmpdir(), "relay-inbound-zh9-"));
+  // Hermetic: a path that CANNOT exist because its parent is a regular file, rather
+  // than a name that merely happens not to exist on this machine.
+  const blocker = join(sandbox, "blocker");
+  await writeFile(blocker, "not a directory");
+  await withEnv({ XDG_RUNTIME_DIR: join(blocker, "run"), TMPDIR: sandbox }, async () => {
+    const result = await materializeInboundAttachments(fakeImageClient(), [message()]);
+    assert.equal(result.images.length, 1, "the image must survive an unusable runtime dir");
+    assert.equal(result.files.length, 1);
+    assert.ok(result.files[0].startsWith(`${sandbox}/`), result.files[0]);
+    assert.doesNotMatch(result.messages[0].content, /Attachment unavailable/);
+    assert.match(result.messages[0].content, /saved to \/.*image\.png/);
+    const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+    const fallbackRoot = join(sandbox, `pi-chaos-relay-inbound-${uid}`);
+    assert.equal((await stat(fallbackRoot)).mode & 0o777, 0o700, "the fallback root must be private");
+  });
+});
+
+test("zh9: when NO root can be created the message still arrives, with its text and a note", async () => {
+  const sandbox = await mkdtemp(join(tmpdir(), "relay-inbound-zh9-both-"));
+  const blocker = join(sandbox, "blocker");
+  await writeFile(blocker, "not a directory");
+  // Preferred AND fallback are unusable: this used to reject the whole batch, which made
+  // index.ts drop the queued delivery entirely (review round 1, P1).
+  await withEnv({ XDG_RUNTIME_DIR: join(blocker, "run"), TMPDIR: join(blocker, "tmp") }, async () => {
+    const result = await materializeInboundAttachments(fakeImageClient(), [message()]);
+    assert.equal(result.images.length, 0);
+    assert.equal(result.files.length, 0);
+    assert.equal(result.messages.length, 1, "the message itself must survive");
+    assert.match(result.messages[0].content, /look at this/, "the text must survive");
+    assert.match(result.messages[0].content, /Attachment unavailable/);
+  });
+});
+
+test("zh9: a usable XDG_RUNTIME_DIR is still used as-is, with no fallback", async () => {
+  const sandbox = await mkdtemp(join(tmpdir(), "relay-inbound-zh9-ok-"));
+  await withEnv({ XDG_RUNTIME_DIR: sandbox }, async () => {
+    const result = await materializeInboundAttachments(fakeImageClient(), [message()]);
+    assert.equal(result.images.length, 1);
+    assert.ok(result.files[0].startsWith(`${sandbox}/`), result.files[0]);
+    const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+    assert.equal((await stat(join(sandbox, `pi-chaos-relay-inbound-${uid}`))).mode & 0o777, 0o700);
+  });
+});
+
 test("materializes a private file and emits a verified Pi image", async () => {
   const root = await mkdtemp(join(tmpdir(), "relay-inbound-test-"));
   const client = fakeClient(async (item) => ({
