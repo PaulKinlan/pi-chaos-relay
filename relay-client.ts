@@ -185,7 +185,7 @@ function replyReferenceFrom(value: unknown): ReplyReference | undefined {
   if (!value || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
   const id = firstId(record, ["id", "messageId", "message_id"]);
-  const text = firstString(record, ["text", "quotedText", "quoted_text"]);
+  const text = firstString(record, ["text", "quotedText", "quoted_text", "caption"]);
   const from = firstString(record, ["from", "sender"]);
   if (id || text || from) {
     return {

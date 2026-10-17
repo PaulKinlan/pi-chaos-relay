@@ -256,9 +256,15 @@ export function formatReplyContext(reference: ReplyReference): string {
   const attribution = parts.length
     ? `In reply to ${parts.join(" ")}`
     : "In reply to";
-  return reference.text
-    ? `[${attribution}: ${JSON.stringify(reference.text)}]`
-    : `[${attribution}]`;
+  if (!reference.text) return `[${attribution}]`;
+  // Bound quoted context independently of inbound content; count Unicode characters
+  // in the original before clipping so the note cannot understate what was omitted.
+  const maxQuoteChars = 256;
+  const characters = Array.from(reference.text);
+  const truncated = characters.length > maxQuoteChars;
+  const quote = truncated ? characters.slice(0, maxQuoteChars).join("") + "…" : reference.text;
+  const note = truncated ? ` (truncated; original length: ${characters.length} characters)` : "";
+  return `[${attribution}: ${JSON.stringify(quote)}${note}]`;
 }
 
 /**

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MessagePoller, formatMessagesForAgent } from "../poller.ts";
+import { MessagePoller, formatMessagesForAgent, formatReplyContext } from "../poller.ts";
 import { MAX_INBOUND_CONTENT_BYTES, MAX_INBOUND_FRAME_BYTES } from "../inbound-message.ts";
 import type { InboundIssue } from "../inbound-message.ts";
 import type { PollerPersistState } from "../poller.ts";
@@ -322,6 +322,28 @@ test("formatMessagesForAgent keeps quoted text on one line, quotes escaped", () 
     { ...msg("m2", "yes"), replyTo: { id: "m1", text: 'Ask "hub"\ndrop it?' } },
   ]);
   assert.match(out, /^\[In reply to message id="m1": "Ask \\"hub\\"\\ndrop it\?"\]$/m);
+});
+
+test("formatReplyContext bounds long quotes with a visible original character count", () => {
+  const text = "a".repeat(256) + "🦊" + "b".repeat(43);
+  const prompt = formatMessagesForAgent([{ ...msg("m2", "answer"), replyTo: { id: "m1", text } }]);
+  const out = prompt.split("\n").find((line) => line.startsWith("[In reply to"));
+  assert.equal(
+    out,
+    `[In reply to message id="m1": "${"a".repeat(256)}…" (truncated; original length: 300 characters)]`,
+  );
+  assert.ok(!prompt.includes("🦊"));
+  assert.equal(prompt.split("\n").filter((line) => line.startsWith("[In reply to")).length, 1);
+});
+
+test("formatReplyContext does not truncate a quote exactly at the limit", () => {
+  const text = "a".repeat(256);
+  assert.equal(formatReplyContext({ id: "m1", text }), `[In reply to message id="m1": "${text}"]`);
+});
+
+test("formatReplyContext handles empty and whitespace-only quotes", () => {
+  assert.equal(formatReplyContext({ id: "m1", text: "" }), '[In reply to message id="m1"]');
+  assert.equal(formatReplyContext({ id: "m1", text: "   " }), '[In reply to message id="m1": "   "]');
 });
 
 test("formatMessagesForAgent leaves non-reply messages structurally unchanged", () => {
