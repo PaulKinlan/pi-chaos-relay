@@ -569,9 +569,11 @@ a different sender in the agent's prompt. When a message was sent as a **reply**
 reply-threading, e.g. tapping reply on a question and answering "Drop"), the
 replied-to message travels with it as an
 `[In reply to message id="…" from "…": "…quoted text…"]` line **before** the
-content, so a terse answer can be resolved to the question it answered; channels
-that give only the id (or only the quoted text) still get
-`[In reply to message id="…"]`. Inbound Telegram/email attachment descriptors
+content, so a terse answer can be resolved to the question it answered. Telegram
+photo captions are used when the replied-to message has no text. Quoted text is
+limited to 256 Unicode characters; longer quotes show an ellipsis and the original
+character count on the same line. Channels that give only the id (or only the
+quoted text) still get a reply context line. Inbound Telegram/email attachment descriptors
 are downloaded through an ECDSA-signed, user/message-scoped relay endpoint.
 Files are written to
 private `0700` directories with mode `0600`; supported PNG/JPEG/GIF/WebP images

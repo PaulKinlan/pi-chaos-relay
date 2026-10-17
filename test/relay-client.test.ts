@@ -8,7 +8,9 @@ import {
   normalizeRelayUrl,
   registerSession,
   registerSessionWithKey,
+  resolveReplyTo,
 } from "../relay-client.ts";
+import type { ChannelMessage } from "../relay-client.ts";
 import { generateKeyPair, verifyRequest } from "../crypto.ts";
 
 /** Build a fake fetch that records calls and returns scripted responses. */
@@ -88,6 +90,26 @@ test("reply includes replyTo when provided", async () => {
   await client.reply({ channelType: "email", channelId: "ch2", content: "yo", replyTo: "m9" });
   const sent = JSON.parse(calls[0].init?.body as string);
   assert.equal(sent.replyTo, "m9");
+});
+
+test("resolveReplyTo reads a Telegram photo caption in reply_to_message", () => {
+  const message = {
+    reply_to_message: { message_id: 41, caption: "Photo of the booking" },
+  } as unknown as ChannelMessage;
+  assert.deepEqual(resolveReplyTo(message), { id: "41", text: "Photo of the booking" });
+  assert.deepEqual(
+    resolveReplyTo({ metadata: { replyTo: { reply_to_message: {
+      message_id: 42, caption: "Nested photo caption",
+    } } } } as unknown as ChannelMessage),
+    { id: "42", text: "Nested photo caption" },
+  );
+});
+
+test("resolveReplyTo prefers real text to a photo caption", () => {
+  const message = {
+    reply_to_message: { message_id: 41, text: "Real text", caption: "Photo caption" },
+  } as unknown as ChannelMessage;
+  assert.deepEqual(resolveReplyTo(message), { id: "41", text: "Real text" });
 });
 
 test("registerTelegram hits the right endpoint with agentId", async () => {
