@@ -6,7 +6,7 @@
  * pin that matrix and the map's hygiene, so a new module cannot silently become
  * an unmapped hole (the guard tells the author to add it to MODULE_TESTS or to
  * FULL_TESTS_TRIGGERS), and so the fast tier can never quietly become the full
- * tier by pulling in test/index.test.ts.
+ * tier by pulling in the index.ts integration suites.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -17,7 +17,7 @@ import { join, posix } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   FULL_TESTS_TRIGGERS,
-  INTEGRATION_TEST,
+  ISOLATED_INTEGRATION_SUITES,
   MODULE_TESTS,
   changedFiles,
   discoverTestFiles,
@@ -114,14 +114,21 @@ test("manifests, lockfiles and tsconfig force the full suite", () => {
   }
 });
 
-test("any test file — or anything else under test/ — forces the full suite", () => {
-  for (const path of ["test/config.test.ts", "test/index.test.ts", "test/helpers.ts", "test/fixtures/a.json"]) {
+test("any test file — or anything else under test/ — forces the full suite, except an isolated integration suite", () => {
+  for (const path of ["test/config.test.ts", "test/integration-harness.ts", "test/helpers.ts", "test/fixtures/a.json"]) {
     const selection = selectTests([path]);
     assert.equal(selection.mode, "full", `${path} must not be narrowed`);
     assert.match(selection.reason, /suite|harness/);
   }
-  // The selector's own test is the single exception: it exercises the selector.
+  // The selector's own test is one exception: it exercises the selector.
   assert.deepEqual(selectTests(["test/fast-gate.test.ts"]).tests, ["test/fast-gate.test.ts"]);
+  // …and each isolated integration suite is the other: it selects ITSELF,
+  // because its process, sandbox and imports are provably its own (guarded below).
+  for (const suite of ISOLATED_INTEGRATION_SUITES) {
+    const selection = selectTests([suite]);
+    assert.equal(selection.mode, "affected", `${suite} selects itself`);
+    assert.deepEqual(selection.tests, [suite]);
+  }
 });
 
 test("an unknown, new or deleted path forces the full suite", () => {
@@ -172,7 +179,10 @@ test("the map is a SUPERSET of the real import closure (the guard that matters)"
   // inbound-attachments all import it. Derive who-imports-what from the files
   // themselves, so a new edge cannot silently escape the fast tier's coverage.
   const modules = discoverSourcePaths();
-  const tests = discoverTestFiles().filter((t) => t !== INTEGRATION_TEST);
+  // The integration suites are excluded exactly like the old monolith was: the
+  // entry point imports every module, so holding modules to the suites would
+  // make every module change run them all. Their OWN changes self-select.
+  const tests = discoverTestFiles().filter((t) => !ISOLATED_INTEGRATION_SUITES.includes(t));
   const closureOf = (file: string, seen = new Set<string>()): Set<string> => {
     if (seen.has(file)) return seen;
     seen.add(file);
@@ -190,15 +200,16 @@ test("the map is a SUPERSET of the real import closure (the guard that matters)"
 
 test("every test file that exists is accounted for by the affected tier", () => {
   // The real condition: no test file may be an unaccounted hole. Either some
-  // mapped module selects it, or it is one of the files only the full tier runs.
+  // mapped module selects it, or it is an isolated integration suite (which
+  // self-selects), or it is one of the files only the full tier runs.
   const selected = new Set(Object.values(MODULE_TESTS).flat());
   const unaccounted = discoverTestFiles().filter(
-    (test) => !selected.has(test) && !FULL_TIER_ONLY_TESTS.includes(test),
+    (test) => !selected.has(test) && !ISOLATED_INTEGRATION_SUITES.includes(test) && !FULL_TIER_ONLY_TESTS.includes(test),
   );
   assert.deepEqual(
     unaccounted,
     [],
-    `add each to a MODULE_TESTS entry, or to FULL_TIER_ONLY_TESTS with a reason: ${unaccounted.join(", ")}`,
+    `add each to a MODULE_TESTS entry, to ISOLATED_INTEGRATION_SUITES (a new index-* integration suite), or to FULL_TIER_ONLY_TESTS with a reason: ${unaccounted.join(", ")}`,
   );
   // …and the full-tier-only list is not a dumping ground: those files must exist.
   for (const test of FULL_TIER_ONLY_TESTS) {
@@ -244,29 +255,106 @@ test("the import parser understands every form the guard claims to cover", () =>
   );
 });
 
-test("the affected tier never runs the integration suite, and the full tier does", () => {
+test("the affected tier never selects an integration suite from a module change, and a suite change selects itself", () => {
   // The boundary is deliberate (the entry point imports every module, so
-  // including it would make the fast tier the full tier), which is why it is
-  // asserted rather than assumed: no mapped module may select it…
+  // mapping the suites onto modules would make the fast tier the full tier),
+  // which is why it is asserted rather than assumed: no mapped module may
+  // select any integration suite…
   for (const module of Object.keys(MODULE_TESTS)) {
     const selection = selectTests([module]);
     if (selection.mode === "affected") {
-      assert.ok(
-        !selection.tests.includes(INTEGRATION_TEST),
-        `${module} must not select the integration suite in the affected tier`,
-      );
+      for (const suite of ISOLATED_INTEGRATION_SUITES) {
+        assert.ok(
+          !selection.tests.includes(suite),
+          `${module} must not select ${suite} in the affected tier`,
+        );
+      }
     }
   }
-  // …and changing the suite itself, or the entry point it drives, routes to FULL.
-  assert.equal(selectTests([INTEGRATION_TEST]).mode, "full");
+  // …and changing the entry point they drive, or the shared harness, routes to FULL.
   assert.equal(selectTests(["index.ts"]).mode, "full");
-  assert.ok(discoverTestFiles().includes(INTEGRATION_TEST), "the integration suite must be discovered");
+  assert.equal(selectTests(["test/integration-harness.ts"]).mode, "full");
+  // The suites exist and are discovered — a renamed suite must not silently
+  // become an unnarrowed path (the list and the disk have to agree).
+  const discovered = discoverTestFiles();
+  for (const suite of ISOLATED_INTEGRATION_SUITES) {
+    assert.ok(discovered.includes(suite), `integration suite must exist and be discovered: ${suite}`);
+  }
+});
+
+test("each isolated integration suite is PROVABLY isolated (the property the narrowing relies on)", () => {
+  // Self-selecting a changed suite is only sound while all of these hold:
+  //   1. it applies its own sandbox BEFORE importing the modules under test —
+  //      config.ts binds homedir() at import, so a static (or pre-sandbox
+  //      dynamic) import of ../config.ts or ../index.ts would leak the real
+  //      ~/.pi into the test process;
+  //   2. it imports no other test file (no shared mutable test scope);
+  //   3. the shared harness is inert at import (checked by the harness guard
+  //      below) so importing it cannot bind the environment either.
+  // A suite that breaks one of these must be dropped from
+  // ISOLATED_INTEGRATION_SUITES, not narrowed anyway.
+  // The spec strings are built by concatenation so THIS file's own import-graph
+  // closure (re-derived by the guard above) does not pick them up as real edges.
+  const INDEX_SPEC = "../index" + ".ts";
+  const CONFIG_SPEC = "../config" + ".ts";
+  const staticRuntimeImport = (source: string, spec: string) =>
+    source
+      .split("\n")
+      .some((line) => new RegExp(`^import\\s+(?!type\\b).*from\\s*["']${spec}["']`).test(line));
+  for (const suite of ISOLATED_INTEGRATION_SUITES) {
+    const source = readFileSync(join(ROOT, suite), "utf8");
+    assert.ok(!staticRuntimeImport(source, INDEX_SPEC), `${suite}: ${INDEX_SPEC} must be imported dynamically, after the sandbox`);
+    assert.ok(!staticRuntimeImport(source, CONFIG_SPEC), `${suite}: ${CONFIG_SPEC} must be imported dynamically, after the sandbox`);
+    const sandboxAt = source.indexOf("createSandbox(");
+    const indexImportAt = source.indexOf(`await import("${INDEX_SPEC}")`);
+    const configImportAt = source.indexOf(`await import("${CONFIG_SPEC}")`);
+    assert.ok(sandboxAt !== -1, `${suite}: must call createSandbox()`);
+    assert.ok(indexImportAt !== -1, `${suite}: must drive the real extension entry point`);
+    assert.ok(sandboxAt < indexImportAt, `${suite}: the sandbox must precede the index.ts import`);
+    assert.ok(configImportAt === -1 || sandboxAt < configImportAt, `${suite}: the sandbox must precede the config.ts import`);
+    assert.ok(
+      !/from\s*["']\.\/[^"']*\.test\.ts["']/.test(source),
+      `${suite}: must not import another test file`,
+    );
+  }
+});
+
+test("the shared integration harness is inert at import and bound only by call", () => {
+  const harness = "test/integration-harness.ts";
+  const source = readFileSync(join(ROOT, harness), "utf8");
+  // No runtime import of the modules under test: type-only imports are erased,
+  // so they cannot bind the pre-sandbox environment.
+  for (const line of source.split("\n")) {
+    assert.ok(
+      !/^import\s+(?!type\b).*from\s*["']\.\.\/(index|config)\.ts["']/.test(line),
+      `${harness}: runtime import of a module under test: ${line}`,
+    );
+  }
+  assert.ok(!/await\s+import\(/.test(source), `${harness}: no dynamic imports at all`);
+  // The environment redirect must live INSIDE createSandbox, not at module
+  // scope — otherwise importing the harness would already bind this process.
+  const sandboxAt = source.indexOf("export function createSandbox");
+  const envAt = source.indexOf("process.env.HOME =");
+  assert.ok(sandboxAt !== -1 && envAt > sandboxAt, `${harness}: the HOME redirect belongs to createSandbox()`);
+  // And only the isolated suites may import the harness: a unit test that
+  // imported it would be an unaccounted path the fast tier could not reason
+  // about (it forces the full suite today, which is safe but hides drift). A
+  // regex, not a substring: this file legitimately NAMES the harness path.
+  const harnessImport = /from\s*["']\.\/integration-harness\.ts["']/;
+  for (const testFile of discoverTestFiles()) {
+    if (ISOLATED_INTEGRATION_SUITES.includes(testFile)) continue;
+    const testSource = readFileSync(join(ROOT, testFile), "utf8");
+    assert.ok(
+      !harnessImport.test(testSource),
+      `${testFile}: only the isolated integration suites may use the shared harness`,
+    );
+  }
 });
 
 test("the discovered test list is what the full suite would run", () => {
   const discovered = discoverTestFiles();
-  assert.ok(discovered.length >= 15, `expected the repo's test files, got ${discovered.length}`);
-  assert.ok(discovered.includes("test/index.test.ts"));
+  assert.ok(discovered.length >= 20, `expected the repo's test files, got ${discovered.length}`);
+  for (const suite of ISOLATED_INTEGRATION_SUITES) assert.ok(discovered.includes(suite), `missing ${suite}`);
   assert.ok(discovered.every((f) => f.startsWith("test/") && f.endsWith(".test.ts")));
 });
 
@@ -352,8 +440,9 @@ function findMissingMapEdges(
 
 /** Test files that only the FULL tier runs, and why. `pack-files.test.ts` guards
  *  the published file list in package.json, and the manifest is a full-tier
- *  trigger, so it has no module to hang off. */
-const FULL_TIER_ONLY_TESTS = [INTEGRATION_TEST, "test/pack-files.test.ts"];
+ *  trigger, so it has no module to hang off. The integration suites are NOT
+ *  here: they self-select (see ISOLATED_INTEGRATION_SUITES). */
+const FULL_TIER_ONLY_TESTS = ["test/pack-files.test.ts"];
 
 test("an explicit --base that does not resolve is fatal, never a silent fallback", () => {
   const result = resolveBase("definitely-not-a-ref-in-this-repo");

@@ -42,7 +42,7 @@ Both must be green. Add or update tests for behavior changes.
 
 While iterating, `npm run test:fast` runs the same two whole-tree checks plus only
 the tests affected by your branch, so an isolated module change does not pay for
-the 3,000-line `test/index.test.ts` integration suite on every commit:
+the `test/index-*.test.ts` integration suites on every commit:
 
 ```sh
 npm run test:fast                  # npx tsc --noEmit + version gate + affected tests
@@ -52,13 +52,23 @@ npm run test:fast -- --base <ref>  # change list against <ref> instead of the de
 
 It is conservative by construction, and what it does NOT cover is stated rather
 than glossed: a mapped module runs every test file that transitively imports it
-(unit level), and the **integration suite `test/index.test.ts` is not part of the
-affected tier** — the entry point imports every module, so including it would make
-every change the full suite. That is the trade the fast tier is: only the full
-tier runs integration coverage, and the full tier is what the merger runs before
+(unit level), and the **integration suites (`test/index-profile.test.ts`,
+`index-provisioning`, `index-plaintext-url`, `index-approvals`, `index-delivery`,
+`index-session` — the behavior-owned partition of the old monolithic
+`test/index.test.ts`, bead pi-chaos-relay-h1t / ADR pi-chaos-relay-mpf) are not
+selected by module changes** — the entry point imports every module, so mapping
+them onto modules would make every change the full suite. The exception: each
+suite owns an isolated HOME/XDG sandbox in its own `node --test` child process
+and imports the entry point only dynamically after the sandbox redirect, so a
+change to ONE suite file selects exactly that suite
+(`ISOLATED_INTEGRATION_SUITES` in `scripts/fast-gate.ts`; the isolation property
+is guarded by `test/fast-gate.test.ts`). Otherwise that is the trade the fast
+tier is: only the full tier runs the remaining integration coverage, and the
+full tier is what the merger runs before
 anything lands. Anything else the selector cannot prove isolated falls back to
 the FULL suite: the entry point, `package.json` / `package-lock.json`,
-`tsconfig.json`, anything under `test/`, **any path that is not in the explicit
+`tsconfig.json`, the shared harness `test/integration-harness.ts`, any other
+path under `test/`, **any path that is not in the explicit
 reverse-dependency map** (`MODULE_TESTS` in `scripts/fast-gate.ts`), a change list
 it cannot read, and a checkout where no default branch resolves. The working tree
 is always included, so a dirty checkout only ever widens the run. `--base <ref>`
@@ -143,8 +153,9 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
   arrives — that misattribution is what this bead fixes. With nothing pending, a
   non-relay turn is not gated at all, and clears any binding left by a turn that ended
   without `agent_end`.
-  `test/index.test.ts` drives turns through a `startTurn` helper (`agent_start` then the
-  turn's user `message_start`), because a test that fires only `agent_start` no longer exercises
+  The `test/index-*.test.ts` suites drive turns through a shared `startTurn` helper
+  (`agent_start` then the turn's user `message_start`, in
+  `test/integration-harness.ts`), because a test that fires only `agent_start` no longer exercises
   binding, and `agent_start` alone cannot model the queued path at all.
 - `relay-client.ts` — signed HTTP client for the relay (ECDSA P-256 identity).
 - `ws-client.ts` — WebSocket transport (push delivery + reconnect/backoff). The
@@ -207,6 +218,19 @@ env-var lists in the README and skills must stay 1:1 with `index.ts` and
   instead of timing out.
 - `config.ts` — resolves config from env + `~/.pi/chaos-relay.json` (0600).
 - `crypto.ts` — keypair generation + request signing.
+- `test/` — one unit suite per module, plus the behavior-owned integration
+  suites `test/index-{profile,provisioning,plaintext-url,approvals,delivery,session}.test.ts`
+  (the partition of the old monolithic `test/index.test.ts`; bead
+  pi-chaos-relay-h1t). Each suite redirects into its own mkdtemp HOME/XDG
+  sandbox via `createSandbox()` BEFORE its dynamic imports of `../config.ts` /
+  `../index.ts` (config binds homedir() at import), and `node --test` gives each
+  file its own process. Shared fixtures live in `test/integration-harness.ts`,
+  which is INERT at import (no env, no fs, no imports of the modules under
+  test) — sandbox and config-dependent helpers are factories
+  (`createStateHelpers`, `createWithRelayEnv`). A new integration suite must be
+  added to `ISOLATED_INTEGRATION_SUITES` in `scripts/fast-gate.ts` and satisfy
+  the isolation guards in `test/fast-gate.test.ts`; otherwise its changes run
+  the full suite.
 
 ## Conventions
 

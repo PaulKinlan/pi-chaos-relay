@@ -5,8 +5,8 @@
  * This is NOT the gate that lands a change. The merger runs the full
  * `npx tsc --noEmit && npm test` on the merged union; this script exists so an
  * implementer working on one module does not pay for the 3,297-line
- * `test/index.test.ts` integration suite on every commit (decision
- * pi-chaos-relay-cru, bead pi-chaos-relay-a1x).
+ * `test/index-*.test.ts` integration suite on every commit (decision
+ * pi-chaos-relay-cru, beads pi-chaos-relay-a1x and pi-chaos-relay-h1t).
  *
  * It always runs the two WHOLE-TREE checks — `npx tsc --noEmit` and the version
  * consistency gate — and then either the affected test files or, when anything
@@ -17,13 +17,19 @@
  *   - A mapped module runs every test file that transitively imports it
  *     (MODULE_TESTS, derived from the real import graph and re-checked by
  *     test/fast-gate.test.ts). That is unit-level coverage.
- *   - `test/index.test.ts` is the INTEGRATION suite and is NOT run by the
- *     affected tier. The entry point imports every module, so including it would
- *     make every change the full suite and the fast tier would not exist. It
- *     runs in the full tier — which the merger always runs, and which this
- *     script runs whenever the entry point, a manifest/lockfile, tsconfig, the
- *     test tree, or any unmapped path is touched. A fast PASS is therefore NOT a
- *     landing verdict, and the banner says so.
+ *   - The index.ts integration coverage is partitioned into the behavior-owned
+ *     suites listed in ISOLATED_INTEGRATION_SUITES (bead pi-chaos-relay-h1t, ADR
+ *     pi-chaos-relay-mpf). Each suite owns an isolated HOME/XDG sandbox inside
+ *     its own node --test child process and imports the entry point only
+ *     dynamically, AFTER the sandbox redirect — so changing ONE suite selects
+ *     exactly that suite here. They are still NOT selected by module changes:
+ *     the entry point imports every module, so mapping them onto modules would
+ *     make every change the full suite and the fast tier would not exist. The
+ *     full tier — which the merger always runs, and which this script runs
+ *     whenever the entry point, a manifest/lockfile, tsconfig, the shared test
+ *     harness, any other test/ path, or any unmapped path is touched — runs
+ *     them all. A fast PASS is therefore NOT a landing verdict, and the banner
+ *     says so.
  *   - Anything this script does not recognise — a brand-new module, a doc, a
  *     deleted path, an unreadable change list, a checkout where the default
  *     branch cannot be resolved — falls back to the full suite. Every guard here
@@ -43,8 +49,28 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 
-/** The integration suite the affected tier deliberately does not run. */
-export const INTEGRATION_TEST = "test/index.test.ts";
+/**
+ * The behavior-owned integration suites partitioned out of the old monolithic
+ * test/index.test.ts (bead pi-chaos-relay-h1t, ADR pi-chaos-relay-mpf). Each one
+ * is safe to run ALONE in the fast tier because it is provably isolated: its own
+ * node --test child process, its own mkdtemp HOME/XDG sandbox applied before the
+ * dynamic imports of ../config.ts and ../index.ts, and no imports of any other
+ * test file. test/fast-gate.test.ts guards all three properties — a suite that
+ * loses one must be REMOVED from this list (falling back to the full tier for
+ * its changes), never narrowed anyway.
+ *
+ * Changing one of these files selects exactly that file. The shared harness
+ * (test/integration-harness.ts), every other test/ path, and index.ts itself
+ * stay full-suite triggers.
+ */
+export const ISOLATED_INTEGRATION_SUITES = [
+  "test/index-approvals.test.ts",
+  "test/index-delivery.test.ts",
+  "test/index-plaintext-url.test.ts",
+  "test/index-profile.test.ts",
+  "test/index-provisioning.test.ts",
+  "test/index-session.test.ts",
+];
 
 /**
  * Explicit reverse dependency map: a source path → EVERY test file that
@@ -54,7 +80,8 @@ export const INTEGRATION_TEST = "test/index.test.ts";
  * relay-client, ws-client and inbound-attachments; crypto reaches seven test
  * files through config and relay-client) — and re-derived by
  * test/fast-gate.test.ts, which FAILS if the map under-covers the graph. The
- * integration suite is excluded here and listed under INTEGRATION_TEST instead.
+ * integration suites are excluded here and listed under
+ * ISOLATED_INTEGRATION_SUITES instead.
  *
  * A path in NEITHER this map nor FULL_TESTS_TRIGGERS is never narrowed.
  */
@@ -170,16 +197,22 @@ export function selectTests(changed: string[]): Selection {
   });
   const tests = new Set<string>();
   const modules: string[] = [];
+  const suites: string[] = [];
 
   for (const path of normalized) {
     if (path === SELF_TEST) {
       tests.add(SELF_TEST);
       continue;
     }
-    // The suite itself: the integration test, any other test file, and any
-    // other path under test/ (a shared helper or fixture one file would not
-    // cover).
-    if (path === INTEGRATION_TEST) return full(`${path} changed: the integration suite`);
+    // An isolated integration suite selects exactly itself: its sandbox and
+    // process are its own, so a suite-only change needs nothing else.
+    if (ISOLATED_INTEGRATION_SUITES.includes(path)) {
+      tests.add(path);
+      suites.push(path);
+      continue;
+    }
+    // Every other path under test/ — a unit suite, the shared harness, a
+    // fixture — is shared state the narrowing cannot reason about: full suite.
     if (path.startsWith("test/")) return full(`${path} changed: the suite or its harness`);
     if (FULL_TESTS_TRIGGERS.has(path)) return full(`${path} changed: global`);
     const mapped = MODULE_TESTS[path];
@@ -199,7 +232,7 @@ export function selectTests(changed: string[]): Selection {
   return {
     mode: "affected",
     tests: [...tests].sort(),
-    reason: `isolated to ${modules.join(", ") || SELF_TEST}`,
+    reason: `isolated to ${[...modules, ...suites].join(", ") || SELF_TEST}`,
     changed: normalized,
   };
 }
@@ -300,8 +333,8 @@ const USAGE = `usage: node scripts/fast-gate.ts [--base <ref>] [--dry-run] [--he
 
 Runs, in order: npx tsc --noEmit; the version-consistency gate; then either the
 affected test files or the full suite when the change is not provably isolated.
-Unit level only — the integration suite (test/index.test.ts) runs in the full
-tier, and the merger still runs the full gate on the merged union.`;
+Unit level plus any isolated integration suite that changed itself — the merger
+still runs the full gate on the merged union.`;
 
 function parseArgs(argv: string[]): { base?: string; dryRun: boolean } {
   const opts: { base?: string; dryRun: boolean } = { dryRun: false };
@@ -366,8 +399,9 @@ function main(): void {
     console.log(
       `[fast-gate] tests (${selection.tests.length} of ${discoverTestFiles().length}): ${selection.tests.join(" ") || "(none)"}`,
     );
+    const notRun = ISOLATED_INTEGRATION_SUITES.filter((s) => !selection.tests.includes(s));
     console.log(
-      `[fast-gate] NOT run by this tier: ${INTEGRATION_TEST} (integration) — a PASS here is not a landing verdict`,
+      `[fast-gate] NOT run by this tier: ${notRun.length ? notRun.join(", ") : "(none — every integration suite was selected)"} — a PASS here is not a landing verdict`,
     );
   }
 
