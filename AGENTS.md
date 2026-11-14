@@ -74,6 +74,25 @@ re-derived by that test file (a new import edge cannot silently escape the fast
 tier). On the fleet VMs this is what `~/.fleet/check.conf` points `CHECK_FAST_CMD`
 at; `CHECK_CMD` stays the full gate.
 
+**Coverage markers.** A fast PASS is evidence only if its log says which suites
+executed, so the gate emits the fleet's producer vocabulary (fleet `docs/speed.md`
+R14/R15), one fact per line, anchored at line start:
+
+```
+fast-gate: running: test/config.test.ts   # dispatched, outcome not yet known
+fast-gate: passed: test/config.test.ts    # the suite executed and passed
+fast-gate: failed: test/config.test.ts    # TAP proves this suite failed
+fast-gate: unknown: <reason>              # the gate never reached its dispatch
+```
+
+`running:` is printed BEFORE the runner starts and `passed:`/`failed:` only after
+it exits, so a run that is killed leaves its dispatch behind and never a pass; a
+whole-tree check that fails first (typecheck, version gate) publishes only
+`unknown:`, which the fleet reads as UNKNOWN coverage rather than as a zero.
+Suites are named repo-relative (`test/<name>.test.ts`). The bracketed
+`[fast-gate] …` banners are deliberately OUTSIDE the vocabulary, so a banner can
+never be harvested as a suite name.
+
 `npm test` also enforces version consistency. Its `pretest` step runs
 `scripts/check-version-consistency-gate.mjs`, which picks the strongest base it can
 resolve and then runs the strict check in `scripts/check-version-consistency.mjs`:
