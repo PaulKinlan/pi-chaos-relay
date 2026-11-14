@@ -216,7 +216,7 @@ export async function materializeInboundAttachments(
   // caller naming an unusable root on purpose still gets the failure it asked for. This
   // resolution is deliberately PURE and must stay so — creating the directory here added
   // an await before the delivery loop, which changed the turn ordering that
-  // index.test.ts's approval assertions pin. Bisecting that out cost a review round.
+  // test/index-approvals.test.ts's approval assertions pin. Bisecting that out cost a review round.
   const effectiveRoot = root ?? defaultInboundAttachmentRoot();
   const mayFallback = root === undefined;
   const images: PiImageContent[] = [];

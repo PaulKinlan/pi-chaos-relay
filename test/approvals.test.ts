@@ -7,8 +7,9 @@
  * secret to the channel that is asking to be trusted. Both are exercised here
  * directly, without the 2,400-line extension, so a failure names the primitive.
  *
- * The summarizeToolCall tests at the end were MOVED here from
- * test/index.test.ts when the function was extracted; their assertions are
+ * The summarizeToolCall tests at the end were MOVED here from the monolithic
+ * test/index.test.ts (since partitioned into the test/index-*.test.ts suites,
+ * bead pi-chaos-relay-h1t) when the function was extracted; their assertions are
  * unchanged, they simply no longer import the entry point to reach it.
  */
 import { test } from "node:test";

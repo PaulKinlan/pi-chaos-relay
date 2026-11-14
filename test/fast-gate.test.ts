@@ -297,14 +297,10 @@ test("each isolated integration suite is PROVABLY isolated (the property the nar
   // closure (re-derived by the guard above) does not pick them up as real edges.
   const INDEX_SPEC = "../index" + ".ts";
   const CONFIG_SPEC = "../config" + ".ts";
-  const staticRuntimeImport = (source: string, spec: string) =>
-    source
-      .split("\n")
-      .some((line) => new RegExp(`^import\\s+(?!type\\b).*from\\s*["']${spec}["']`).test(line));
   for (const suite of ISOLATED_INTEGRATION_SUITES) {
     const source = readFileSync(join(ROOT, suite), "utf8");
-    assert.ok(!staticRuntimeImport(source, INDEX_SPEC), `${suite}: ${INDEX_SPEC} must be imported dynamically, after the sandbox`);
-    assert.ok(!staticRuntimeImport(source, CONFIG_SPEC), `${suite}: ${CONFIG_SPEC} must be imported dynamically, after the sandbox`);
+    assert.ok(!staticRuntimeImportOf(source, INDEX_SPEC), `${suite}: ${INDEX_SPEC} must be imported dynamically, after the sandbox`);
+    assert.ok(!staticRuntimeImportOf(source, CONFIG_SPEC), `${suite}: ${CONFIG_SPEC} must be imported dynamically, after the sandbox`);
     const sandboxAt = source.indexOf("createSandbox(");
     const indexImportAt = source.indexOf(`await import("${INDEX_SPEC}")`);
     const configImportAt = source.indexOf(`await import("${CONFIG_SPEC}")`);
@@ -312,40 +308,49 @@ test("each isolated integration suite is PROVABLY isolated (the property the nar
     assert.ok(indexImportAt !== -1, `${suite}: must drive the real extension entry point`);
     assert.ok(sandboxAt < indexImportAt, `${suite}: the sandbox must precede the index.ts import`);
     assert.ok(configImportAt === -1 || sandboxAt < configImportAt, `${suite}: the sandbox must precede the config.ts import`);
-    assert.ok(
-      !/from\s*["']\.\/[^"']*\.test\.ts["']/.test(source),
-      `${suite}: must not import another test file`,
-    );
+    // Cross-test imports in ANY form — static (including multi-line specifier
+    // lists), side-effect, or dynamic (`await import("./x.test.ts")`), and from
+    // any relative root (`./x.test.ts`, `../test/x.test.ts`) — via the same
+    // specifier parser the import-closure guard uses. Bead pi-chaos-relay-9tp:
+    // the line-anchored regex this replaces missed the multi-line, dynamic and
+    // parent-relative forms.
+    const crossTest = importSpecifiersFrom(source).filter((spec) => spec.endsWith(".test.ts"));
+    assert.deepEqual(crossTest, [], `${suite}: must not import another test file (${crossTest.join(", ")})`);
   }
 });
 
 test("the shared integration harness is inert at import and bound only by call", () => {
   const harness = "test/integration-harness.ts";
   const source = readFileSync(join(ROOT, harness), "utf8");
-  // No runtime import of the modules under test: type-only imports are erased,
-  // so they cannot bind the pre-sandbox environment.
-  for (const line of source.split("\n")) {
-    assert.ok(
-      !/^import\s+(?!type\b).*from\s*["']\.\.\/(index|config)\.ts["']/.test(line),
-      `${harness}: runtime import of a module under test: ${line}`,
-    );
-  }
+  // No runtime import of the modules under test, in ANY static form
+  // (multi-line specifier lists included): type-only imports are erased, so
+  // they cannot bind the pre-sandbox environment. The spec strings are built
+  // by concatenation so THIS file's own import-graph closure does not pick
+  // them up as real edges.
+  assert.ok(
+    !staticRuntimeImportOf(source, "../index" + ".ts"),
+    `${harness}: runtime import of the entry point`,
+  );
+  assert.ok(
+    !staticRuntimeImportOf(source, "../config" + ".ts"),
+    `${harness}: runtime import of config`,
+  );
   assert.ok(!/await\s+import\(/.test(source), `${harness}: no dynamic imports at all`);
   // The environment redirect must live INSIDE createSandbox, not at module
   // scope — otherwise importing the harness would already bind this process.
   const sandboxAt = source.indexOf("export function createSandbox");
   const envAt = source.indexOf("process.env.HOME =");
   assert.ok(sandboxAt !== -1 && envAt > sandboxAt, `${harness}: the HOME redirect belongs to createSandbox()`);
-  // And only the isolated suites may import the harness: a unit test that
-  // imported it would be an unaccounted path the fast tier could not reason
-  // about (it forces the full suite today, which is safe but hides drift). A
-  // regex, not a substring: this file legitimately NAMES the harness path.
-  const harnessImport = /from\s*["']\.\/integration-harness\.ts["']/;
+  // And only the isolated suites may import the harness, in any import form:
+  // a unit test that imported it would be an unaccounted path the fast tier
+  // could not reason about (it forces the full suite today, which is safe but
+  // hides drift). Parsed, not substringed: this file legitimately NAMES the
+  // harness path, and a multi-line or dynamic import must not slip past (9tp).
   for (const testFile of discoverTestFiles()) {
     if (ISOLATED_INTEGRATION_SUITES.includes(testFile)) continue;
     const testSource = readFileSync(join(ROOT, testFile), "utf8");
     assert.ok(
-      !harnessImport.test(testSource),
+      !importSpecifiersFrom(testSource).includes("./integration-harness.ts"),
       `${testFile}: only the isolated integration suites may use the shared harness`,
     );
   }
@@ -374,6 +379,45 @@ test("the base resolution names what it used, and the change list is real", () =
   assert.match(head.note, /requested/);
   const thisCommit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8" }).stdout.trim();
   assert.equal(head.mergeBase, thisCommit);
+});
+
+/**
+ * Static-import detection for the isolation guards, covering EVERY static form
+ * — including a multi-line specifier list (bead pi-chaos-relay-9tp: the
+ * line-anchored check this replaces let a static import whose `from` clause
+ * sits on a later line slip past). `import type` is exempt: it is erased at
+ * compile time and cannot bind the pre-sandbox environment. Dynamic
+ * `await import(...)` is deliberately NOT matched — the suites import the
+ * modules under test that way, after the sandbox redirect. (This comment must
+ * not contain a literal `from "../<module>"` — the import-closure guard above
+ * parses comments too.)
+ */
+function staticRuntimeImportOf(source: string, spec: string): boolean {
+  const escaped = spec.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return (
+    new RegExp(`\\bimport\\s+(?!type\\b)[^;]*?\\bfrom\\s*["']${escaped}["']`, "s").test(source) ||
+    new RegExp(`\\bimport\\s*["']${escaped}["']`).test(source) // side-effect form
+  );
+}
+
+test("staticRuntimeImportOf catches every static form (and exempts type-only and dynamic)", () => {
+  // The spec and every fixture are built through $S substitution so THIS
+  // file's own import-graph closure (re-derived by the guard above) does not
+  // read the fixtures as real import edges.
+  const spec = "../index" + ".ts";
+  const fixture = (form: string) => form.replaceAll("$S", spec);
+  assert.ok(staticRuntimeImportOf(fixture('import x from "$S";'), spec));
+  assert.ok(
+    staticRuntimeImportOf(fixture('import {\n  default as ext,\n} from "$S";'), spec),
+    "a multi-line specifier list is still a static import",
+  );
+  assert.ok(staticRuntimeImportOf(fixture('import "$S";'), spec), "the side-effect form");
+  assert.ok(!staticRuntimeImportOf(fixture('import type { X } from "$S";'), spec), "type-only is erased");
+  assert.ok(
+    !staticRuntimeImportOf(fixture('const m = await import("$S");'), spec),
+    "dynamic import is what the suites legitimately use, after the sandbox",
+  );
+  assert.ok(!staticRuntimeImportOf(fixture('import x from "$S.bak";'), spec), "the dot in .ts is not a wildcard");
 });
 
 /**
