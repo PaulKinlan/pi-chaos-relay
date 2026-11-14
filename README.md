@@ -640,6 +640,11 @@ cannot read, and a checkout with no resolvable default branch (`--base <ref>`
 selects a base and must resolve). Landing — and the fleet merger — still run
 `npx tsc --noEmit && npm test` on the merged tree; see AGENTS.md.
 
+Every run also prints line-anchored coverage markers — `fast-gate: running:
+<suite>` before a suite is dispatched, `passed:`/`failed:` once its outcome is
+known, and `fast-gate: unknown: <reason>` when a whole-tree check failed first —
+so a recorded fast verdict names the tests that actually ran. See AGENTS.md.
+
 `npm test` runs the version check first (via `pretest`), so a tree whose
 `package.json` and `package-lock.json` disagree fails the gate instead of shipping —
 that half needs no base and always applies. The check also refuses a version that

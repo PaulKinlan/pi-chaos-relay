@@ -42,6 +42,11 @@ FULL suite, and `--base <ref>` must resolve. It never replaces the merger's full
 gate: a change is green only after `npx tsc --noEmit && npm test` passes on the
 merged union. See AGENTS.md for the map's rules.
 
+It also emits the fleet's coverage markers — `fast-gate: running|passed|failed:
+<suite>` and `fast-gate: unknown: <reason>`, anchored at line start — so a cached
+fast verdict names the suites that actually ran instead of reading UNKNOWN. See
+AGENTS.md ("Coverage markers").
+
 ## Keep docs in sync (same commit)
 
 Any change to a command (`/chaos-relay …`), tool (`relay_*`), env var

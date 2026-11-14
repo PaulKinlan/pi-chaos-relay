@@ -10,7 +10,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { join, posix } from "node:path";
@@ -18,11 +18,16 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   FULL_TESTS_TRIGGERS,
   INTEGRATION_TEST,
+  MARKER_PREFIX,
   MODULE_TESTS,
   changedFiles,
   discoverTestFiles,
+  dispatchMarkers,
+  failingSuitesFromTap,
+  outcomeMarkers,
   resolveBase,
   selectTests,
+  unknownMarker,
 } from "../scripts/fast-gate.ts";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -439,4 +444,197 @@ test("a bad invocation fails closed with a usage error", () => {
 test("the selector module is importable by path URL (no CJS/ESM trap)", () => {
   assert.equal(new URL(SCRIPT_URL).protocol, "file:");
   assert.ok(pathToFileURL(SCRIPT_PATH).href.endsWith("scripts/fast-gate.ts"));
+});
+
+// ── Coverage markers (fleet docs/speed.md R14/R15) ─────────────────────────
+//
+// A fast PASS proves nothing about coverage unless the log says WHICH suites
+// executed. Before this bead every PASS recorded here read UNKNOWN ("no
+// fast-gate marker and no runner evidence"), because the gate only printed
+// bracketed `[fast-gate] …` banners that the fleet's reader cannot see.
+
+/**
+ * The vocabulary fleet tooling accepts, anchored at line start, copied from
+ * `~/fleet/remote/check-coverage.py` (docs/speed.md R15). A marker outside this
+ * set is invisible to the reader; anything matching it is published as a suite
+ * name, so the anchoring is the contract and these tests pin it.
+ */
+const ACCEPTED_MARKERS = [
+  /^fast-gate:\s*(?:running|ran|passed|completed|failed):\s*(.*)$/,
+  /^fast-gate:\s*unmapped:\s*(.*)$/,
+  /^fast-gate:\s*unknown:\s*(.*)$/,
+];
+
+const acceptedByReader = (line: string): boolean => ACCEPTED_MARKERS.some((re) => re.test(line));
+
+/** A TAP report of one assertion failure in b.test.mjs, as `node --test` writes it. */
+const TAP_ONE_FAILURE = `TAP version 13
+# Subtest: passes
+ok 1 - passes
+  ---
+  duration_ms: 1.220968
+  type: 'test'
+  ...
+# Subtest: fails
+not ok 2 - fails
+  ---
+  duration_ms: 2.383005
+  location: '/work/repo/test/b.test.ts:3:1'
+  failureType: 'testCodeFailure'
+  error: '1 == 2'
+  ...
+1..2
+# tests 2
+# fail 1
+`;
+
+/** A file whose import throws: TAP still carries the file's location. */
+const TAP_IMPORT_THROW = `TAP version 13
+# Subtest: /work/repo/test/c.test.ts
+not ok 1 - /work/repo/test/c.test.ts
+  ---
+  duration_ms: 131.36
+  location: '/work/repo/test/c.test.ts:1:1'
+  ...
+1..1
+`;
+
+test("every emitted marker is inside the vocabulary the fleet reader accepts", () => {
+  const lines = [
+    ...dispatchMarkers(["test/a.test.ts", "test/b.test.ts"]),
+    ...outcomeMarkers(["test/a.test.ts"], { ok: true }),
+    ...outcomeMarkers(["test/a.test.ts", "test/b.test.ts"], { ok: false, tap: TAP_ONE_FAILURE }),
+    unknownMarker("the whole-tree typecheck failed, so no test suite was dispatched"),
+  ];
+  for (const line of lines) assert.ok(acceptedByReader(line), `not in the accepted vocabulary: ${line}`);
+  // The human banners stay OUTSIDE it: an unanchored marker once published
+  // sixteen "files" from a run that had four (fleet-agch).
+  for (const banner of [
+    "[fast-gate] ok tests (full suite)",
+    "[fast-gate] mode: affected — isolated to config.ts",
+    "  fast-gate: passed: test/indented.test.ts",
+  ]) {
+    assert.equal(acceptedByReader(banner), false, `a banner must never be read as coverage: ${banner}`);
+  }
+});
+
+test("the dispatch marker names each planned suite before anything runs", () => {
+  assert.deepEqual(dispatchMarkers(["test/config.test.ts", "test/url-redact.test.ts"]), [
+    `${MARKER_PREFIX}running: test/config.test.ts`,
+    `${MARKER_PREFIX}running: test/url-redact.test.ts`,
+  ]);
+  assert.deepEqual(dispatchMarkers([]), []);
+});
+
+test("a passing run claims exactly the suites it dispatched", () => {
+  const planned = ["test/config.test.ts", "test/url-redact.test.ts"];
+  assert.deepEqual(outcomeMarkers(planned, { ok: true }), [
+    `${MARKER_PREFIX}passed: test/config.test.ts`,
+    `${MARKER_PREFIX}passed: test/url-redact.test.ts`,
+  ]);
+});
+
+test("a mixed run claims only the suite TAP proves failed — never a pass", () => {
+  const planned = ["test/a.test.ts", "test/b.test.ts", "test/c.test.ts"];
+  const markers = outcomeMarkers(planned, { ok: false, tap: TAP_ONE_FAILURE });
+  assert.deepEqual(markers, [`${MARKER_PREFIX}failed: test/b.test.ts`]);
+  assert.equal(
+    markers.some((line) => /passed:/.test(line)),
+    false,
+    "a suite must never be announced as passed when the run failed",
+  );
+  // An import-time throw is attributed the same way (the runner reports the file).
+  assert.deepEqual(outcomeMarkers(planned, { ok: false, tap: TAP_IMPORT_THROW }), [
+    `${MARKER_PREFIX}failed: test/c.test.ts`,
+  ]);
+});
+
+test("a failed run with no usable evidence claims nothing at all", () => {
+  const planned = ["test/a.test.ts", "test/b.test.ts"];
+  // No TAP report at all (the runner never produced one).
+  assert.deepEqual(outcomeMarkers(planned, { ok: false }), []);
+  // TAP that only names a path outside the plan (a shared helper) is not guessed at.
+  const helperTap = `not ok 1 - helper
+  ---
+  location: '/work/repo/test/helpers.ts:9:1'
+  ...
+1..1
+`;
+  assert.deepEqual(outcomeMarkers(planned, { ok: false, tap: helperTap }), []);
+  assert.deepEqual(failingSuitesFromTap(TAP_ONE_FAILURE, []), []);
+  // …and a report whose every entry passed attributes no failure.
+  const allPassed = `ok 1 - passes
+ok 2 - other
+1..2
+`;
+  assert.deepEqual(failingSuitesFromTap(allPassed, planned), []);
+});
+
+test("the TAP parser reads quoted, unquoted and file:// locations", () => {
+  const planned = ["test/a.test.ts", "test/b.test.ts", "test/c.test.ts"];
+  const tap = [
+    "not ok 1 - one",
+    "  location: 'test/a.test.ts:4:2'",
+    "not ok 2 - two",
+    "  location: file:///work/repo/test/b.test.ts:7:9",
+    "not ok 3 - three",
+    "  location: /work/repo/test/c.test.ts:1:1",
+    "1..3",
+  ].join("\n");
+  assert.deepEqual(failingSuitesFromTap(tap, planned), planned);
+  // Plan order wins, so the marker order does not depend on the runner's order.
+  assert.deepEqual(failingSuitesFromTap(tap, ["test/c.test.ts", "test/a.test.ts"]), [
+    "test/c.test.ts",
+    "test/a.test.ts",
+  ]);
+});
+
+test("a pre-dispatch failure is UNKNOWN and claims no suite", () => {
+  // End to end: a real checkout where the whole-tree typecheck fails. The marker
+  // contract is the point — coverage must read UNKNOWN (never a zero, never a
+  // pass) and no suite may be announced as running or passed.
+  const dir = mkdtempSync(join(tmpdir(), "fast-gate-fail-"));
+  try {
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    mkdirSync(join(dir, "node_modules", ".bin"), { recursive: true });
+    copyFileSync(SCRIPT_PATH, join(dir, "scripts", "fast-gate.ts"));
+    // A local `tsc` that fails, so the test needs no network and no real TypeScript.
+    const fakeTsc = join(dir, "node_modules", ".bin", "tsc");
+    writeFileSync(fakeTsc, "#!/bin/sh\necho \"fake tsc: type error\" >&2\nexit 1\n", { mode: 0o755 });
+    const gitIn = (args: string[]) =>
+      spawnSync("git", ["-c", "user.email=t@example.com", "-c", "user.name=t", ...args], {
+        cwd: dir,
+        encoding: "utf8",
+      });
+    gitIn(["init", "-q", "-b", "work"]);
+    gitIn(["add", "."]);
+    gitIn(["commit", "-q", "-m", "init"]);
+
+    const result = spawnSync(process.execPath, ["scripts/fast-gate.ts"], { cwd: dir, encoding: "utf8" });
+    assert.notEqual(result.status, 0, "a failed whole-tree check must fail the gate");
+    assert.match(result.stdout, /^fast-gate: unknown: the whole-tree typecheck failed/m);
+    assert.doesNotMatch(result.stdout, /^fast-gate: (?:running|passed|failed):/m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("every test file the runner would discover is one the gate can name", () => {
+  // In the full tier the gate runs `node --test` discovery but names the suites
+  // from discoverTestFiles(), so the two sets must be the same: otherwise the
+  // markers would understate (or invent) what ran. Node discovers `test/**/*`
+  // plus root-level `*.test.*`, `*-test.*`, `*_test.*`, `test-*.*` and `test.*`.
+  assert.deepEqual(
+    (readdirSync(join(ROOT, "test")) as string[]).filter((name) => !name.endsWith(".test.ts")),
+    [],
+    "every file under test/ must be named *.test.ts, or discovery and the marker list diverge",
+  );
+  const tracked = spawnSync("git", ["ls-files"], { cwd: ROOT, encoding: "utf8" }).stdout.split("\n");
+  const disguised = tracked.filter(
+    (path) =>
+      path !== "" &&
+      !path.startsWith("test/") &&
+      /(^|\/)(?:[^/]*\.test\.|test-[^/]*\.|test\.|[^/]*-test\.|[^/]*_test\.)/.test(path),
+  );
+  assert.deepEqual(disguised, [], "a test file outside test/ would run but never be named");
 });
