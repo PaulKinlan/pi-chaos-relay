@@ -2,6 +2,10 @@ node_modules/
 *.log
 .DS_Store
 
+# Local incremental type-check cache (tsconfig incremental+tsBuildInfoFile).
+# Machine- and worktree-local; safe to delete (the next tsc run rebuilds it).
+/.tsbuildinfo
+
 # Local secrets / credentials — never commit. The extension writes the relay
 # API key to ~/.pi/chaos-relay.json, but guard against any stray local copies.
 chaos-relay.json

@@ -631,7 +631,9 @@ npm run test:fast   # implementer iteration: the two checks above + only the aff
 `npm run test:fast` is for iteration, not for landing. It always runs the
 whole-tree type-check and the version gate, then narrows the tests using the
 explicit reverse-dependency map in `scripts/fast-gate.ts` (a mapped module means
-every test file that transitively imports it). Module changes never select the
+every test file that transitively imports it). The type-check is incremental
+(worktree-local gitignored `/.tsbuildinfo` cache) and runs concurrently with the
+selected tests after the sub-second version gate. Module changes never select the
 integration suites — the entry point imports every module, so including them
 would make every change the full suite — but the suites are partitioned by
 behavior (`test/index-*.test.ts`, each with its own isolated HOME/XDG sandbox and

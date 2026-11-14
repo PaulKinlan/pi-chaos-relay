@@ -50,6 +50,14 @@ npm run test:fast -- --dry-run     # print the plan (mode, tests, commands), run
 npm run test:fast -- --base <ref>  # change list against <ref> instead of the default branch
 ```
 
+Two execution details matter for its speed (bead pi-chaos-relay-eu4): the
+type-check is INCREMENTAL — tsconfig sets `incremental` with the cache at the
+gitignored, worktree-local `/.tsbuildinfo` (never under `node_modules`, which
+the fleet hard-links from a shared store), so a repeat run re-checks only what
+changed (~7-9s warm vs ~14-18s cold on the fleet's 2-vCPU VMs) — and after the
+sub-second version gate, the type-check and the selected tests run
+CONCURRENTLY, both verdicts always reported.
+
 It is conservative by construction, and what it does NOT cover is stated rather
 than glossed: a mapped module runs every test file that transitively imports it
 (unit level), and the **integration suites (`test/index-profile.test.ts`,
@@ -75,7 +83,8 @@ is always included, so a dirty checkout only ever widens the run. `--base <ref>`
 must resolve: a typo is a usage error, not a narrower run.
 
 This is NOT the landing gate. The merger runs the full
-`npx tsc --noEmit && npm test` on the merged union, and a change is green only
+`npx tsc --noEmit && npm test` on the merged union (the incremental cache helps
+there too, in the merger's own worktree), and a change is green only
 once that passes. When you add a module, decide its fast-tier coverage in one
 line — add it to `MODULE_TESTS` (its own tests plus the tests of the modules that
 import it) or to `FULL_TESTS_TRIGGERS`; `test/fast-gate.test.ts` fails while a

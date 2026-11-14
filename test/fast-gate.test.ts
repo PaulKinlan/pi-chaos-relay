@@ -444,6 +444,25 @@ function findMissingMapEdges(
  *  here: they self-select (see ISOLATED_INTEGRATION_SUITES). */
 const FULL_TIER_ONLY_TESTS = ["test/pack-files.test.ts"];
 
+test("the type-check cache is incremental, worktree-local, and gitignored", () => {
+  // tsconfig carries incremental + a root-level tsBuildInfoFile so EVERY tsc
+  // invocation (fast gate, full gate, local runs) reuses it (bead
+  // pi-chaos-relay-eu4). The cache must never be committed (machine-local
+  // state) and must not live under node_modules (the fleet hard-links that
+  // from a shared store — a cache there would be written by every lane at
+  // once).
+  const tsconfig = JSON.parse(readFileSync(join(ROOT, "tsconfig.json"), "utf8")) as {
+    compilerOptions: Record<string, unknown>;
+  };
+  assert.equal(tsconfig.compilerOptions.incremental, true, "tsconfig keeps the incremental type-check");
+  assert.equal(tsconfig.compilerOptions.tsBuildInfoFile, ".tsbuildinfo", "the cache is worktree-local, not in node_modules");
+  const gitignore = readFileSync(join(ROOT, ".gitignore"), "utf8");
+  assert.ok(
+    gitignore.split("\n").some((line) => line.trim() === "/.tsbuildinfo"),
+    ".gitignore must exclude the tsbuildinfo cache",
+  );
+});
+
 test("an explicit --base that does not resolve is fatal, never a silent fallback", () => {
   const result = resolveBase("definitely-not-a-ref-in-this-repo");
   assert.equal(result.ok, false);

@@ -34,7 +34,9 @@ Both must pass. Add/adjust tests for behavior changes.
 **While iterating**, `npm run test:fast` runs `npx tsc --noEmit` and the version
 gate as always, then only the test files affected by your change
 (`scripts/fast-gate.ts` holds the explicit map, re-derived from the real import
-graph by `test/fast-gate.test.ts`). It is a UNIT tier plus the isolated
+graph by `test/fast-gate.test.ts`). The type-check is incremental (worktree-local
+gitignored `/.tsbuildinfo` cache) and runs concurrently with the selected tests
+after the version gate. It is a UNIT tier plus the isolated
 integration suites: the behavior-owned `test/index-*.test.ts` suites each own an
 isolated HOME/XDG sandbox and process, so changing ONE suite selects only that
 suite, while module changes never select them. The entry point, the

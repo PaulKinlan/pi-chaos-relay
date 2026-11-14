@@ -35,6 +35,15 @@
  *     branch cannot be resolved — falls back to the full suite. Every guard here
  *     fails CLOSED: a wrong answer can cost time, never coverage.
  *
+ * EXECUTION SHAPE (bead pi-chaos-relay-eu4): the version gate runs first (it is
+ * sub-second), then the whole-tree type-check and the selected tests run
+ * CONCURRENTLY — tsc is the long pole and neither step depends on the other, so
+ * on the fleet's 2-vCPU VMs they overlap on separate cores; both verdicts are
+ * always reported. The type-check itself is incremental: tsconfig sets
+ * `incremental` with the cache at the gitignored, worktree-local `/.tsbuildinfo`
+ * (never under node_modules, which the fleet hard-links from a shared store), so
+ * a repeat run in the same worktree re-checks only what changed.
+ *
  * USAGE
  *   npm run test:fast                      # tsc + version gate + affected tests
  *   node scripts/fast-gate.ts --dry-run    # print the plan, run nothing
@@ -42,7 +51,7 @@
  *                                          # no default branch resolves here)
  *   node scripts/fast-gate.ts --help
  */
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -243,6 +252,24 @@ function run(command: string, args: string[]): number {
   return result.status ?? 1;
 }
 
+/**
+ * Run a command, capturing its output for ordered replay. The fast gate runs
+ * the type-check CONCURRENTLY with the tests (bead pi-chaos-relay-eu4): tsc is
+ * the long pole (~7-18s) and the suites are independent processes, so on the
+ * fleet's 2-vCPU VMs they overlap on separate cores. Sequential output is
+ * replayed afterwards, per step, so the log still reads in a fixed order.
+ */
+function runCaptured(command: string, args: string[]): Promise<{ status: number; output: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { cwd: ROOT });
+    let output = "";
+    child.stdout.on("data", (chunk) => (output += chunk));
+    child.stderr.on("data", (chunk) => (output += chunk));
+    child.on("close", (code) => resolve({ status: code ?? 1, output }));
+    child.on("error", (err) => resolve({ status: 1, output: `${output}\nspawn failed: ${err.message}` }));
+  });
+}
+
 function git(args: string[]): { ok: boolean; out: string } {
   const result = spawnSync("git", args, { cwd: ROOT, encoding: "utf8" });
   if (result.status !== 0) return { ok: false, out: "" };
@@ -405,18 +432,17 @@ function main(): void {
     );
   }
 
-  const steps: Array<{ label: string; command: string; args: string[] }> = [
-    { label: "typecheck (whole tree)", command: "npx", args: ["tsc", "--noEmit"] },
-    {
-      label: "version consistency (whole tree)",
-      command: "node",
-      args: ["scripts/check-version-consistency-gate.mjs"],
-    },
-  ];
+  const typecheckStep = { label: "typecheck (whole tree)", command: "npx", args: ["tsc", "--noEmit"] };
+  const versionStep = {
+    label: "version consistency (whole tree)",
+    command: "node",
+    args: ["scripts/check-version-consistency-gate.mjs"],
+  };
+  const testSteps: Array<{ label: string; command: string; args: string[] }> = [];
   if (selection.mode === "full") {
-    steps.push({ label: "tests (full suite)", command: "node", args: ["--test"] });
+    testSteps.push({ label: "tests (full suite)", command: "node", args: ["--test"] });
   } else if (selection.tests.length > 0) {
-    steps.push({
+    testSteps.push({
       label: `tests (affected: ${selection.tests.length})`,
       command: "node",
       args: ["--test", ...selection.tests],
@@ -424,6 +450,7 @@ function main(): void {
   } else {
     console.log("[fast-gate] no affected tests to run — typecheck and the version gate only");
   }
+  const steps = [typecheckStep, versionStep, ...testSteps];
 
   if (opts.dryRun) {
     console.log("[fast-gate] --dry-run, planned steps:");
@@ -431,16 +458,40 @@ function main(): void {
     process.exit(0);
   }
 
-  for (const step of steps) {
-    console.log(`\n[fast-gate] === ${step.label} ===`);
-    const status = run(step.command, step.args);
-    if (status !== 0) {
-      console.error(`[fast-gate] FAIL ${step.label} (exit ${status})`);
-      process.exit(status);
+  void (async () => {
+    // The version gate is sub-second, so it stays first and serial. The
+    // type-check and the tests then run CONCURRENTLY (bead pi-chaos-relay-eu4):
+    // tsc is the long pole (~7-18s) and the suites are independent node --test
+    // child processes, so on the fleet's 2-vCPU VMs they overlap on separate
+    // cores. Neither depends on the other's result — both verdicts are always
+    // reported, so a failing type-check never hides the test outcome.
+    console.log(`\n[fast-gate] === ${versionStep.label} ===`);
+    const versionStatus = run(versionStep.command, versionStep.args);
+    if (versionStatus !== 0) {
+      console.error(`[fast-gate] FAIL ${versionStep.label} (exit ${versionStatus})`);
+      process.exit(versionStatus);
     }
-    console.log(`[fast-gate] ok ${step.label}`);
-  }
-  console.log(`\n[fast-gate] PASS (${selection.mode} tier)`);
+    console.log(`[fast-gate] ok ${versionStep.label}`);
+
+    const parallelSteps = [typecheckStep, ...testSteps];
+    console.log(`\n[fast-gate] === running concurrently: ${parallelSteps.map((s) => s.label).join(" + ")} ===`);
+    const results = await Promise.all(parallelSteps.map((step) => runCaptured(step.command, step.args)));
+    let failed = 0;
+    for (let k = 0; k < parallelSteps.length; k++) {
+      const step = parallelSteps[k];
+      const { status, output } = results[k];
+      console.log(`\n[fast-gate] --- ${step.label} ---`);
+      if (output.trim() !== "") console.log(output.trimEnd());
+      if (status !== 0) {
+        console.error(`[fast-gate] FAIL ${step.label} (exit ${status})`);
+        failed = failed || status;
+      } else {
+        console.log(`[fast-gate] ok ${step.label}`);
+      }
+    }
+    if (failed !== 0) process.exit(failed);
+    console.log(`\n[fast-gate] PASS (${selection.mode} tier)`);
+  })();
 }
 
 // Only run when executed directly: the selector must be importable by its tests
